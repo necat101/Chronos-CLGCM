@@ -1,0 +1,5 @@
+# Core dependencies for running and training
+torch
+transformers
+datasets
+numpy

@@ -1,0 +1,13 @@
+# Core dependencies for running and training
+torch
+transformers
+datasets
+numpy
+
+# Optional, but highly recommended for fine-tuning, building the C++ kernel,
+# and enabling all features.
+pybind11
+cmake
+peft
+accelerate
+bitsandbytes

@@ -1,0 +1,80 @@
+#version 450
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer MatrixA { float A[]; };
+layout(binding = 1, std430) readonly buffer QuantizedB { uint B[]; };
+layout(binding = 2, std430) writeonly buffer MatrixY { float Y[]; };
+
+layout(push_constant) uniform PushConstants {
+    int K;
+    int M;
+    int N;
+};
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    uint m = gl_GlobalInvocationID.y;
+
+    if (n >= N || m >= M) {
+        return;
+    }
+
+    float sum = 0.0;
+    uint block_size_k = 256;
+    uint sizeof_block_bytes = 88;
+    uint num_blocks_per_row = uint(K) / block_size_k;
+    uint b_row_offset_uints = m * num_blocks_per_row * sizeof_block_bytes / 4;
+
+    for (uint i = 0; i < num_blocks_per_row; ++i) {
+        uint block_offset_uints = b_row_offset_uints + i * sizeof_block_bytes / 4;
+        float d = uintBitsToFloat(B[block_offset_uints + 0]);
+        float dmin = uintBitsToFloat(B[block_offset_uints + 1]);
+
+        for (uint j = 0; j < 8; ++j) { // Iterate over 8 sub-blocks of 32
+            uint scale_uint_idx = block_offset_uints + 2 + (j / 4);
+            uint scale_byte_idx = j % 4;
+            uint scales_packed = B[scale_uint_idx];
+            int scale_byte = int((scales_packed >> (scale_byte_idx * 8)) & 0xFF);
+
+            float s1 = float(scale_byte & 0x0F) / 15.0;
+            float s2 = float(scale_byte >> 4)   / 15.0;
+            float d1 = s1 * d;
+            float d2 = s2 * d;
+            
+            // --- First 16 values (use scale d1) ---
+            for (uint l = 0; l < 16; ++l) {
+                uint val_offset_in_block = j * 32 + l;
+                uint qs_byte_idx_in_block = val_offset_in_block / 4;
+                uint qs_uint_idx_in_block = qs_byte_idx_in_block / 4;
+                uint byte_offset_in_uint = qs_byte_idx_in_block % 4;
+
+                uint qs_uint = B[block_offset_uints + 6 + qs_uint_idx_in_block];
+                uint qs_byte = (qs_uint >> (byte_offset_in_uint * 8)) & 0xFF;
+                
+                uint shift = (2 * (val_offset_in_block % 4));
+                int qi = int((qs_byte >> shift) & 0x03);
+
+                uint a_idx = n * uint(K) + i * 256 + val_offset_in_block;
+                sum += A[a_idx] * (float(qi) * d1 + dmin);
+            }
+            
+            // --- Second 16 values (use scale d2) ---
+            for (uint l = 0; l < 16; ++l) {
+                uint val_offset_in_block = j * 32 + 16 + l;
+                uint qs_byte_idx_in_block = val_offset_in_block / 4;
+                uint qs_uint_idx_in_block = qs_byte_idx_in_block / 4;
+                uint byte_offset_in_uint = qs_byte_idx_in_block % 4;
+
+                uint qs_uint = B[block_offset_uints + 6 + qs_uint_idx_in_block];
+                uint qs_byte = (qs_uint >> (byte_offset_in_uint * 8)) & 0xFF;
+
+                uint shift = (2 * (val_offset_in_block % 4));
+                int qi = int((qs_byte >> shift) & 0x03);
+
+                uint a_idx = n * uint(K) + i * 256 + val_offset_in_block;
+                sum += A[a_idx] * (float(qi) * d2 + dmin);
+            }
+        }
+    }
+    Y[n * uint(M) + m] = sum;
+}
