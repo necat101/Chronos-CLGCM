@@ -1,4 +1,4 @@
-# Chronos Profit-Sharing Source-Available License (Draft v0.1)
+# Chronos Profit-Sharing Source-Available License
 
 This license governs the use of the software known as "Chronos" and its associated source code, binaries, and documentation (collectively, the "Software").
 
@@ -32,8 +32,6 @@ b.  **Reporting:** The User must provide Makhi Burroughs email: saltpepper312@gm
 c.  **Payment:** Payments shall be made to Makhi Burroughs email: saltpepper312@gmail.com within 30 days of the end of each calendar quarter.
 
 d.  **Auditing:** Makhi Burroughs email: saltpepper312@gmail.com reserves the right to audit the User's financial records related to the Commercial Use of the Software to ensure compliance with this agreement.
-
-    *[Note to User: This clause is complex and requires careful legal drafting to be enforceable.]*
 
 ### 3. Attribution
 
