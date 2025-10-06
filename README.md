@@ -1,4 +1,4 @@
-# Chronos: A Hybrid Memory-Reasoning Architecture
+# Chronos (Continuously Learning Generative Chronos Model): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
