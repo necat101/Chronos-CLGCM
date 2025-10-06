@@ -3,6 +3,7 @@ torch
 transformers
 datasets
 numpy
+keyboard
 
 # Optional, but highly recommended for fine-tuning, building the C++ kernel,
 # and enabling all features.
