@@ -22,6 +22,13 @@ except ImportError:
     print("Warning: 'peft' library not found. LoRA fine-tuning and merging will be unavailable.")
     _HAS_PEFT = False
 
+try:
+    import keyboard
+    _HAS_KEYBOARD = True
+except ImportError:
+    print("Warning: 'keyboard' library not found. The Ctrl+X interrupt feature will be disabled in chat mode.")
+    _HAS_KEYBOARD = False
+
 # --- MODIFIED FOR CPU TRAINING ---
 print("Warning: bitsandbytes is disabled for CPU training. Falling back to standard AdamW optimizer.")
 ADAM_OPTIMIZER = torch.optim.AdamW
@@ -41,7 +48,7 @@ try:
         _HAS_VULKAN = False
 except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.          !!!")
+    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.           !!!")
     print("!!!                                                                         !!!")
     print("!!! To fix this, please run the appropriate setup script:                   !!!")
     print("!!!  - On Windows:   Run setup.bat                                          !!!")
@@ -53,6 +60,14 @@ except ImportError:
     print("!!!  - On Linux/macOS: source .venv/bin/activate                            !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1) # Exit the program because the kernel is essential
+
+
+# --- HELPER CLASS: AttrDict ---
+class AttrDict(dict):
+    """A dictionary that allows for attribute-style access."""
+    def __init__(self, *args, **kwargs):
+        super(AttrDict, self).__init__(*args, **kwargs)
+        self.__dict__ = self
 
 
 # --- Device Utilities ---
@@ -89,20 +104,33 @@ class JSONLDataset(Dataset):
         """Processes a single JSON object into tokenized input_ids and labels."""
         try:
             if self.kayla_mode:
+                # --- Context part (masked out in labels) ---
                 instruction_text = f"### Instruction:\n{obj.get('Instruction', '')}\n\n"
+                
+                feelings_text = ""
+                # Check for the feelings key and ensure it has content to include it
+                if obj.get('feelings'):
+                    feelings_text = f"### Feelings:\n{obj.get('feelings')}\n\n"
+
+                # The full prompt context is instruction + feelings
+                prompt_context_text = instruction_text + feelings_text
+
+                # --- Generation part (predicted by the model) ---
                 thought_text = f"### Thought Process:\n{obj.get('thought-process', '')}\n\n"
                 output_text = f"### Response:\n{obj.get('output', '')}"
-
-                instruction_tokens = self.tokenizer.encode(instruction_text, add_special_tokens=True)
+                
+                # Tokenize the different parts
+                prompt_context_tokens = self.tokenizer.encode(prompt_context_text, add_special_tokens=True)
                 thought_tokens = self.tokenizer.encode(thought_text, add_special_tokens=False)
                 output_tokens = self.tokenizer.encode(output_text, add_special_tokens=False)
 
-                input_ids = instruction_tokens + thought_tokens + output_tokens + [self.tokenizer.eos_token_id]
-                labels = ([-100] * len(instruction_tokens)) + thought_tokens + output_tokens + [self.tokenizer.eos_token_id]
+                # Combine into final input_ids and labels
+                input_ids = prompt_context_tokens + thought_tokens + output_tokens + [self.tokenizer.eos_token_id]
+                labels = ([-100] * len(prompt_context_tokens)) + thought_tokens + output_tokens + [self.tokenizer.eos_token_id]
             else:
                 prompt = f"### Instruction:\n{obj.get('instruction', '')}\n\n### Response:\n"
                 completion = obj.get('output', '') or obj.get('response', '')
-                
+
                 prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=True)
                 completion_tokens = self.tokenizer.encode(completion, add_special_tokens=False)
 
@@ -115,16 +143,16 @@ class JSONLDataset(Dataset):
 
             return {"input_ids": torch.tensor(input_ids), "labels": torch.tensor(labels)}
         except (KeyError, AttributeError, TypeError):
-             return None
+            return None
 
     def _load(self, path):
         if not os.path.exists(path):
             raise FileNotFoundError(f"Dataset file not found: {path}")
-        
+
         print(f"Loading and tokenizing dataset from {path}...")
         if self.kayla_mode:
             print("INFO: Kayla-style instruction tuning is ENABLED.")
-        
+
         with open(path, "r", encoding="utf-8") as f:
             try:
                 # Handle .json file (a list of objects)
@@ -156,26 +184,26 @@ class JSONLDataset(Dataset):
 def create_dataloader(path, tokenizer, max_length, batch_size, pad_token_id, kayla_mode=False):
     """Creates a DataLoader for training or fine-tuning."""
     dataset = JSONLDataset(path, tokenizer, max_length, kayla_mode=kayla_mode)
-    
+
     def collate_fn(batch):
         max_len = max(len(item['input_ids']) for item in batch)
-        
+
         input_ids_batch = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
         labels_batch = torch.full((len(batch), max_len), -100, dtype=torch.long)
         attention_mask_batch = torch.zeros((len(batch), max_len), dtype=torch.long)
-        
+
         for i, item in enumerate(batch):
             seq_len = len(item['input_ids'])
             input_ids_batch[i, :seq_len] = item['input_ids']
             labels_batch[i, :seq_len] = item['labels']
             attention_mask_batch[i, :seq_len] = 1
-            
+
         return {
             "input_ids": input_ids_batch,
             "labels": labels_batch,
             "attention_mask": attention_mask_batch
         }
-        
+
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True)
 
 
@@ -190,7 +218,7 @@ def get_q_block_size(qtype: str) -> int:
         raise ValueError(f"Unknown quantization type: {qtype}")
 
 def export_model(output_path: str, model: nn.Module, qtype: str):
-    """Quantizes and exports the model to a compressed .npz file."""
+    """Quantizes and exports the model to a compressed .npz file with config."""
     if not _HAS_KERNEL:
         print("ERROR: C++ kernel is required for quantization. Aborting.")
         return
@@ -198,7 +226,12 @@ def export_model(output_path: str, model: nn.Module, qtype: str):
     print(f"Quantizing and exporting model to {output_path} with {qtype} weights...")
     state_dict = model.state_dict()
     quantized_tensors = {}
-    
+
+    # Save config into the quantized file
+    # Ensure config is a plain dict before saving for numpy compatibility
+    config_to_save = dict(model.config)
+    quantized_tensors['_config'] = np.array(config_to_save)
+
     Q_BLOCK_SIZE = get_q_block_size(qtype)
 
     for name, tensor in tqdm(state_dict.items(), desc="Quantizing Tensors"):
@@ -207,7 +240,7 @@ def export_model(output_path: str, model: nn.Module, qtype: str):
         if tensor.ndim == 2 and "emb" not in name and "ltm" not in name:
             float_tensor_np = tensor.cpu().float().numpy()
             M, K = float_tensor_np.shape
-            
+
             # Pad the tensor if its inner dimension is not a multiple of the block size
             pad_cols = 0
             if K % Q_BLOCK_SIZE != 0:
@@ -216,7 +249,7 @@ def export_model(output_path: str, model: nn.Module, qtype: str):
 
             # Use the C++ kernel to quantize the weights
             quantized_data = chronos_matmul.quantize(float_tensor_np, qtype)
-            
+
             quantized_tensors[name] = {
                 "quantized": quantized_data,
                 "qtype": qtype,
@@ -225,7 +258,7 @@ def export_model(output_path: str, model: nn.Module, qtype: str):
         else:
             # Store non-quantized tensors as is
             quantized_tensors[name] = {"raw": tensor.cpu().numpy()}
-            
+
     np.savez_compressed(output_path, **quantized_tensors)
     print(f"Model successfully exported to {output_path}")
 
@@ -239,7 +272,7 @@ class QuantizedLinear:
         self.qtype = str(weight_data['qtype'])
         self.original_shape = weight_data['original_shape']
         self.M, self.K = self.original_shape
-        
+
         bias_obj = q_data.get(f'{name}.bias')
         if bias_obj is not None:
             self.bias = bias_obj.item()['raw']
@@ -248,10 +281,10 @@ class QuantizedLinear:
 
     def __call__(self, x: torch.Tensor, device: str = "cpu") -> torch.Tensor:
         if not _HAS_KERNEL: raise ImportError("C++ kernel required for quantized matmul")
-        
+
         x_np = x.cpu().float().numpy()
         y_np = chronos_matmul.matmul_quantized(x_np, self.quantized_w, self.M, self.qtype, device)
-        
+
         if y_np.shape[-1] != self.M:
             y_np = y_np[..., :self.M]
 
@@ -294,7 +327,7 @@ class GRUCell(nn.Module):
         z = torch.sigmoid(self.W_iz(x) + self.W_hz(h))
         n = torch.tanh(self.W_in(x) + r * self.W_hn(h))
         return (1 - z) * n + z * h
-        
+
 class LTMModule(nn.Module):
     """Titans Long-Term Memory Module. Capable of test-time updates."""
     def __init__(self, n_slots=1024, key_dim=64, val_dim=64, lr=1e-3, momentum=0.9, wd=1e-4):
@@ -303,7 +336,7 @@ class LTMModule(nn.Module):
         self.vals = nn.Parameter(torch.randn(n_slots, val_dim) * 0.02)
         self.register_buffer("_mom_vals", torch.zeros_like(self.vals.data))
         self.lr, self.momentum, self.weight_decay = lr, momentum, wd
-        
+
         # Buffer for accumulating deltas if not updating in-place
         self.register_buffer("ltm_deltas", torch.zeros_like(self.vals.data))
         self.accumulate_deltas = False
@@ -321,28 +354,28 @@ class LTMModule(nn.Module):
         with torch.no_grad():
             if grads_tensor is None: return
             device = self.vals.device
-            
+
             slot_grads = torch.zeros_like(self.vals.data)
             idx_flat = topk_idx.view(-1)
             grads_flat = grads_tensor.view(-1, self.vals.size(1))
             slot_grads.index_add_(0, idx_flat.to(device), grads_flat.to(device))
-            
+
             counts = torch.zeros(self.vals.size(0), device=device)
             counts.index_add_(0, idx_flat.to(device), torch.ones_like(idx_flat, dtype=torch.float, device=device))
             nonzero_mask = counts > 0
             if nonzero_mask.any():
                 slot_grads[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
-            
+
             self._mom_vals.data.mul_(self.momentum).add_(slot_grads)
             update_delta = (self._mom_vals.data + self.weight_decay * self.vals.data)
             update_delta.mul_(-self.lr)
-            
+
             final_update = torch.zeros_like(self.vals.data)
             final_update[nonzero_mask] = update_delta[nonzero_mask]
-            
+
             if self.accumulate_deltas:
                 self.ltm_deltas.data.add_(final_update)
-                self.vals.data.add_(final_update) 
+                self.vals.data.add_(final_update)
             else:
                 self.vals.data.add_(final_update)
 
@@ -350,88 +383,96 @@ class ChronosCore(nn.Module):
     """The full, trainable Chronos model, integrating HRM as the core processor."""
     def __init__(self, config: dict):
         super().__init__()
-        self.config = config
+        # Use AttrDict for config to support both dot-notation and .get() method access
+        self.config = AttrDict(config)
 
-        self.tok_emb = nn.Embedding(config["vocab_size"], config["context_dim"])
-        self.pos_emb = nn.Embedding(config["max_length"], config["context_dim"])
-        
-        self.persistent = nn.Parameter(torch.randn(config["persistent_dim"]) * 0.02)
+        self.tok_emb = nn.Embedding(self.config.vocab_size, self.config.context_dim)
+        self.pos_emb = nn.Embedding(self.config.max_length, self.config.context_dim)
+
+        self.persistent = nn.Parameter(torch.randn(self.config.persistent_dim) * 0.02)
         self.ltm = LTMModule(
-            n_slots=config["ltm_slots"], 
-            key_dim=config["ltm_key_dim"], 
-            val_dim=config["ltm_val_dim"], 
-            lr=config.get("ltm_lr", 1e-2)
+            n_slots=self.config.ltm_slots,
+            key_dim=self.config.ltm_key_dim,
+            val_dim=self.config.ltm_val_dim,
+            lr=self.config.ltm_lr
         )
-        self.qproj = nn.Linear(config["context_dim"], config["ltm_key_dim"], bias=False)
-        
-        in_dim = config["context_dim"] + config["persistent_dim"] + (config["ltm_val_dim"] * config.get("ltm_topk", 4))
-        self.in_proj = nn.Linear(in_dim, config["context_dim"])
-        
-        self.h_rnn = GRUCell(config["context_dim"], config["h_hidden"])
-        self.h_to_context = nn.Linear(config["h_hidden"], config["context_dim"])
-        self.l_rnn = GRUCell(config["context_dim"] * 2, config["l_hidden"])
-        self.l_to_out = nn.Linear(config["l_hidden"], config["context_dim"])
-        
-        self.out_norm = nn.LayerNorm(config["context_dim"])
-        self.lm_head = nn.Linear(config["context_dim"], config["vocab_size"], bias=False)
+        self.qproj = nn.Linear(self.config.context_dim, self.config.ltm_key_dim, bias=False)
+
+        in_dim = self.config.context_dim + self.config.persistent_dim + (self.config.ltm_val_dim * self.config.ltm_topk)
+        self.in_proj = nn.Linear(in_dim, self.config.context_dim)
+
+        self.h_rnn = GRUCell(self.config.context_dim, self.config.h_hidden)
+        self.h_to_context = nn.Linear(self.config.h_hidden, self.config.context_dim)
+        self.l_rnn = GRUCell(self.config.context_dim * 2, self.config.l_hidden)
+        self.l_to_out = nn.Linear(self.config.l_hidden, self.config.context_dim)
+
+        self.out_norm = nn.LayerNorm(self.config.context_dim)
+        self.lm_head = nn.Linear(self.config.context_dim, self.config.vocab_size, bias=False)
         self.tok_emb.weight = self.lm_head.weight
 
-    def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, labels: Optional[torch.LongTensor] = None):
+    # Methods to satisfy the PEFT library
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        return {"input_ids": input_ids}
+
+    def _get_prompt_embedding(self, prompt_embedding):
+         return prompt_embedding
+
+    def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, labels: Optional[torch.LongTensor] = None, **kwargs):
         B, T = input_ids.shape
         device = input_ids.device
-        
+
         tok_embs = self.tok_emb(input_ids)
         pos = torch.arange(T, device=device).unsqueeze(0)
         x = tok_embs + self.pos_emb(pos)
-        
+
         if attention_mask is None: attention_mask = torch.ones_like(input_ids)
-        
+
         all_topk_vals = []
         all_topk_idx = []
         final_token_embeddings = []
-        
-        h_state = torch.zeros(B, self.config["h_hidden"], device=device)
-        l_state = torch.zeros(B, self.config["l_hidden"], device=device)
-        
+
+        h_state = torch.zeros(B, self.config.h_hidden, device=device)
+        l_state = torch.zeros(B, self.config.l_hidden, device=device)
+
         for t in range(T):
             token_emb = x[:, t, :]
-            
+
             p_read = self.persistent.unsqueeze(0).expand(B, -1)
             query = self.qproj(token_emb)
-            topk_vals, topk_idx = self.ltm.retrieve_topk(query, topk=self.config.get("ltm_topk", 4))
-            
+            topk_vals, topk_idx = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk)
+
             if self.training or torch.is_grad_enabled():
                 topk_vals.retain_grad()
 
             all_topk_vals.append(topk_vals)
             all_topk_idx.append(topk_idx)
-            
+
             ltm_summary_flat = topk_vals.view(B, -1)
-            
+
             mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
             enc = F.gelu(self.in_proj(mac_input))
-            
-            for _ in range(self.config["h_steps"]):
+
+            for _ in range(self.config.h_steps):
                 h_state = self.h_rnn(enc, h_state)
                 context = self.h_to_context(h_state)
-                for _ in range(self.config["l_steps"]):
+                for _ in range(self.config.l_steps):
                     l_input = torch.cat([enc, context], dim=-1)
                     l_state = self.l_rnn(l_input, l_state)
                 enc = enc + self.l_to_out(l_state)
-                
+
             final_token_embeddings.append(enc)
 
         final_embeddings = torch.stack(final_token_embeddings, dim=1)
         final_embeddings = self.out_norm(final_embeddings)
         logits = self.lm_head(final_embeddings)
-        
+
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config["vocab_size"]), shift_labels.view(-1))
-            
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+
         seq_topk_vals = torch.stack(all_topk_vals, dim=1)
         seq_topk_idx = torch.stack(all_topk_idx, dim=1)
 
@@ -440,30 +481,34 @@ class ChronosCore(nn.Module):
 class QuantizedChronos:
     """The quantized Chronos model for CPU/Vulkan inference."""
     def __init__(self, config: dict, q_data: dict):
-        self.config = config
+        self.config = AttrDict(config)
+        # Inspect the loaded data to find and store the qtype
+        first_quantized_layer_meta = q_data['qproj.weight'].item()
+        self.qtype = first_quantized_layer_meta['qtype']
+        
         self.tok_emb = nn.Embedding.from_pretrained(torch.from_numpy(q_data['tok_emb.weight'].item()['raw']))
         self.pos_emb = nn.Embedding.from_pretrained(torch.from_numpy(q_data['pos_emb.weight'].item()['raw']))
         self.persistent = torch.from_numpy(q_data['persistent'].item()['raw'])
-        self.out_norm = nn.LayerNorm(config["context_dim"])
+        self.out_norm = nn.LayerNorm(self.config.context_dim)
         self.out_norm.load_state_dict({
-            'weight': torch.from_numpy(q_data['out_norm.weight'].item()['raw']), 
+            'weight': torch.from_numpy(q_data['out_norm.weight'].item()['raw']),
             'bias': torch.from_numpy(q_data['out_norm.bias'].item()['raw'])
         })
-        
-        self.ltm = LTMModule(n_slots=config["ltm_slots"], key_dim=config["ltm_key_dim"], val_dim=config["ltm_val_dim"])
+
+        self.ltm = LTMModule(n_slots=self.config.ltm_slots, key_dim=self.config.ltm_key_dim, val_dim=self.config.ltm_val_dim)
         self.ltm.load_state_dict({
-            'keys': torch.from_numpy(q_data['ltm.keys'].item()['raw']), 
+            'keys': torch.from_numpy(q_data['ltm.keys'].item()['raw']),
             'vals': torch.from_numpy(q_data['ltm.vals'].item()['raw'])
         }, strict=False)
 
         self.qproj = QuantizedLinear('qproj', q_data)
         self.in_proj = QuantizedLinear('in_proj', q_data)
-        self.h_rnn = QuantizedGRUCell(config["context_dim"], config["h_hidden"], 'h_rnn', q_data)
+        self.h_rnn = QuantizedGRUCell(self.config.context_dim, self.config.h_hidden, 'h_rnn', q_data)
         self.h_to_context = QuantizedLinear('h_to_context', q_data)
-        self.l_rnn = QuantizedGRUCell(config["context_dim"] * 2, config["l_hidden"], 'l_rnn', q_data)
+        self.l_rnn = QuantizedGRUCell(self.config.context_dim * 2, self.config.l_hidden, 'l_rnn', q_data)
         self.l_to_out = QuantizedLinear('l_to_out', q_data)
         self.lm_head = QuantizedLinear('lm_head', q_data)
-        print("Initialized QuantizedChronos model for inference.")
+        print("Initialized QuantizedChronos model from config.")
 
     def __call__(self, input_ids: torch.LongTensor, h_state: torch.Tensor, l_state: torch.Tensor, device: str = "cpu"):
         B, T = input_ids.shape
@@ -473,16 +518,16 @@ class QuantizedChronos:
 
         p_read = self.persistent.unsqueeze(0).expand(B, -1)
         query = self.qproj(token_emb, device=device)
-        topk_vals, _ = self.ltm.retrieve_topk(query, topk=self.config.get("ltm_topk", 4))
+        topk_vals, _ = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk)
         ltm_summary_flat = topk_vals.view(B, -1)
-        
+
         mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
         enc = F.gelu(self.in_proj(mac_input, device=device))
-        
-        for _ in range(self.config["h_steps"]):
+
+        for _ in range(self.config.h_steps):
             h_state = self.h_rnn(enc, h_state, device=device)
             context = self.h_to_context(h_state, device=device)
-            for _ in range(self.config["l_steps"]):
+            for _ in range(self.config.l_steps):
                 l_input = torch.cat([enc, context], dim=-1)
                 l_state = self.l_rnn(l_input, l_state, device=device)
             enc = enc + self.l_to_out(l_state, device=device)
@@ -491,18 +536,55 @@ class QuantizedChronos:
         logits = self.lm_head(final_embedding, device=device)
         return {"logits": logits.unsqueeze(1), "h_state": h_state, "l_state": l_state}
 
-def load_quantized(model_path, config):
+def load_quantized(model_path):
     print(f"Loading quantized model from: {model_path}")
     q_data = np.load(model_path, allow_pickle=True)
+
+    if '_config' not in q_data:
+        raise ValueError("Quantized model file is missing '_config' data. Please re-quantize the model with this script version.")
+
+    config = q_data['_config'].item() # .item() extracts the dict from the numpy array
     return QuantizedChronos(config, q_data)
+
+def load_full_model_with_config(model_path, cli_args, device):
+    checkpoint = torch.load(model_path, map_location=device)
+
+    if 'config' in checkpoint:
+        config = checkpoint['config']
+    elif 'args' in checkpoint:
+        config = checkpoint['args']
+    else:
+        print("!!! WARNING: Model config not found in checkpoint. Falling back to command-line arguments.")
+        print("!!!          This is not recommended. Please re-save your final model using the latest script.")
+        config = vars(cli_args)
+
+    config_dict = vars(config) if not isinstance(config, dict) else config
+    config_dict['max_new_tokens'] = cli_args.max_new_tokens
+
+    # Add a default model_type if it is missing, for PEFT compatibility
+    if 'model_type' not in config_dict:
+        config_dict['model_type'] = 'chronos'
+
+    model = ChronosCore(config_dict).to(device)
+
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        print("Warning: Loading a legacy checkpoint with a raw state_dict.")
+        model.load_state_dict(checkpoint)
+
+    return model, model.config
 
 def train(args, device, tokenizer):
     print("Running in TRAIN mode...")
     config = vars(args)
+
+    # Add a model_type for newly created models, for PEFT compatibility
+    config['model_type'] = 'chronos'
     
     model = ChronosCore(config).to(device)
     optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
-    
+
     dataloader = create_dataloader(args.train, tokenizer, args.max_length, args.batch_size, tokenizer.pad_token_id, kayla_mode=args.kayla)
 
     scheduler = None
@@ -515,42 +597,42 @@ def train(args, device, tokenizer):
     if args.resume_from_ckpt:
         if not os.path.exists(args.resume_from_ckpt):
             raise FileNotFoundError(f"Checkpoint to resume from not found at {args.resume_from_ckpt}")
-        
+
         print(f"Resuming training from checkpoint: {args.resume_from_ckpt}")
         checkpoint = torch.load(args.resume_from_ckpt, map_location=device)
-        
+
         if 'model_state_dict' not in checkpoint or 'optimizer_state_dict' not in checkpoint:
             print("\nERROR: The specified checkpoint is not a valid training checkpoint.")
             sys.exit(1)
-            
+
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint.get('completed_epoch', 0)
-        
+
         if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
             print("Resuming learning rate scheduler state.")
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
+
         print(f"Successfully loaded model and optimizer. Resuming from epoch {start_epoch + 1}.")
 
     model.train()
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     os.makedirs(args.out_dir, exist_ok=True)
-    
-    optimizer.zero_grad() 
-    
+
+    optimizer.zero_grad()
+
     for epoch in range(start_epoch, args.epochs):
         print(f"\n--- Epoch {epoch + 1} / {args.epochs} ---")
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
         total_loss = 0.0
-        
+
         for i, batch in enumerate(pbar):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs["loss"]
-            
+
             if loss is not None:
-                loss = loss / args.accumulation_steps 
+                loss = loss / args.accumulation_steps
                 loss.backward()
                 total_loss += loss.item() * args.accumulation_steps
 
@@ -565,36 +647,37 @@ def train(args, device, tokenizer):
 
         ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
         print(f"Epoch {epoch + 1} complete. Saving checkpoint to {ckpt_path}")
+        config_to_save = dict(model.config)
         torch.save({
             'completed_epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'args': config,
+            'config': config_to_save,
         }, ckpt_path)
 
     final_save_path = os.path.join(args.out_dir, "chronos_final.pt")
     print(f"\nTraining finished. Saving final inference model to {final_save_path}")
-    torch.save(model.state_dict(), final_save_path)
-    
+    config_to_save = dict(model.config)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': config_to_save
+    }, final_save_path)
+
     if args.quantize_on_complete:
         print("\n--- Training Complete: Starting On-the-Fly Quantization ---")
-        quant_args = argparse.Namespace(ckpt=final_save_path, out=None, qtype=args.qtype, **config)
-        quantize(quant_args)
+        quant_args = argparse.Namespace(ckpt=final_save_path, out=None, qtype=args.qtype)
+        quantize(args, device)
 
 def finetune(args, device, tokenizer):
     if not _HAS_PEFT: raise ImportError("Please install 'peft' for fine-tuning.")
     print("Running in FINETUNE mode with LoRA...")
-    config = vars(args)
-    if not args.base_ckpt or not os.path.exists(args.base_ckpt): raise FileNotFoundError(f"Base checkpoint not found at {args.base_ckpt}")
-    
-    model = ChronosCore(config)
-    model.load_state_dict(torch.load(args.base_ckpt, map_location="cpu"))
-    model.to(device)
-    
+
+    model, model_config = load_full_model_with_config(args.base_ckpt, args, device)
+
     lora_r = args.lora_r
     if args.finetune_unlock_percent:
-        if args.lora_r != 8: 
+        if args.lora_r != 8:
             print(f"Warning: Both --lora_r ({args.lora_r}) and --finetune-unlock-percent were specified. Prioritizing --lora_r.")
         else:
             total_params = sum(p.numel() for p in model.parameters())
@@ -603,7 +686,7 @@ def finetune(args, device, tokenizer):
             for name, module in model.named_modules():
                 if isinstance(module, nn.Linear) and any(tm in name for tm in target_modules):
                     lora_param_sum_per_r += module.in_features + module.out_features
-            
+
             target_trainable_count = total_params * (args.finetune_unlock_percent / 100.0)
             if lora_param_sum_per_r > 0:
                 estimated_r = target_trainable_count / lora_param_sum_per_r
@@ -612,14 +695,24 @@ def finetune(args, device, tokenizer):
             else:
                 print("Warning: Could not find target modules for LoRA. Using default r=8.")
 
+    # =================================================================================
+    # === MODIFICATION: Add modules_to_save to LoraConfig =============================
+    # =================================================================================
     lora_config = LoraConfig(
-        r=lora_r, lora_alpha=args.lora_alpha, target_modules=["qproj", "in_proj", "h_to_context", "l_to_out"],
-        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
+        r=lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=["qproj", "in_proj", "h_to_context", "l_to_out"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        modules_to_save=["ltm"],  # <-- This tells PEFT to not freeze the LTM module
     )
+    # =================================================================================
+    
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    
-    dataloader = create_dataloader(args.train, tokenizer, args.max_length, args.batch_size, tokenizer.pad_token_id, kayla_mode=args.kayla)
+
+    dataloader = create_dataloader(args.train, tokenizer, model_config.max_length, args.batch_size, tokenizer.pad_token_id, kayla_mode=args.kayla)
     optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -642,72 +735,70 @@ def finetune(args, device, tokenizer):
                 loss = loss / args.accumulation_steps
                 loss.backward()
                 total_loss += loss.item() * args.accumulation_steps
-                
+
                 if (i + 1) % args.accumulation_steps == 0:
                     optimizer.step()
                     if scheduler:
                         scheduler.step()
                     optimizer.zero_grad()
-                
+
                 current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
                 pbar.set_postfix({"loss": f"{total_loss / (i+1):.4f}", "lr": f"{current_lr:.2e}"})
 
     adapter_path = os.path.join(args.out_dir, "chronos_lora_adapter")
     print(f"Saving LoRA adapter to {adapter_path}")
     model.save_pretrained(adapter_path)
-    
-def merge_lora(args):
+
+def merge_lora(args, device):
     if not _HAS_PEFT: raise ImportError("Please install 'peft' for merging.")
     print("Running in MERGE-LORA mode...")
-    config = vars(args)
-    
     if not args.base_ckpt or not os.path.exists(args.base_ckpt): raise FileNotFoundError(f"Base checkpoint not found at {args.base_ckpt}")
     if not args.lora_adapter_path or not os.path.exists(args.lora_adapter_path): raise FileNotFoundError(f"LoRA adapter not found at {args.lora_adapter_path}")
 
     print(f"Loading base model from {args.base_ckpt}...")
-    base_model = ChronosCore(config)
-    base_model.load_state_dict(torch.load(args.base_ckpt, map_location="cpu"))
+    base_model, _ = load_full_model_with_config(args.base_ckpt, args, device)
 
     print(f"Loading LoRA adapter from {args.lora_adapter_path}...")
     model = PeftModel.from_pretrained(base_model, args.lora_adapter_path)
-    
+
     print("Merging adapter into the base model...")
     model = model.merge_and_unload()
-    
+
     output_path = args.merged_out_path or args.base_ckpt.replace(".pt", "-merged.pt")
     print(f"Saving merged model to {output_path}...")
-    torch.save(model.state_dict(), output_path)
+    config_to_save = dict(model.config)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'config': config_to_save
+    }, output_path)
     print("Merge complete.")
-        
-def quantize(args):
+
+def quantize(args, device):
     print(f"Running in QUANTIZE mode with {args.qtype} precision...")
     if not args.ckpt or not os.path.exists(args.ckpt): raise FileNotFoundError(f"Checkpoint not found at {args.ckpt}")
-    
-    config = vars(args)
-    if "vocab_size" not in config:
-        print("Warning: vocab_size not found in args for quantization. You may need to specify it if loading a config separately.")
-        config["vocab_size"] = 32000 # Default fallback
-    
-    model = ChronosCore(config)
-    model.load_state_dict(torch.load(args.ckpt, map_location="cpu"))
-    
+
+    print(f"Loading full-precision model from {args.ckpt}...")
+    model, _ = load_full_model_with_config(args.ckpt, args, device)
+
     out_path = args.out if args.out else args.ckpt.replace(".pt", f"-{args.qtype}.npz")
     export_model(out_path, model, qtype=args.qtype)
 
 def chat(args, device, tokenizer):
     print("Running in CHAT mode...")
-    config = vars(args)
-    
+
     model = None
     shadow_model = None
+    config = None
     is_quantized = False
-    inference_device = "cpu"
+    inference_device = "cpu" # Default for quantized models
+    ltm_has_been_updated = False # Flag to track if we need to save
 
     if args.load_quantized:
         if not _HAS_KERNEL:
             print("ERROR: Cannot run quantized chat without the C++ kernel.")
             return
-        model = load_quantized(args.load_quantized, config)
+        model = load_quantized(args.load_quantized)
+        config = model.config
         is_quantized = True
 
         if args.device == 'vulkan':
@@ -716,18 +807,25 @@ def chat(args, device, tokenizer):
             else:
                 inference_device = "vulkan"
                 print("INFO: Using Vulkan for inference.")
-        
+
         if args.enable_quantized_learning:
             if not args.ckpt:
                 raise ValueError("To enable learning on a quantized model, you must provide the original full-precision checkpoint via --ckpt.")
             print("Loading full-precision 'shadow' model for online learning...")
-            shadow_model = ChronosCore(config).to(device)
-            shadow_model.load_state_dict(torch.load(args.ckpt, map_location=device))
+            # Shadow model config must match the quantized one
+            shadow_model = ChronosCore(dict(config)).to(device)
+            shadow_checkpoint = torch.load(args.ckpt, map_location=device)
+            # Ensure we load the state dict correctly
+            state_dict_to_load = shadow_checkpoint.get('model_state_dict', shadow_checkpoint)
+            shadow_model.load_state_dict(state_dict_to_load)
+            
+            # Sync the quantized model's initial LTM state to the shadow model
+            shadow_model.ltm.load_state_dict(model.ltm.state_dict())
             shadow_model.eval()
 
+
     elif args.ckpt:
-        model = ChronosCore(config).to(device)
-        model.load_state_dict(torch.load(args.ckpt, map_location=device))
+        model, config = load_full_model_with_config(args.ckpt, args, device)
         inference_device = device
     else:
         raise ValueError("Provide --ckpt for a full model or --load-quantized for a quantized one.")
@@ -747,148 +845,190 @@ def chat(args, device, tokenizer):
         model.eval()
 
     print("\nWelcome to Chronos Chat. Type 'exit' or 'quit' to end.")
+    if _HAS_KEYBOARD:
+        print("Press Ctrl+X to stop generation at any time.")
     print("="*50)
-    
-    while True:
-        prompt = input(">>> ")
-        if prompt.lower() in ["exit", "quit"]:
-            if args.ltm_lora_path and model.ltm.accumulate_deltas:
-                if torch.any(model.ltm.ltm_deltas != 0):
-                    print(f"\nSaving LTM memory deltas to {args.ltm_lora_path}...")
-                    torch.save(model.ltm.ltm_deltas.cpu(), args.ltm_lora_path)
-                    print("Done.")
-                else:
-                    print("\nNo new LTM updates to save.")
-            break
 
-        prompt_format = f"### Instruction:\n{prompt}\n\n### Response:\n"
-        prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device if not is_quantized else "cpu")
-        
-        print("\nChronos: ", end="", flush=True)
-        response_ids = []
-        
-        h_state = torch.zeros(1, config["h_hidden"], device=device if not is_quantized else "cpu")
-        l_state = torch.zeros(1, config["l_hidden"], device=device if not is_quantized else "cpu")
-        
-        current_ids = prompt_ids
-        with torch.no_grad():
-            for i in range(args.max_new_tokens):
-                if is_quantized:
-                    outputs = model(current_ids, h_state, l_state, device=inference_device)
-                    h_state, l_state = outputs['h_state'], outputs['l_state']
-                else:
-                    outputs = model(current_ids)
-                
-                logits = outputs["logits"]
-                next_token_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0)
-                
-                if next_token_id.item() == tokenizer.eos_token_id:
-                    break
-                    
-                response_ids.append(next_token_id.item())
-                decoded_token = tokenizer.decode([next_token_id.item()])
-                if "###" in decoded_token:
-                    break
-                print(decoded_token, end="", flush=True)
+    try:
+        while True:
+            prompt = input(">>> ")
+            if prompt.lower() in ["exit", "quit"]:
+                break
 
-                current_ids = torch.cat([current_ids, next_token_id], dim=1)
-    
-        if len(response_ids) > 0:
-            update_model = model
-            target_device = device if not is_quantized else "cpu"
+            prompt_format = f"### Instruction:\n{prompt}\n\n### Response:\n"
+            prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device if not is_quantized else "cpu")
 
-            if is_quantized and args.enable_quantized_learning:
-                print("\n[Updating LTM via shadow model...]", end="", flush=True)
-                shadow_model.ltm.load_state_dict(model.ltm.state_dict())
-                update_model = shadow_model
+            print("\nChronos: ", end="", flush=True)
+            response_ids = []
+
+            h_state = torch.zeros(1, config.h_hidden, device=device if not is_quantized else "cpu")
+            l_state = torch.zeros(1, config.l_hidden, device=device if not is_quantized else "cpu")
+
+            current_ids = prompt_ids
+            with torch.no_grad():
+                for i in range(args.max_new_tokens):
+                    if _HAS_KEYBOARD and keyboard.is_pressed('ctrl+x'):
+                        print("\n[Generation interrupted by user.]", end="", flush=True)
+                        break
+
+                    if is_quantized:
+                        outputs = model(current_ids, h_state, l_state, device=inference_device)
+                        h_state, l_state = outputs['h_state'], outputs['l_state']
+                    else:
+                        outputs = model(current_ids)
+
+                    logits = outputs["logits"]
+                    next_token_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0)
+
+                    if next_token_id.item() == tokenizer.eos_token_id:
+                        break
+
+                    response_ids.append(next_token_id.item())
+                    decoded_token = tokenizer.decode([next_token_id.item()])
+                    if "###" in decoded_token:
+                        break
+                    print(decoded_token, end="", flush=True)
+
+                    current_ids = torch.cat([current_ids, next_token_id], dim=1)
+
+            if len(response_ids) > 0 and (not is_quantized or args.enable_quantized_learning):
+                update_model = shadow_model if is_quantized else model
                 target_device = device
-            
-            if not is_quantized or args.enable_quantized_learning:
-                update_model.train()
+
+                if is_quantized:
+                    print("\n[Updating LTM via shadow model...]", end="", flush=True)
+                
+                update_model.train() # Set to train mode to enable gradients
                 with torch.enable_grad():
                     full_sequence = torch.cat([prompt_ids[0], torch.tensor(response_ids)], dim=0).unsqueeze(0).to(target_device)
                     labels = torch.cat([torch.full_like(prompt_ids[0], -100), torch.tensor(response_ids)], dim=0).unsqueeze(0).to(target_device)
-                    
+
                     update_model.zero_grad()
                     outputs = update_model(input_ids=full_sequence, labels=labels)
                     loss = outputs["loss"]
-                    
+
                     if loss is not None and not torch.isnan(loss):
                         loss.backward()
                         ltm_grads = outputs["topk_vals"].grad
-                        
-                        model.ltm.inner_update(outputs["topk_idx"], ltm_grads)
+
+                        # Update happens on the SHADOW model's LTM
+                        update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads)
+                        ltm_has_been_updated = True # Mark that a change has occurred
+
+                        # Copy the updated LTM weights back to the live quantized model
+                        if is_quantized:
+                            model.ltm.load_state_dict(update_model.ltm.state_dict())
                 
-                update_model.eval()
-                if is_quantized and args.enable_quantized_learning:
+                update_model.eval() # Set back to eval mode
+                if is_quantized:
                     print("[Done]", end="", flush=True)
 
-        print("\n\n" + "="*50)
+            print("\n\n" + "="*50)
+
+    except KeyboardInterrupt:
+        print("\n\n[Ctrl+C detected. Exiting chat.]")
+    
+    finally:
+        # --- SAVE ON EXIT LOGIC ---
+        if args.ltm_lora_path and model.ltm.accumulate_deltas:
+            if torch.any(model.ltm.ltm_deltas != 0):
+                print(f"\nSaving LTM memory deltas to {args.ltm_lora_path}...")
+                torch.save(model.ltm.ltm_deltas.cpu(), args.ltm_lora_path)
+                print("Done.")
+            else:
+                print("\nNo new LTM updates to save as LoRA.")
+        
+        elif is_quantized and args.enable_quantized_learning and ltm_has_been_updated:
+            print("\n--- LTM has been updated during this session ---")
+            
+            output_path = args.load_quantized
+            
+            while True:
+                response = input(f"Do you want to save these changes by re-quantizing the model to '{output_path}'? (y/n): ").lower()
+                if response in ["y", "yes"]:
+                    print(f"\nRe-quantizing model with updated LTM to {output_path}...")
+                    export_model(output_path, shadow_model, model.qtype)
+                    print("✅ Save complete.")
+                    break
+                elif response in ["n", "no"]:
+                    print("Changes will be discarded. Exiting.")
+                    break
+                else:
+                    print("Invalid input. Please enter 'y' or 'n'.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Chronos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora"], help="Operation mode.")
-    
-    parser.add_argument("--train", type=str, default=None, help="Path to training JSON/JSONL file.")
-    parser.add_argument("--out-dir", type=str, default="./chronos_checkpoints", help="Directory to save checkpoints/adapters.")
-    parser.add_argument("--ckpt", type=str, default=None, help="[Chat/Quantize] Path to a full-precision .pt checkpoint.")
-    parser.add_argument("--base-ckpt", type=str, default=None, help="[Finetune/Merge] Base checkpoint for fine-tuning or merging.")
-    parser.add_argument("--load-quantized", type=str, default=None, help="[Chat] Path to a quantized .npz model for chat.")
-    parser.add_argument("--out", type=str, default=None, help="[Quantize] Output path for quantization (e.g., model.npz).")
-    parser.add_argument("--ltm-lora-path", type=str, default=None, help="[Chat] Optional: Path to save/load LTM updates as a separate delta file.")
-    parser.add_argument("--lora-adapter-path", type=str, default=None, help="[Merge] Path to the trained LoRA adapter directory.")
-    parser.add_argument("--merged-out-path", type=str, default=None, help="[Merge] Output path for the merged model .pt file.")
 
-    parser.add_argument("--resume-from-ckpt", type=str, default=None, help="[Train] Path to a checkpoint .pt file to resume training from.")
-    parser.add_argument("--kayla", action="store_true", help="Enable Kayla-style instruction tuning (adds thought-process).")
-    parser.add_argument("--lora_r", type=int, default=8, help="[Finetune] LoRA attention dimension (rank).")
-    parser.add_argument("--lora_alpha", type=int, default=16, help="[Finetune] LoRA alpha parameter.")
-    parser.add_argument("--finetune-unlock-percent", type=float, default=None, help="[Finetune] Target percentage of params to train (e.g., 1.5 for 1.5%%). Overrides --lora_r if it's default.")
-    parser.add_argument("--quantize-on-complete", action="store_true", help="[Train] Automatically quantize the model after training finishes.")
-    
-    parser.add_argument("--auto-max-length", action="store_true", help="Automatically scan the dataset to find the longest sequence and set it as the max length for the tokenizer and model.")
+    # --- Data and Path Arguments (Universal) ---
+    path_group = parser.add_argument_group('Paths and Data')
+    path_group.add_argument("--train", type=str, default=None, help="Path to training/finetuning JSON or JSONL file.")
+    path_group.add_argument("--out-dir", type=str, default="./chronos_checkpoints", help="Directory to save checkpoints/adapters.")
+    path_group.add_argument("--ckpt", type=str, default=None, help="[Chat/Quantize] Path to a full-precision .pt checkpoint.")
+    path_group.add_argument("--base-ckpt", type=str, default=None, help="[Finetune/Merge] Base .pt checkpoint for fine-tuning or merging.")
+    path_group.add_argument("--load-quantized", type=str, default=None, help="[Chat] Path to a quantized .npz model for chat.")
+    path_group.add_argument("--out", type=str, default=None, help="[Quantize] Output path for quantization (e.g., model.npz).")
+    path_group.add_argument("--merged-out-path", type=str, default=None, help="[Merge] Output path for the merged model .pt file.")
+    path_group.add_argument("--lora-adapter-path", type=str, default=None, help="[Merge] Path to the trained LoRA adapter directory.")
+    path_group.add_argument("--tokenizer", type=str, default="microsoft/phi-2")
+    path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="[Train] Path to a checkpoint .pt file to resume training from.")
 
-    parser.add_argument("--context_dim", type=int, default=512)
-    parser.add_argument("--persistent_dim", type=int, default=128)
-    parser.add_argument("--ltm_slots", type=int, default=2048)
-    parser.add_argument("--ltm_key_dim", type=int, default=128)
-    parser.add_argument("--ltm_val_dim", type=int, default=128)
-    parser.add_argument("--h_hidden", type=int, default=512)
-    parser.add_argument("--l_hidden", type=int, default=512)
-    parser.add_argument("--h_steps", type=int, default=2)
-    parser.add_argument("--l_steps", type=int, default=3)
-    parser.add_argument("--ltm_topk", type=int, default=4, help="Number of LTM slots to retrieve per token.")
-    
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--accumulation-steps", type=int, default=1, help="Number of steps to accumulate gradients before performing an optimizer step. Simulates a larger batch size.")
-    parser.add_argument("--starting-lr", type=float, default=1e-4, help="The starting (maximum) learning rate for the scheduler.")
-    parser.add_argument("--ltm_lr", type=float, default=1e-2, help="Learning rate for the LTM's internal 'surprise' updates.")
-    parser.add_argument("--max_length", type=int, default=1024)
-    parser.add_argument("--disable-lr-schedule", action="store_true", help="Disable the cosine annealing learning rate scheduler and use a fixed LR.")
-    parser.add_argument("--min-lr", type=float, default=1e-6, help="The minimum learning rate for the cosine annealing scheduler to decay to.")
-    
-    parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--enable-quantized-learning", action="store_true", help="[Chat] Enable LTM updates for quantized models. Requires providing the original --ckpt.")
+    # --- Model Architecture Arguments (for Training/Finetuning) ---
+    arch_group = parser.add_argument_group('Architecture (for --mode train/finetune)')
+    arch_group.add_argument("--context_dim", type=int, default=512)
+    arch_group.add_argument("--persistent_dim", type=int, default=128)
+    arch_group.add_argument("--ltm_slots", type=int, default=2048)
+    arch_group.add_argument("--ltm_key_dim", type=int, default=128)
+    arch_group.add_argument("--ltm_val_dim", type=int, default=128)
+    arch_group.add_argument("--h_hidden", type=int, default=512)
+    arch_group.add_argument("--l_hidden", type=int, default=512)
+    arch_group.add_argument("--h_steps", type=int, default=2)
+    arch_group.add_argument("--l_steps", type=int, default=3)
+    arch_group.add_argument("--ltm_topk", type=int, default=4, help="Number of LTM slots to retrieve per token.")
+    arch_group.add_argument("--max_length", type=int, default=1024)
+    arch_group.add_argument("--auto-max-length", action="store_true", help="Automatically scan the dataset to find the longest sequence and set it as max_length.")
 
-    parser.add_argument("--qtype", type=str, default="INT4", choices=["INT4", "Q4_0", "Q8_0", "Q2_K"], help="Quantization type/format.")
-    
-    parser.add_argument("--tokenizer", type=str, default="microsoft/phi-2")
-    parser.add_argument("--threads", type=int, default=max(1, os.cpu_count() // 2))
-    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "vulkan"], help="[Chat] Device for quantized inference.")
+    # --- Training Arguments ---
+    train_group = parser.add_argument_group('Training and Finetuning')
+    train_group.add_argument("--epochs", type=int, default=3)
+    train_group.add_argument("--batch_size", type=int, default=4)
+    train_group.add_argument("--accumulation-steps", type=int, default=1, help="Simulates a larger batch size.")
+    train_group.add_argument("--starting-lr", type=float, default=1e-4)
+    train_group.add_argument("--min-lr", type=float, default=1e-6, help="Min LR for cosine annealing.")
+    train_group.add_argument("--disable-lr-schedule", action="store_true", help="Use a fixed LR instead of cosine annealing.")
+    train_group.add_argument("--ltm_lr", type=float, default=1e-2, help="LR for the LTM's internal 'surprise' updates.")
+    train_group.add_argument("--kayla", action="store_true", help="Enable Kayla-style instruction tuning (with thought-process).")
+    train_group.add_argument("--lora_r", type=int, default=8, help="[Finetune] LoRA rank.")
+    train_group.add_argument("--lora_alpha", type=int, default=16, help="[Finetune] LoRA alpha.")
+    train_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="[Finetune] Target percentage of params to train (e.g., 1.5 for 1.5%%). Overrides --lora_r.")
+    train_group.add_argument("--quantize-on-complete", action="store_true", help="[Train] Automatically quantize after training.")
+
+    # --- Inference Arguments ---
+    infer_group = parser.add_argument_group('Inference (Chat)')
+    infer_group.add_argument("--max-new-tokens", type=int, default=512)
+    infer_group.add_argument("--enable-quantized-learning", action="store_true", help="[Chat] Enable LTM updates for quantized models. Requires original --ckpt.")
+    infer_group.add_argument("--ltm-lora-path", type=str, default=None, help="[Chat] Optional: Path to save/load LTM updates as a separate delta file.")
+    infer_group.add_argument("--device", type=str, default="cpu", choices=["cpu", "vulkan"], help="[Chat] Device for quantized inference.")
+
+    # --- Other Arguments ---
+    other_group = parser.add_argument_group('Other Settings')
+    other_group.add_argument("--qtype", type=str, default="INT4", choices=["INT4", "Q4_0", "Q8_0", "Q2_K"], help="Quantization type/format.")
+    other_group.add_argument("--threads", type=int, default=max(1, os.cpu_count() // 2))
 
     args = parser.parse_args()
-    
+
     set_threads(args.threads)
-    pt_device = pick_device() 
+    pt_device = pick_device()
     print(f"Using PyTorch device: {pt_device}")
-    
+
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    args.vocab_size = len(tokenizer)
+    # Only add vocab size to args for training, otherwise it's loaded from config
+    if args.mode in ["train", "finetune"]:
+        args.vocab_size = len(tokenizer)
 
     if args.auto_max_length:
         if not args.train:
@@ -896,14 +1036,20 @@ def main():
 
         print("INFO: --auto-max-length enabled. Scanning dataset to find the maximum sequence length...")
         max_found_length = 0
-        
+
         with open(args.train, 'r', encoding='utf-8') as f:
-            
+
             def get_text_from_obj(obj, kayla_mode):
                 try:
                     if kayla_mode:
-                        return f"### Instruction:\n{obj.get('Instruction', '')}\n\n### Thought Process:\n{obj.get('thought-process', '')}\n\n### Response:\n{obj.get('output', '')}"
+                        # Add feelings if present, otherwise it's an empty string
+                        feelings_part = f"### Feelings:\n{obj.get('feelings')}\n\n" if obj.get('feelings') else ""
+                        return (f"### Instruction:\n{obj.get('Instruction', '')}\n\n"
+                                f"{feelings_part}"
+                                f"### Thought Process:\n{obj.get('thought-process', '')}\n\n"
+                                f"### Response:\n{obj.get('output', '')}")
                     else:
+                        # Standard instruction format remains unchanged
                         return f"### Instruction:\n{obj.get('instruction', '')}\n\n### Response:\n{obj.get('output', '') or obj.get('response', '')}"
                 except:
                     return ""
@@ -925,9 +1071,10 @@ def main():
                         if length > max_found_length: max_found_length = length
                     except:
                         continue
-        
+
         if max_found_length > 0:
-            max_found_length += 16 
+            # Add a small buffer
+            max_found_length += 16
             print(f"✅ Auto-scan complete. Found max sequence length: {max_found_length - 16}. Setting max_length to {max_found_length}.")
             args.max_length = max_found_length
             tokenizer.model_max_length = max_found_length
@@ -945,10 +1092,10 @@ def main():
     elif args.mode == "merge-lora":
         if not args.base_ckpt: parser.error("`--base_ckpt` is required for merge-lora mode.")
         if not args.lora_adapter_path: parser.error("`--lora-adapter-path` is required for merge-lora mode.")
-        merge_lora(args)
+        merge_lora(args, pt_device)
     elif args.mode == "quantize":
         if not args.ckpt: parser.error("`--ckpt` is required for quantize mode.")
-        quantize(args)
+        quantize(args, pt_device)
     elif args.mode == "chat":
         if not (args.ckpt or args.load_quantized):
             parser.error("`--ckpt` or `--load-quantized` is required for chat mode.")
