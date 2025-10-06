@@ -97,6 +97,7 @@ Train a new model from scratch on a JSON or JSONL dataset.
 ```sh
 python chronos.py train --train "path/to/your_data.jsonl" --epochs 10 --batch_size 1 --accumulation-steps 8 --starting-lr 1e-4 --min-lr 1e-6 --out-dir "./my_model"
 ```
+Note: The tokenizer is not locked to `phi-2`. You can specify any compatible model from the Hugging Face Hub with the `--tokenizer` argument in your command.
 
 #### Kayla Mode Training (Chain-of-Thought and feelings)
 
