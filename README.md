@@ -55,25 +55,25 @@ For Developers (Re-compiling the Kernel): To compile the kernel with Vulkan supp
 Installation
 Clone the repository:
 
-Bash
 
-git clone https://github.com/necat101/Chronos.git
-cd chronos
+```git clone https://github.com/necat101/Chronos.git
+cd chronos ```
 Create a virtual environment (recommended):
 
 
-python -m venv .venv
+```python -m venv .venv
+```
 # On Windows
-.\.venv\Scripts\Activate
+```.\.venv\Scripts\Activate``
 # On Linux/macOS
-source .venv/bin/activate
+```source .venv/bin/activate```
 Run the setup script: This will install Python dependencies and compile the C++ kernel.
 
 
 # On Windows
-setup.bat
+```.\setup.bat```
 # On Linux/macOS
-bash setup.sh
+./setup.sh
 This will create a chronos_matmul library file in your project root.
 
 User Guide
@@ -83,49 +83,49 @@ The chronos.py script is the main entry point for all operations. All models are
 Train a new model from scratch. This will create a new model directory at --out-dir containing the weights and tokenizer.
 
 
-python chronos.py train \
+```python chronos.py train \
     --train "path/to/your_data.jsonl" \
     --tokenizer-path "microsoft/phi-2" \
     --out-dir "./my_chronos_model" \
     --epochs 5 \
-    --batch_size 2
+    --batch_size 2```
 Kayla Mode Training (Chain-of-Thought and feelings)
 Enable Kayla Mode by adding the --kayla flag. The dataset needs Instruction, thought-process, feelings, and output fields.
 
 
-python chronos.py train --train "path/to/kayla_data.jsonl" --kayla --out-dir "./my_kayla_model"
+```python chronos.py train --train "path/to/kayla_data.jsonl" --kayla --out-dir "./my_kayla_model"```
 Resuming Training
 If your training is interrupted, you can resume by pointing to the model directory containing the partial checkpoints.
 
 
-python chronos.py train --train "path/to/your_data.jsonl" --resume-from-model-path "./my_chronos_model"
+```python chronos.py train --train "path/to/your_data.jsonl" --resume-from-model-path "./my_chronos_model"```
 2. Fine-Tuning (LoRA)
 Adapt a pre-trained model using LoRA. This loads a full model directory and saves the adapter to a separate output directory.
 
 
-python chronos.py finetune \
+```python chronos.py finetune \
     --model-path "./my_chronos_model" \
     --train "path/to/new_data.jsonl" \
     --out-dir "./my_lora_adapter" \
-    --epochs 3
+    --epochs 3```
 You can control the adapter size with --finetune-unlock-percent 1.5 (for 1.5% trainable parameters).
 
 3. Merging a LoRA Adapter
 Merge the adapter back into the base model to create a new, standalone model directory.
 
 
-python chronos.py merge-lora \
+```python chronos.py merge-lora \
     --model-path "./my_chronos_model" \
     --lora-adapter-path "./my_lora_adapter" \
-    --out-dir "./my_model_merged"
+    --out-dir "./my_model_merged"```
 4. Quantization
 Convert a full-precision model directory into a quantized model directory.
 
 
-python chronos.py quantize \
+```python chronos.py quantize \
     --model-path "./my_model_merged" \
     --out-dir "./my_model_merged-INT4" \
-    --qtype INT4
+    --qtype INT4```
 The output directory will contain the .npz file and a copy of the essential tokenizer files. Available qtype: INT4, Q4_0, Q8_0, Q2_K.
 
 5. Inference (Chat Mode)
@@ -135,31 +135,31 @@ Running a Quantized Model (Recommended)
 On CPU:
 
 
-python chronos.py chat --model-path "./my_model_merged-INT4"
+```python chronos.py chat --model-path "./my_model_merged-INT4"```
 On GPU (Vulkan):
 
 
-python chronos.py chat --model-path "./my_model_merged-INT4" --device vulkan
+```python chronos.py chat --model-path "./my_model_merged-INT4" --device vulkan```
 Enabling Online Learning in Chat
 Allow the model to learn from your conversation.
 
 Modify & Re-quantize (Recommended): This method updates the model in memory and then asks if you want to save the changes by re-quantizing upon exit. This makes your model permanently smarter.
 
 
-python chronos.py chat \
+```python chronos.py chat \
     --model-path "./my_model_merged-INT4" \
     --enable-quantized-learning \
-    --shadow-model-path "./my_model_merged"
+    --shadow-model-path "./my_model_merged"```
 Note: Online learning requires the quantized model (--model-path) and the original full-precision model (--shadow-model-path).
 
 Save Updates Separately (LoRA-style): To save only the LTM updates without modifying the base model, use --ltm-lora-path.
 
 
-python chronos.py chat \
+```python chronos.py chat \
     --model-path "./my_model_merged-INT4" \
     --enable-quantized-learning \
     --shadow-model-path "./my_model_merged" \
-    --ltm-lora-path "./my_ltm_updates.pt"
+    --ltm-lora-path "./my_ltm_updates.pt"```
 The memory updates will be saved to my_ltm_updates.pt when you quit.
 
 Command-Line Reference
