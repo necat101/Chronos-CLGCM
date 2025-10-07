@@ -274,15 +274,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 <br>
 
-\<details\>
-\<summary\>\<b\>v0.3 Alpha Changelog\</b\>\</summary\>
+
 
   - Refactored to a directory-based model system to bundle weights and tokenizer files together.
   - Fixed critical tokenizer mismatch bug that caused gibberish output during inference.
   - Simplified command-line interface by unifying model loading under the `--model-path` argument.
   - Deprecated old file-based flags (`--ckpt`, `--load-quantized`, etc.) in favor of the new, more robust system.
 
-\</details\>
 
 -----
 
