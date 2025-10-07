@@ -1,15 +1,15 @@
-Chronos v0.3 (alpha): A Hybrid Memory-Reasoning Architecture
+# Chronos v0.3 (alpha): A Hybrid Memory-Reasoning Architecture
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 License: Custom (Free for non-commercial use) | Python: 3.8+
 
-What's New in v0.3
+# What's New in v0.3
 Major Change: Directory-Based Models!
 To permanently fix tokenizer mismatch errors and make models truly portable, Chronos now saves and loads models as self-contained directories. Each directory includes both the model weights (.pt or .npz) and the necessary tokenizer files.
 
 This is a critical change that simplifies the workflow and improves reliability. You will now use the --model-path argument to point to these directories instead of the old file-based flags like --ckpt and --load-quantized.
 
-About The Project
+# About The Project:
 The field of AI has been dominated by a paradigm of unprecedented scale, yet fundamental limitations in today's Transformer models are becoming apparent. The path to Artificial General Intelligence (AGI) may not be paved with scale alone. Chronos challenges this paradigm by focusing on architectural intelligence.
 
 This project introduces a novel hybrid model where a deep reasoning engine operates within a dynamic, lifelong learning memory environment. Chronos is conceived not merely to process information, but to think, learn, and remember in a cohesive, integrated, and human-like manner.
