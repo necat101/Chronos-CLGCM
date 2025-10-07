@@ -62,6 +62,11 @@ except ImportError:
     sys.exit(1) # Exit the program because the kernel is essential
 
 
+# --- CONSTANTS --- # <<< NEW
+MODEL_WEIGHTS_NAME = "chronos.pt"
+QUANTIZED_MODEL_WEIGHTS_NAME_TPL = "chronos-{qtype}.npz"
+
+
 # --- HELPER CLASS: AttrDict ---
 class AttrDict(dict):
     """A dictionary that allows for attribute-style access."""
@@ -217,52 +222,55 @@ def get_q_block_size(qtype: str) -> int:
     else:
         raise ValueError(f"Unknown quantization type: {qtype}")
 
-def export_model(output_path: str, model: nn.Module, qtype: str):
-    """Quantizes and exports the model to a compressed .npz file with config."""
+# <<< CHANGED: This function now saves to a directory with tokenizer files
+def export_and_quantize_model(output_dir: str, model: nn.Module, tokenizer, qtype: str):
+    """Quantizes and exports the model to a directory containing the .npz and tokenizer."""
     if not _HAS_KERNEL:
         print("ERROR: C++ kernel is required for quantization. Aborting.")
         return
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, QUANTIZED_MODEL_WEIGHTS_NAME_TPL.format(qtype=qtype))
 
     print(f"Quantizing and exporting model to {output_path} with {qtype} weights...")
     state_dict = model.state_dict()
     quantized_tensors = {}
 
-    # Save config into the quantized file
-    # Ensure config is a plain dict before saving for numpy compatibility
     config_to_save = dict(model.config)
     quantized_tensors['_config'] = np.array(config_to_save)
 
     Q_BLOCK_SIZE = get_q_block_size(qtype)
 
     for name, tensor in tqdm(state_dict.items(), desc="Quantizing Tensors"):
-        # We quantize linear layers, but exclude embeddings and the LTM module itself,
-        # which should remain in high precision for learning.
         if tensor.ndim == 2 and "emb" not in name and "ltm" not in name:
             float_tensor_np = tensor.cpu().float().numpy()
             M, K = float_tensor_np.shape
 
-            # Pad the tensor if its inner dimension is not a multiple of the block size
             pad_cols = 0
             if K % Q_BLOCK_SIZE != 0:
                 pad_cols = Q_BLOCK_SIZE - (K % Q_BLOCK_SIZE)
                 float_tensor_np = np.pad(float_tensor_np, ((0, 0), (0, pad_cols)), 'constant')
 
-            # Use the C++ kernel to quantize the weights
             quantized_data = chronos_matmul.quantize(float_tensor_np, qtype)
-
             quantized_tensors[name] = {
                 "quantized": quantized_data,
                 "qtype": qtype,
                 "original_shape": [M, K],
             }
         else:
-            # Store non-quantized tensors as is
             quantized_tensors[name] = {"raw": tensor.cpu().numpy()}
 
     np.savez_compressed(output_path, **quantized_tensors)
-    print(f"Model successfully exported to {output_path}")
+    print(f"Model weights successfully exported to {output_path}")
 
-# --- Model Architecture ---
+    # <<< NEW: Also save the tokenizer
+    tokenizer.save_pretrained(output_dir)
+    print(f"Tokenizer files saved to {output_dir}")
+
+# ... (QuantizedLinear, QuantizedGRUCell, GRUCell, LTMModule, ChronosCore classes are unchanged) ...
+# NOTE: To keep this response manageable, I'm omitting the large, unchanged model class definitions.
+# Paste them back in from your original file. They require no edits.
+
 class QuantizedLinear:
     """A wrapper for a quantized linear layer that uses the C++ kernel for inference."""
     def __init__(self, name: str, q_data: dict):
@@ -415,7 +423,7 @@ class ChronosCore(nn.Module):
         return {"input_ids": input_ids}
 
     def _get_prompt_embedding(self, prompt_embedding):
-         return prompt_embedding
+        return prompt_embedding
 
     def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, labels: Optional[torch.LongTensor] = None, **kwargs):
         B, T = input_ids.shape
@@ -478,6 +486,7 @@ class ChronosCore(nn.Module):
 
         return {"loss": loss, "logits": logits, "topk_vals": seq_topk_vals, "topk_idx": seq_topk_idx}
 
+
 class QuantizedChronos:
     """The quantized Chronos model for CPU/Vulkan inference."""
     def __init__(self, config: dict, q_data: dict):
@@ -536,55 +545,58 @@ class QuantizedChronos:
         logits = self.lm_head(final_embedding, device=device)
         return {"logits": logits.unsqueeze(1), "h_state": h_state, "l_state": l_state}
 
-def load_quantized(model_path):
-    print(f"Loading quantized model from: {model_path}")
-    q_data = np.load(model_path, allow_pickle=True)
+# <<< CHANGED: This function now loads from a directory
+def load_quantized(model_path: str):
+    print(f"Loading quantized model from directory: {model_path}")
+    
+    # Find the .npz file in the directory
+    npz_files = [f for f in os.listdir(model_path) if f.endswith('.npz')]
+    if not npz_files:
+        raise FileNotFoundError(f"No quantized model .npz file found in {model_path}")
+    if len(npz_files) > 1:
+        print(f"Warning: Multiple .npz files found. Using the first one: {npz_files[0]}")
+    
+    weights_path = os.path.join(model_path, npz_files[0])
+    q_data = np.load(weights_path, allow_pickle=True)
 
     if '_config' not in q_data:
-        raise ValueError("Quantized model file is missing '_config' data. Please re-quantize the model with this script version.")
+        raise ValueError("Quantized model file is missing '_config' data. Please re-quantize the model.")
 
-    config = q_data['_config'].item() # .item() extracts the dict from the numpy array
+    config = q_data['_config'].item()
     return QuantizedChronos(config, q_data)
 
-def load_full_model_with_config(model_path, cli_args, device):
-    checkpoint = torch.load(model_path, map_location=device)
+# <<< CHANGED: This function now loads from a directory
+def load_full_model_with_config(model_path: str, cli_args, device):
+    weights_path = os.path.join(model_path, MODEL_WEIGHTS_NAME)
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Model weights file '{MODEL_WEIGHTS_NAME}' not found in '{model_path}'")
+        
+    checkpoint = torch.load(weights_path, map_location=device)
 
-    if 'config' in checkpoint:
-        config = checkpoint['config']
-    elif 'args' in checkpoint:
-        config = checkpoint['args']
-    else:
-        print("!!! WARNING: Model config not found in checkpoint. Falling back to command-line arguments.")
-        print("!!!          This is not recommended. Please re-save your final model using the latest script.")
-        config = vars(cli_args)
-
+    # Config is always loaded from the checkpoint
+    if 'config' not in checkpoint:
+        raise ValueError("Model config not found in checkpoint. The model file is likely corrupted or from an old version.")
+    config = checkpoint['config']
+    
     config_dict = vars(config) if not isinstance(config, dict) else config
     config_dict['max_new_tokens'] = cli_args.max_new_tokens
 
-    # Add a default model_type if it is missing, for PEFT compatibility
     if 'model_type' not in config_dict:
         config_dict['model_type'] = 'chronos'
 
     model = ChronosCore(config_dict).to(device)
-
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        print("Warning: Loading a legacy checkpoint with a raw state_dict.")
-        model.load_state_dict(checkpoint)
+    model.load_state_dict(checkpoint['model_state_dict'])
 
     return model, model.config
+
 
 def train(args, device, tokenizer):
     print("Running in TRAIN mode...")
     config = vars(args)
-
-    # Add a model_type for newly created models, for PEFT compatibility
     config['model_type'] = 'chronos'
     
     model = ChronosCore(config).to(device)
     optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
-
     dataloader = create_dataloader(args.train, tokenizer, args.max_length, args.batch_size, tokenizer.pad_token_id, kayla_mode=args.kayla)
 
     scheduler = None
@@ -594,16 +606,18 @@ def train(args, device, tokenizer):
         scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
 
     start_epoch = 0
-    if args.resume_from_ckpt:
-        if not os.path.exists(args.resume_from_ckpt):
-            raise FileNotFoundError(f"Checkpoint to resume from not found at {args.resume_from_ckpt}")
+    if args.resume_from_model_path:
+        # <<< CHANGED: Resume logic now uses the model path
+        resume_ckpt_path = os.path.join(args.resume_from_model_path, MODEL_WEIGHTS_NAME)
+        if not os.path.exists(resume_ckpt_path):
+            raise FileNotFoundError(f"Checkpoint to resume from not found at {resume_ckpt_path}")
 
-        print(f"Resuming training from checkpoint: {args.resume_from_ckpt}")
-        checkpoint = torch.load(args.resume_from_ckpt, map_location=device)
-
-        if 'model_state_dict' not in checkpoint or 'optimizer_state_dict' not in checkpoint:
-            print("\nERROR: The specified checkpoint is not a valid training checkpoint.")
-            sys.exit(1)
+        print(f"Resuming training from checkpoint in: {args.resume_from_model_path}")
+        checkpoint = torch.load(resume_ckpt_path, map_location=device)
+        
+        # Check if it's a training checkpoint or a final model
+        if 'optimizer_state_dict' not in checkpoint:
+             raise ValueError("The specified checkpoint is a final inference model, not a training checkpoint. Cannot resume.")
 
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -618,7 +632,6 @@ def train(args, device, tokenizer):
     model.train()
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     os.makedirs(args.out_dir, exist_ok=True)
-
     optimizer.zero_grad()
 
     for epoch in range(start_epoch, args.epochs):
@@ -645,8 +658,9 @@ def train(args, device, tokenizer):
                 current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
                 pbar.set_postfix({"loss": f"{total_loss / (i + 1):.4f}", "lr": f"{current_lr:.2e}"})
 
+        # <<< CHANGED: Checkpoint saving now saves inside the output directory
         ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
-        print(f"Epoch {epoch + 1} complete. Saving checkpoint to {ckpt_path}")
+        print(f"Epoch {epoch + 1} complete. Saving training checkpoint to {ckpt_path}")
         config_to_save = dict(model.config)
         torch.save({
             'completed_epoch': epoch + 1,
@@ -656,25 +670,33 @@ def train(args, device, tokenizer):
             'config': config_to_save,
         }, ckpt_path)
 
-    final_save_path = os.path.join(args.out_dir, "chronos_final.pt")
+    # <<< CHANGED: Final save now includes the tokenizer
+    final_save_path = os.path.join(args.out_dir, MODEL_WEIGHTS_NAME)
     print(f"\nTraining finished. Saving final inference model to {final_save_path}")
     config_to_save = dict(model.config)
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': config_to_save
     }, final_save_path)
+    
+    tokenizer.save_pretrained(args.out_dir)
+    print(f"Tokenizer files saved to {args.out_dir}")
 
     if args.quantize_on_complete:
         print("\n--- Training Complete: Starting On-the-Fly Quantization ---")
-        quant_args = argparse.Namespace(ckpt=final_save_path, out=None, qtype=args.qtype)
-        quantize(args, device)
+        quantize_out_path = args.out_dir + f"-{args.qtype}"
+        quantize(args, device, model, tokenizer, quantize_out_path)
 
+
+# <<< CHANGED: Finetune now loads and saves to directories
 def finetune(args, device, tokenizer):
     if not _HAS_PEFT: raise ImportError("Please install 'peft' for fine-tuning.")
     print("Running in FINETUNE mode with LoRA...")
 
-    model, model_config = load_full_model_with_config(args.base_ckpt, args, device)
+    # The tokenizer passed in is already loaded from the base model path
+    model, model_config = load_full_model_with_config(args.model_path, args, device)
 
+    # ... (LoRA config logic is unchanged)
     lora_r = args.lora_r
     if args.finetune_unlock_percent:
         if args.lora_r != 8:
@@ -695,9 +717,6 @@ def finetune(args, device, tokenizer):
             else:
                 print("Warning: Could not find target modules for LoRA. Using default r=8.")
 
-    # =================================================================================
-    # === MODIFICATION: Add modules_to_save to LoraConfig =============================
-    # =================================================================================
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=args.lora_alpha,
@@ -705,9 +724,8 @@ def finetune(args, device, tokenizer):
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
-        modules_to_save=["ltm"],  # <-- This tells PEFT to not freeze the LTM module
+        modules_to_save=["ltm"],
     )
-    # =================================================================================
     
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
@@ -722,6 +740,7 @@ def finetune(args, device, tokenizer):
         print(f"INFO: Step-based Cosine Annealing LR scheduler ENABLED for finetuning. Total update steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
         scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
 
+    # ... (Training loop is unchanged)
     optimizer.zero_grad()
     for epoch in range(args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
@@ -744,19 +763,18 @@ def finetune(args, device, tokenizer):
 
                 current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
                 pbar.set_postfix({"loss": f"{total_loss / (i+1):.4f}", "lr": f"{current_lr:.2e}"})
+    
+    print(f"Saving LoRA adapter to {args.out_dir}")
+    model.save_pretrained(args.out_dir)
 
-    adapter_path = os.path.join(args.out_dir, "chronos_lora_adapter")
-    print(f"Saving LoRA adapter to {adapter_path}")
-    model.save_pretrained(adapter_path)
 
-def merge_lora(args, device):
+# <<< CHANGED: Merge now loads and saves to directories
+def merge_lora(args, device, tokenizer):
     if not _HAS_PEFT: raise ImportError("Please install 'peft' for merging.")
     print("Running in MERGE-LORA mode...")
-    if not args.base_ckpt or not os.path.exists(args.base_ckpt): raise FileNotFoundError(f"Base checkpoint not found at {args.base_ckpt}")
-    if not args.lora_adapter_path or not os.path.exists(args.lora_adapter_path): raise FileNotFoundError(f"LoRA adapter not found at {args.lora_adapter_path}")
-
-    print(f"Loading base model from {args.base_ckpt}...")
-    base_model, _ = load_full_model_with_config(args.base_ckpt, args, device)
+    
+    print(f"Loading base model from {args.model_path}...")
+    base_model, _ = load_full_model_with_config(args.model_path, args, device)
 
     print(f"Loading LoRA adapter from {args.lora_adapter_path}...")
     model = PeftModel.from_pretrained(base_model, args.lora_adapter_path)
@@ -764,25 +782,43 @@ def merge_lora(args, device):
     print("Merging adapter into the base model...")
     model = model.merge_and_unload()
 
-    output_path = args.merged_out_path or args.base_ckpt.replace(".pt", "-merged.pt")
+    output_path = os.path.join(args.out_dir, MODEL_WEIGHTS_NAME)
     print(f"Saving merged model to {output_path}...")
     config_to_save = dict(model.config)
     torch.save({
         'model_state_dict': model.state_dict(),
         'config': config_to_save
     }, output_path)
+    
+    tokenizer.save_pretrained(args.out_dir)
+    print(f"Tokenizer files saved to {args.out_dir}")
     print("Merge complete.")
 
-def quantize(args, device):
+
+# <<< CHANGED: Quantize now operates on directories
+def quantize(args, device, model=None, tokenizer=None, out_path=None):
     print(f"Running in QUANTIZE mode with {args.qtype} precision...")
-    if not args.ckpt or not os.path.exists(args.ckpt): raise FileNotFoundError(f"Checkpoint not found at {args.ckpt}")
+    
+    # Allow passing in an already-loaded model (e.g., from train --quantize-on-complete)
+    if model is None or tokenizer is None:
+        if not args.model_path:
+            raise ValueError("--model-path is required for quantize mode.")
+        print(f"Loading full-precision model from {args.model_path}...")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+        model, _ = load_full_model_with_config(args.model_path, args, device)
 
-    print(f"Loading full-precision model from {args.ckpt}...")
-    model, _ = load_full_model_with_config(args.ckpt, args, device)
+    # Determine output path
+    if out_path is None:
+        if not args.out_dir:
+            # Default to creating a new dir next to the source
+            out_path = args.model_path.rstrip('/\\') + f"-{args.qtype}"
+        else:
+            out_path = args.out_dir
 
-    out_path = args.out if args.out else args.ckpt.replace(".pt", f"-{args.qtype}.npz")
-    export_model(out_path, model, qtype=args.qtype)
+    export_and_quantize_model(out_path, model, tokenizer, qtype=args.qtype)
 
+
+# <<< CHANGED: Chat mode now loads a model directory
 def chat(args, device, tokenizer):
     print("Running in CHAT mode...")
 
@@ -793,13 +829,16 @@ def chat(args, device, tokenizer):
     inference_device = "cpu" # Default for quantized models
     ltm_has_been_updated = False # Flag to track if we need to save
 
-    if args.load_quantized:
+    # Determine if loading quantized or full model
+    npz_files = [f for f in os.listdir(args.model_path) if f.endswith('.npz')]
+    if npz_files:
         if not _HAS_KERNEL:
             print("ERROR: Cannot run quantized chat without the C++ kernel.")
             return
-        model = load_quantized(args.load_quantized)
+        model = load_quantized(args.model_path)
         config = model.config
         is_quantized = True
+        print(f"Loaded quantized model with {model.qtype} weights.")
 
         if args.device == 'vulkan':
             if not _HAS_VULKAN:
@@ -807,29 +846,26 @@ def chat(args, device, tokenizer):
             else:
                 inference_device = "vulkan"
                 print("INFO: Using Vulkan for inference.")
-
+        
         if args.enable_quantized_learning:
-            if not args.ckpt:
-                raise ValueError("To enable learning on a quantized model, you must provide the original full-precision checkpoint via --ckpt.")
+            if not args.shadow_model_path:
+                raise ValueError("To enable learning on a quantized model, you must provide the original full-precision model directory via --shadow-model-path.")
             print("Loading full-precision 'shadow' model for online learning...")
             # Shadow model config must match the quantized one
             shadow_model = ChronosCore(dict(config)).to(device)
-            shadow_checkpoint = torch.load(args.ckpt, map_location=device)
-            # Ensure we load the state dict correctly
-            state_dict_to_load = shadow_checkpoint.get('model_state_dict', shadow_checkpoint)
-            shadow_model.load_state_dict(state_dict_to_load)
+            shadow_weights_path = os.path.join(args.shadow_model_path, MODEL_WEIGHTS_NAME)
+            shadow_checkpoint = torch.load(shadow_weights_path, map_location=device)
+            shadow_model.load_state_dict(shadow_checkpoint.get('model_state_dict', shadow_checkpoint))
             
             # Sync the quantized model's initial LTM state to the shadow model
             shadow_model.ltm.load_state_dict(model.ltm.state_dict())
             shadow_model.eval()
 
-
-    elif args.ckpt:
-        model, config = load_full_model_with_config(args.ckpt, args, device)
+    else: # Load full precision model
+        model, config = load_full_model_with_config(args.model_path, args, device)
         inference_device = device
-    else:
-        raise ValueError("Provide --ckpt for a full model or --load-quantized for a quantized one.")
 
+    # ... (Online learning and chat loop logic is mostly unchanged)
     if args.ltm_lora_path:
         print(f"LTM online learning is ACTIVE. Updates will be stored separately at: {args.ltm_lora_path}")
         model.ltm.accumulate_deltas = True
@@ -941,13 +977,13 @@ def chat(args, device, tokenizer):
         elif is_quantized and args.enable_quantized_learning and ltm_has_been_updated:
             print("\n--- LTM has been updated during this session ---")
             
-            output_path = args.load_quantized
+            output_dir = args.model_path # Overwrite the existing quantized model dir
             
             while True:
-                response = input(f"Do you want to save these changes by re-quantizing the model to '{output_path}'? (y/n): ").lower()
+                response = input(f"Do you want to save these changes by re-quantizing the model to '{output_dir}'? (y/n): ").lower()
                 if response in ["y", "yes"]:
-                    print(f"\nRe-quantizing model with updated LTM to {output_path}...")
-                    export_model(output_path, shadow_model, model.qtype)
+                    print(f"\nRe-quantizing model with updated LTM to {output_dir}...")
+                    export_and_quantize_model(output_dir, shadow_model, tokenizer, model.qtype)
                     print("✅ Save complete.")
                     break
                 elif response in ["n", "no"]:
@@ -963,19 +999,17 @@ def main():
 
     # --- Data and Path Arguments (Universal) ---
     path_group = parser.add_argument_group('Paths and Data')
-    path_group.add_argument("--train", type=str, default=None, help="Path to training/finetuning JSON or JSONL file.")
-    path_group.add_argument("--out-dir", type=str, default="./chronos_checkpoints", help="Directory to save checkpoints/adapters.")
-    path_group.add_argument("--ckpt", type=str, default=None, help="[Chat/Quantize] Path to a full-precision .pt checkpoint.")
-    path_group.add_argument("--base-ckpt", type=str, default=None, help="[Finetune/Merge] Base .pt checkpoint for fine-tuning or merging.")
-    path_group.add_argument("--load-quantized", type=str, default=None, help="[Chat] Path to a quantized .npz model for chat.")
-    path_group.add_argument("--out", type=str, default=None, help="[Quantize] Output path for quantization (e.g., model.npz).")
-    path_group.add_argument("--merged-out-path", type=str, default=None, help="[Merge] Output path for the merged model .pt file.")
+    path_group.add_argument("--train", type=str, default=None, help="[Train/Finetune] Path to training JSON or JSONL file.")
+    path_group.add_argument("--model-path", type=str, default=None, help="[All except Train] Path to the model directory.")
+    path_group.add_argument("--out-dir", type=str, default="./chronos_model", help="[Train/Finetune/Merge/Quantize] Directory to save the new model/adapter.")
     path_group.add_argument("--lora-adapter-path", type=str, default=None, help="[Merge] Path to the trained LoRA adapter directory.")
-    path_group.add_argument("--tokenizer", type=str, default="microsoft/phi-2")
-    path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="[Train] Path to a checkpoint .pt file to resume training from.")
+    path_group.add_argument("--tokenizer-path", type=str, default="microsoft/phi-2", help="[Train] Path or HF name of the tokenizer to use for a new model.")
+    path_group.add_argument("--resume-from-model-path", type=str, default=None, help="[Train] Path to a model directory containing a training checkpoint to resume from.")
+    path_group.add_argument("--shadow-model-path", type=str, default=None, help="[Chat] Path to the original full-precision model dir, required for online learning with a quantized model.")
 
-    # --- Model Architecture Arguments (for Training/Finetuning) ---
-    arch_group = parser.add_argument_group('Architecture (for --mode train/finetune)')
+
+    # --- Model Architecture Arguments (for Training) ---
+    arch_group = parser.add_argument_group('Architecture (for --mode train)')
     arch_group.add_argument("--context_dim", type=int, default=512)
     arch_group.add_argument("--persistent_dim", type=int, default=128)
     arch_group.add_argument("--ltm_slots", type=int, default=2048)
@@ -1007,7 +1041,7 @@ def main():
     # --- Inference Arguments ---
     infer_group = parser.add_argument_group('Inference (Chat)')
     infer_group.add_argument("--max-new-tokens", type=int, default=512)
-    infer_group.add_argument("--enable-quantized-learning", action="store_true", help="[Chat] Enable LTM updates for quantized models. Requires original --ckpt.")
+    infer_group.add_argument("--enable-quantized-learning", action="store_true", help="[Chat] Enable LTM updates for quantized models. Requires --shadow-model-path.")
     infer_group.add_argument("--ltm-lora-path", type=str, default=None, help="[Chat] Optional: Path to save/load LTM updates as a separate delta file.")
     infer_group.add_argument("--device", type=str, default="cpu", choices=["cpu", "vulkan"], help="[Chat] Device for quantized inference.")
 
@@ -1022,15 +1056,25 @@ def main():
     pt_device = pick_device()
     print(f"Using PyTorch device: {pt_device}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    # <<< CHANGED: Tokenizer loading is now context-dependent
+    tokenizer = None
+    if args.mode == "train":
+        print(f"Loading tokenizer '{args.tokenizer_path}' for new model training...")
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
+    elif args.model_path:
+        print(f"Loading tokenizer from model directory: {args.model_path}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    else:
+        parser.error("--model-path is required for this mode.")
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Only add vocab size to args for training, otherwise it's loaded from config
-    if args.mode in ["train", "finetune"]:
+    if args.mode == "train":
         args.vocab_size = len(tokenizer)
 
     if args.auto_max_length:
+        # ... (auto-max-length logic is unchanged)
         if not args.train:
             parser.error("--auto-max-length requires a --train file to be specified.")
 
@@ -1042,14 +1086,12 @@ def main():
             def get_text_from_obj(obj, kayla_mode):
                 try:
                     if kayla_mode:
-                        # Add feelings if present, otherwise it's an empty string
                         feelings_part = f"### Feelings:\n{obj.get('feelings')}\n\n" if obj.get('feelings') else ""
                         return (f"### Instruction:\n{obj.get('Instruction', '')}\n\n"
                                 f"{feelings_part}"
                                 f"### Thought Process:\n{obj.get('thought-process', '')}\n\n"
                                 f"### Response:\n{obj.get('output', '')}")
                     else:
-                        # Standard instruction format remains unchanged
                         return f"### Instruction:\n{obj.get('instruction', '')}\n\n### Response:\n{obj.get('output', '') or obj.get('response', '')}"
                 except:
                     return ""
@@ -1073,7 +1115,6 @@ def main():
                         continue
 
         if max_found_length > 0:
-            # Add a small buffer
             max_found_length += 16
             print(f"✅ Auto-scan complete. Found max sequence length: {max_found_length - 16}. Setting max_length to {max_found_length}.")
             args.max_length = max_found_length
@@ -1081,25 +1122,23 @@ def main():
         else:
             print("⚠️ WARNING: Auto-scan did not find any valid entries. Using default max_length.")
 
-
+    # <<< CHANGED: Simplified mode dispatching
     if args.mode == "train":
         if not args.train: parser.error("`--train` is required for train mode.")
         train(args, pt_device, tokenizer)
     elif args.mode == "finetune":
         if not args.train: parser.error("`--train` is required for finetune mode.")
-        if not args.base_ckpt: parser.error("`--base_ckpt` is required for finetune mode.")
+        if not args.model_path: parser.error("`--model-path` is required for finetune mode.")
         finetune(args, pt_device, tokenizer)
     elif args.mode == "merge-lora":
-        if not args.base_ckpt: parser.error("`--base_ckpt` is required for merge-lora mode.")
+        if not args.model_path: parser.error("`--model-path` is required for merge-lora mode.")
         if not args.lora_adapter_path: parser.error("`--lora-adapter-path` is required for merge-lora mode.")
-        merge_lora(args, pt_device)
+        merge_lora(args, pt_device, tokenizer)
     elif args.mode == "quantize":
-        if not args.ckpt: parser.error("`--ckpt` is required for quantize mode.")
         quantize(args, pt_device)
     elif args.mode == "chat":
-        if not (args.ckpt or args.load_quantized):
-            parser.error("`--ckpt` or `--load-quantized` is required for chat mode.")
         chat(args, pt_device, tokenizer)
+
 
 if __name__ == "__main__":
     main()
