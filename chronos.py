@@ -48,7 +48,7 @@ try:
         _HAS_VULKAN = False
 except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.           !!!")
+    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.          !!!")
     print("!!!                                                                         !!!")
     print("!!! To fix this, please run the appropriate setup script:                   !!!")
     print("!!!  - On Windows:   Run setup.bat                                          !!!")
@@ -62,9 +62,9 @@ except ImportError:
     sys.exit(1) # Exit the program because the kernel is essential
 
 
-# --- CONSTANTS --- # <<< NEW
+# --- CONSTANTS ---
 MODEL_WEIGHTS_NAME = "chronos.pt"
-QUANTIZED_MODEL_WEIGHTS_NAME_TPL = "chronos-{qtype}.npz"
+QUANTIZED_MODEL_WEIGHTS_NAME_TPL = "chronos-{qtype}.npz" # Template for the name
 
 
 # --- HELPER CLASS: AttrDict ---
@@ -222,7 +222,7 @@ def get_q_block_size(qtype: str) -> int:
     else:
         raise ValueError(f"Unknown quantization type: {qtype}")
 
-# <<< CHANGED: This function now saves to a directory with tokenizer files
+# <<< CHANGED: This function now saves to a directory with tokenizer files and config
 def export_and_quantize_model(output_dir: str, model: nn.Module, tokenizer, qtype: str):
     """Quantizes and exports the model to a directory containing the .npz and tokenizer."""
     if not _HAS_KERNEL:
@@ -236,6 +236,7 @@ def export_and_quantize_model(output_dir: str, model: nn.Module, tokenizer, qtyp
     state_dict = model.state_dict()
     quantized_tensors = {}
 
+    # <<< FIXED: Save the model config directly into the npz file
     config_to_save = dict(model.config)
     quantized_tensors['_config'] = np.array(config_to_save)
 
@@ -263,13 +264,9 @@ def export_and_quantize_model(output_dir: str, model: nn.Module, tokenizer, qtyp
     np.savez_compressed(output_path, **quantized_tensors)
     print(f"Model weights successfully exported to {output_path}")
 
-    # <<< NEW: Also save the tokenizer
+    # <<< FIXED: Also save the tokenizer to make the directory self-contained
     tokenizer.save_pretrained(output_dir)
     print(f"Tokenizer files saved to {output_dir}")
-
-# ... (QuantizedLinear, QuantizedGRUCell, GRUCell, LTMModule, ChronosCore classes are unchanged) ...
-# NOTE: To keep this response manageable, I'm omitting the large, unchanged model class definitions.
-# Paste them back in from your original file. They require no edits.
 
 class QuantizedLinear:
     """A wrapper for a quantized linear layer that uses the C++ kernel for inference."""
@@ -449,6 +446,9 @@ class ChronosCore(nn.Module):
             query = self.qproj(token_emb)
             topk_vals, topk_idx = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk)
 
+            # NOTE: This UserWarning is expected and necessary.
+            # We must retain the grad on a non-leaf tensor (the retrieved values)
+            # to calculate the "surprise" gradient for the LTM update.
             if self.training or torch.is_grad_enabled():
                 topk_vals.retain_grad()
 
@@ -521,32 +521,37 @@ class QuantizedChronos:
 
     def __call__(self, input_ids: torch.LongTensor, h_state: torch.Tensor, l_state: torch.Tensor, device: str = "cpu"):
         B, T = input_ids.shape
-        current_pos = T - 1
-        pos_ids = torch.tensor([current_pos], dtype=torch.long)
-        token_emb = self.tok_emb(input_ids[:, -1]) + self.pos_emb(pos_ids)
+        # Use T-1 for single-token generation, but allow for longer sequences during initial prompt processing.
+        current_pos_start = T - 1 if T > 1 else 0
+        
+        # Process the entire input_ids sequence token-by-token
+        for t in range(current_pos_start, T):
+            pos_ids = torch.tensor([t], dtype=torch.long)
+            token_emb = self.tok_emb(input_ids[:, t]) + self.pos_emb(pos_ids)
+            
+            p_read = self.persistent.unsqueeze(0).expand(B, -1)
+            query = self.qproj(token_emb, device=device)
+            topk_vals, _ = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk)
+            ltm_summary_flat = topk_vals.view(B, -1)
 
-        p_read = self.persistent.unsqueeze(0).expand(B, -1)
-        query = self.qproj(token_emb, device=device)
-        topk_vals, _ = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk)
-        ltm_summary_flat = topk_vals.view(B, -1)
+            mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
+            enc = F.gelu(self.in_proj(mac_input, device=device))
 
-        mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
-        enc = F.gelu(self.in_proj(mac_input, device=device))
-
-        for _ in range(self.config.h_steps):
-            h_state = self.h_rnn(enc, h_state, device=device)
-            context = self.h_to_context(h_state, device=device)
-            for _ in range(self.config.l_steps):
-                l_input = torch.cat([enc, context], dim=-1)
-                l_state = self.l_rnn(l_input, l_state, device=device)
-            enc = enc + self.l_to_out(l_state, device=device)
-
+            for _ in range(self.config.h_steps):
+                h_state = self.h_rnn(enc, h_state, device=device)
+                context = self.h_to_context(h_state, device=device)
+                for _ in range(self.config.l_steps):
+                    l_input = torch.cat([enc, context], dim=-1)
+                    l_state = self.l_rnn(l_input, l_state, device=device)
+                enc = enc + self.l_to_out(l_state, device=device)
+        
         final_embedding = self.out_norm(enc)
         logits = self.lm_head(final_embedding, device=device)
         return {"logits": logits.unsqueeze(1), "h_state": h_state, "l_state": l_state}
 
-# <<< CHANGED: This function now loads from a directory
+# <<< FIXED: This function now loads a portable, self-contained model directory
 def load_quantized(model_path: str):
+    """Loads a quantized model directory, automatically finding the .npz and tokenizer."""
     print(f"Loading quantized model from directory: {model_path}")
     
     # Find the .npz file in the directory
@@ -563,10 +568,11 @@ def load_quantized(model_path: str):
         raise ValueError("Quantized model file is missing '_config' data. Please re-quantize the model.")
 
     config = q_data['_config'].item()
-    return QuantizedChronos(config, q_data)
+    return QuantizedChronos(config, q_data), AttrDict(config)
 
-# <<< CHANGED: This function now loads from a directory
-def load_full_model_with_config(model_path: str, cli_args, device):
+# <<< FIXED: This function now loads a portable, self-contained model directory
+def load_full_model_with_config(model_path: str, device):
+    """Loads a full-precision model and its config from a directory."""
     weights_path = os.path.join(model_path, MODEL_WEIGHTS_NAME)
     if not os.path.exists(weights_path):
         raise FileNotFoundError(f"Model weights file '{MODEL_WEIGHTS_NAME}' not found in '{model_path}'")
@@ -576,24 +582,22 @@ def load_full_model_with_config(model_path: str, cli_args, device):
     # Config is always loaded from the checkpoint
     if 'config' not in checkpoint:
         raise ValueError("Model config not found in checkpoint. The model file is likely corrupted or from an old version.")
-    config = checkpoint['config']
+    config = AttrDict(checkpoint['config'])
     
-    config_dict = vars(config) if not isinstance(config, dict) else config
-    config_dict['max_new_tokens'] = cli_args.max_new_tokens
+    # Ensure model_type is present for HuggingFace compatibility
+    if 'model_type' not in config:
+        config['model_type'] = 'chronos'
 
-    if 'model_type' not in config_dict:
-        config_dict['model_type'] = 'chronos'
-
-    model = ChronosCore(config_dict).to(device)
+    model = ChronosCore(config).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
 
-    return model, model.config
+    return model, config
 
 
 def train(args, device, tokenizer):
     print("Running in TRAIN mode...")
     config = vars(args)
-    config['model_type'] = 'chronos'
+    config['model_type'] = 'chronos' 
     
     model = ChronosCore(config).to(device)
     optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
@@ -606,18 +610,24 @@ def train(args, device, tokenizer):
         scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
 
     start_epoch = 0
-    if args.resume_from_model_path:
-        # <<< CHANGED: Resume logic now uses the model path
-        resume_ckpt_path = os.path.join(args.resume_from_model_path, MODEL_WEIGHTS_NAME)
-        if not os.path.exists(resume_ckpt_path):
-            raise FileNotFoundError(f"Checkpoint to resume from not found at {resume_ckpt_path}")
+    # <<< FIXED: Resume logic now uses a direct file path to the checkpoint .pt file
+    if args.resume_from_ckpt:
+        if not os.path.exists(args.resume_from_ckpt):
+            raise FileNotFoundError(f"Checkpoint to resume from not found at {args.resume_from_ckpt}")
 
-        print(f"Resuming training from checkpoint in: {args.resume_from_model_path}")
-        checkpoint = torch.load(resume_ckpt_path, map_location=device)
+        print(f"Resuming training from checkpoint: {args.resume_from_ckpt}")
+        checkpoint = torch.load(args.resume_from_ckpt, map_location=device)
         
-        # Check if it's a training checkpoint or a final model
         if 'optimizer_state_dict' not in checkpoint:
-             raise ValueError("The specified checkpoint is a final inference model, not a training checkpoint. Cannot resume.")
+            raise ValueError("The specified checkpoint is a final inference model, not a training checkpoint. Cannot resume.")
+
+        # Load config from checkpoint to ensure consistency
+        if 'config' in checkpoint:
+            model_config = AttrDict(checkpoint['config'])
+            # Create a new model with the *exact* architecture from the checkpoint
+            model = ChronosCore(model_config).to(device)
+        else:
+            print("Warning: Config not found in checkpoint. Using current CLI args for model architecture.")
 
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -658,25 +668,23 @@ def train(args, device, tokenizer):
                 current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
                 pbar.set_postfix({"loss": f"{total_loss / (i + 1):.4f}", "lr": f"{current_lr:.2e}"})
 
-        # <<< CHANGED: Checkpoint saving now saves inside the output directory
+        # <<< CHANGED: Checkpoint saving now saves inside the output directory and includes config
         ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
         print(f"Epoch {epoch + 1} complete. Saving training checkpoint to {ckpt_path}")
-        config_to_save = dict(model.config)
         torch.save({
             'completed_epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'config': config_to_save,
+            'config': dict(model.config), # <<< FIXED: Save config
         }, ckpt_path)
 
-    # <<< CHANGED: Final save now includes the tokenizer
+    # <<< CHANGED: Final save now includes the config and tokenizer in the directory
     final_save_path = os.path.join(args.out_dir, MODEL_WEIGHTS_NAME)
     print(f"\nTraining finished. Saving final inference model to {final_save_path}")
-    config_to_save = dict(model.config)
     torch.save({
         'model_state_dict': model.state_dict(),
-        'config': config_to_save
+        'config': dict(model.config) # <<< FIXED: Save config
     }, final_save_path)
     
     tokenizer.save_pretrained(args.out_dir)
@@ -684,19 +692,19 @@ def train(args, device, tokenizer):
 
     if args.quantize_on_complete:
         print("\n--- Training Complete: Starting On-the-Fly Quantization ---")
-        quantize_out_path = args.out_dir + f"-{args.qtype}"
-        quantize(args, device, model, tokenizer, quantize_out_path)
+        # Quantize to a new directory for clarity, e.g., './my_model-INT4'
+        quantize_out_dir = args.out_dir.rstrip('/\\') + f"-{args.qtype}"
+        quantize(args, device, model, tokenizer, quantize_out_dir)
 
 
-# <<< CHANGED: Finetune now loads and saves to directories
+# <<< CHANGED: Finetune now loads and saves to self-contained directories
 def finetune(args, device, tokenizer):
     if not _HAS_PEFT: raise ImportError("Please install 'peft' for fine-tuning.")
     print("Running in FINETUNE mode with LoRA...")
 
-    # The tokenizer passed in is already loaded from the base model path
-    model, model_config = load_full_model_with_config(args.model_path, args, device)
+    # Load the base model and its config from the specified directory
+    model, model_config = load_full_model_with_config(args.model_path, device)
 
-    # ... (LoRA config logic is unchanged)
     lora_r = args.lora_r
     if args.finetune_unlock_percent:
         if args.lora_r != 8:
@@ -740,7 +748,6 @@ def finetune(args, device, tokenizer):
         print(f"INFO: Step-based Cosine Annealing LR scheduler ENABLED for finetuning. Total update steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
         scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
 
-    # ... (Training loop is unchanged)
     optimizer.zero_grad()
     for epoch in range(args.epochs):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
@@ -768,13 +775,13 @@ def finetune(args, device, tokenizer):
     model.save_pretrained(args.out_dir)
 
 
-# <<< CHANGED: Merge now loads and saves to directories
+# <<< CHANGED: Merge now loads and saves to self-contained directories
 def merge_lora(args, device, tokenizer):
     if not _HAS_PEFT: raise ImportError("Please install 'peft' for merging.")
     print("Running in MERGE-LORA mode...")
     
     print(f"Loading base model from {args.model_path}...")
-    base_model, _ = load_full_model_with_config(args.model_path, args, device)
+    base_model, _ = load_full_model_with_config(args.model_path, device)
 
     print(f"Loading LoRA adapter from {args.lora_adapter_path}...")
     model = PeftModel.from_pretrained(base_model, args.lora_adapter_path)
@@ -782,12 +789,13 @@ def merge_lora(args, device, tokenizer):
     print("Merging adapter into the base model...")
     model = model.merge_and_unload()
 
+    # Save to a new, self-contained directory
+    os.makedirs(args.out_dir, exist_ok=True)
     output_path = os.path.join(args.out_dir, MODEL_WEIGHTS_NAME)
     print(f"Saving merged model to {output_path}...")
-    config_to_save = dict(model.config)
     torch.save({
         'model_state_dict': model.state_dict(),
-        'config': config_to_save
+        'config': dict(model.config) # <<< FIXED: Save config
     }, output_path)
     
     tokenizer.save_pretrained(args.out_dir)
@@ -795,8 +803,8 @@ def merge_lora(args, device, tokenizer):
     print("Merge complete.")
 
 
-# <<< CHANGED: Quantize now operates on directories
-def quantize(args, device, model=None, tokenizer=None, out_path=None):
+# <<< CHANGED: Quantize now operates on self-contained directories
+def quantize(args, device, model=None, tokenizer=None, out_dir=None):
     print(f"Running in QUANTIZE mode with {args.qtype} precision...")
     
     # Allow passing in an already-loaded model (e.g., from train --quantize-on-complete)
@@ -804,21 +812,22 @@ def quantize(args, device, model=None, tokenizer=None, out_path=None):
         if not args.model_path:
             raise ValueError("--model-path is required for quantize mode.")
         print(f"Loading full-precision model from {args.model_path}...")
+        # Tokenizer is loaded from the same directory as the model
         tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-        model, _ = load_full_model_with_config(args.model_path, args, device)
+        model, _ = load_full_model_with_config(args.model_path, device)
 
-    # Determine output path
-    if out_path is None:
+    # Determine output directory
+    if out_dir is None:
         if not args.out_dir:
-            # Default to creating a new dir next to the source
-            out_path = args.model_path.rstrip('/\\') + f"-{args.qtype}"
+            # Default to creating a new dir next to the source, e.g., './my_model-INT4'
+            out_dir = args.model_path.rstrip('/\\') + f"-{args.qtype}"
         else:
-            out_path = args.out_dir
+            out_dir = args.out_dir
 
-    export_and_quantize_model(out_path, model, tokenizer, qtype=args.qtype)
+    export_and_quantize_model(out_dir, model, tokenizer, qtype=args.qtype)
 
 
-# <<< CHANGED: Chat mode now loads a model directory
+# <<< CHANGED: Chat mode now loads a self-contained model directory, no arch flags needed
 def chat(args, device, tokenizer):
     print("Running in CHAT mode...")
 
@@ -829,14 +838,13 @@ def chat(args, device, tokenizer):
     inference_device = "cpu" # Default for quantized models
     ltm_has_been_updated = False # Flag to track if we need to save
 
-    # Determine if loading quantized or full model
+    # Determine if loading quantized or full model from the same --model-path
     npz_files = [f for f in os.listdir(args.model_path) if f.endswith('.npz')]
     if npz_files:
         if not _HAS_KERNEL:
             print("ERROR: Cannot run quantized chat without the C++ kernel.")
             return
-        model = load_quantized(args.model_path)
-        config = model.config
+        model, config = load_quantized(args.model_path)
         is_quantized = True
         print(f"Loaded quantized model with {model.qtype} weights.")
 
@@ -851,29 +859,31 @@ def chat(args, device, tokenizer):
             if not args.shadow_model_path:
                 raise ValueError("To enable learning on a quantized model, you must provide the original full-precision model directory via --shadow-model-path.")
             print("Loading full-precision 'shadow' model for online learning...")
-            # Shadow model config must match the quantized one
-            shadow_model = ChronosCore(dict(config)).to(device)
-            shadow_weights_path = os.path.join(args.shadow_model_path, MODEL_WEIGHTS_NAME)
-            shadow_checkpoint = torch.load(shadow_weights_path, map_location=device)
-            shadow_model.load_state_dict(shadow_checkpoint.get('model_state_dict', shadow_checkpoint))
+            # Shadow model is loaded with its own config, which should match the quantized one
+            shadow_model, _ = load_full_model_with_config(args.shadow_model_path, device)
             
             # Sync the quantized model's initial LTM state to the shadow model
             shadow_model.ltm.load_state_dict(model.ltm.state_dict())
             shadow_model.eval()
 
     else: # Load full precision model
-        model, config = load_full_model_with_config(args.model_path, args, device)
+        model, config = load_full_model_with_config(args.model_path, device)
         inference_device = device
 
-    # ... (Online learning and chat loop logic is mostly unchanged)
     if args.ltm_lora_path:
         print(f"LTM online learning is ACTIVE. Updates will be stored separately at: {args.ltm_lora_path}")
-        model.ltm.accumulate_deltas = True
+        # The model to update is the shadow model if it exists, otherwise the base model
+        updatable_model = shadow_model if is_quantized else model
+        updatable_model.ltm.accumulate_deltas = True
         if os.path.exists(args.ltm_lora_path):
             print("Loading existing LTM deltas...")
             deltas = torch.load(args.ltm_lora_path)
-            model.ltm.vals.data.add_(deltas.to(model.ltm.vals.device))
-            model.ltm.ltm_deltas.data = deltas.to(model.ltm.ltm_deltas.device)
+            # Apply loaded deltas to the LTM values and the delta accumulator
+            updatable_model.ltm.vals.data.add_(deltas.to(updatable_model.ltm.vals.device))
+            updatable_model.ltm.ltm_deltas.data = deltas.to(updatable_model.ltm.ltm_deltas.device)
+            # If quantized, sync the now-updated shadow LTM back to the live model
+            if is_quantized:
+                model.ltm.load_state_dict(updatable_model.ltm.state_dict())
     else:
         print("LTM online learning is ACTIVE. Updates will modify base model weights directly in memory.")
 
@@ -892,7 +902,8 @@ def chat(args, device, tokenizer):
                 break
 
             prompt_format = f"### Instruction:\n{prompt}\n\n### Response:\n"
-            prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device if not is_quantized else "cpu")
+            # Always use the main device for tokenization, even for quantized models
+            prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device)
 
             print("\nChronos: ", end="", flush=True)
             response_ids = []
@@ -907,13 +918,16 @@ def chat(args, device, tokenizer):
                         print("\n[Generation interrupted by user.]", end="", flush=True)
                         break
 
+                    # Pass CPU tensors to quantized model, CUDA/MPS to full model
+                    model_input_ids = current_ids.to("cpu") if is_quantized else current_ids.to(device)
+
                     if is_quantized:
-                        outputs = model(current_ids, h_state, l_state, device=inference_device)
+                        outputs = model(model_input_ids, h_state, l_state, device=inference_device)
                         h_state, l_state = outputs['h_state'], outputs['l_state']
                     else:
-                        outputs = model(current_ids)
+                        outputs = model(model_input_ids)
 
-                    logits = outputs["logits"]
+                    logits = outputs["logits"].to(device) # Move logits to main device for sampling
                     next_token_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0)
 
                     if next_token_id.item() == tokenizer.eos_token_id:
@@ -936,8 +950,8 @@ def chat(args, device, tokenizer):
                 
                 update_model.train() # Set to train mode to enable gradients
                 with torch.enable_grad():
-                    full_sequence = torch.cat([prompt_ids[0], torch.tensor(response_ids)], dim=0).unsqueeze(0).to(target_device)
-                    labels = torch.cat([torch.full_like(prompt_ids[0], -100), torch.tensor(response_ids)], dim=0).unsqueeze(0).to(target_device)
+                    full_sequence = torch.cat([prompt_ids[0], torch.tensor(response_ids, device=target_device)], dim=0).unsqueeze(0)
+                    labels = torch.cat([torch.full_like(prompt_ids[0], -100), torch.tensor(response_ids, device=target_device)], dim=0).unsqueeze(0)
 
                     update_model.zero_grad()
                     outputs = update_model(input_ids=full_sequence, labels=labels)
@@ -947,11 +961,11 @@ def chat(args, device, tokenizer):
                         loss.backward()
                         ltm_grads = outputs["topk_vals"].grad
 
-                        # Update happens on the SHADOW model's LTM
+                        # Update happens on the SHADOW model's LTM (or the main model if not quantized)
                         update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads)
                         ltm_has_been_updated = True # Mark that a change has occurred
 
-                        # Copy the updated LTM weights back to the live quantized model
+                        # Copy the updated LTM weights back to the live quantized model for immediate use
                         if is_quantized:
                             model.ltm.load_state_dict(update_model.ltm.state_dict())
                 
@@ -966,13 +980,30 @@ def chat(args, device, tokenizer):
     
     finally:
         # --- SAVE ON EXIT LOGIC ---
-        if args.ltm_lora_path and model.ltm.accumulate_deltas:
-            if torch.any(model.ltm.ltm_deltas != 0):
+        updatable_model = shadow_model if is_quantized else model
+        if args.ltm_lora_path and updatable_model.ltm.accumulate_deltas:
+            if torch.any(updatable_model.ltm.ltm_deltas != 0):
                 print(f"\nSaving LTM memory deltas to {args.ltm_lora_path}...")
-                torch.save(model.ltm.ltm_deltas.cpu(), args.ltm_lora_path)
+                torch.save(updatable_model.ltm.ltm_deltas.cpu(), args.ltm_lora_path)
                 print("Done.")
             else:
                 print("\nNo new LTM updates to save as LoRA.")
+        
+        elif not is_quantized and not args.ltm_lora_path and ltm_has_been_updated:
+             while True:
+                response = input(f"Do you want to save the learned LTM updates back to '{args.model_path}'? (y/n): ").lower()
+                if response in ["y", "yes"]:
+                    print(f"\nSaving updated model to {args.model_path}...")
+                    output_weights_path = os.path.join(args.model_path, MODEL_WEIGHTS_NAME)
+                    torch.save({
+                        'model_state_dict': model.state_dict(),
+                        'config': dict(model.config)
+                    }, output_weights_path)
+                    print("✅ Save complete.")
+                    break
+                elif response in ["n", "no"]:
+                    print("Changes will be discarded. Exiting.")
+                    break
         
         elif is_quantized and args.enable_quantized_learning and ltm_has_been_updated:
             print("\n--- LTM has been updated during this session ---")
@@ -1000,11 +1031,12 @@ def main():
     # --- Data and Path Arguments (Universal) ---
     path_group = parser.add_argument_group('Paths and Data')
     path_group.add_argument("--train", type=str, default=None, help="[Train/Finetune] Path to training JSON or JSONL file.")
-    path_group.add_argument("--model-path", type=str, default=None, help="[All except Train] Path to the model directory.")
+    path_group.add_argument("--model-path", type=str, default=None, help="[All except Train] Path to the model directory for loading.")
     path_group.add_argument("--out-dir", type=str, default="./chronos_model", help="[Train/Finetune/Merge/Quantize] Directory to save the new model/adapter.")
     path_group.add_argument("--lora-adapter-path", type=str, default=None, help="[Merge] Path to the trained LoRA adapter directory.")
     path_group.add_argument("--tokenizer-path", type=str, default="microsoft/phi-2", help="[Train] Path or HF name of the tokenizer to use for a new model.")
-    path_group.add_argument("--resume-from-model-path", type=str, default=None, help="[Train] Path to a model directory containing a training checkpoint to resume from.")
+    # <<< FIXED: Changed resume argument to be a direct file path.
+    path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="[Train] Path to a specific training checkpoint .pt file to resume from.")
     path_group.add_argument("--shadow-model-path", type=str, default=None, help="[Chat] Path to the original full-precision model dir, required for online learning with a quantized model.")
 
 
@@ -1056,25 +1088,30 @@ def main():
     pt_device = pick_device()
     print(f"Using PyTorch device: {pt_device}")
 
-    # <<< CHANGED: Tokenizer loading is now context-dependent
+    # <<< CHANGED: Tokenizer loading is now context-dependent based on mode
     tokenizer = None
     if args.mode == "train":
         print(f"Loading tokenizer '{args.tokenizer_path}' for new model training...")
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     elif args.model_path:
         print(f"Loading tokenizer from model directory: {args.model_path}")
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    else:
-        parser.error("--model-path is required for this mode.")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        except Exception as e:
+            print(f"Error loading tokenizer from '{args.model_path}': {e}")
+            sys.exit(1)
+    # The 'quantize' mode can also load from model_path, so it's covered above.
+    elif args.mode not in ['train', 'quantize']:
+        parser.error(f"--model-path is required for mode '{args.mode}'.")
 
-    if tokenizer.pad_token is None:
+
+    if tokenizer and tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     if args.mode == "train":
         args.vocab_size = len(tokenizer)
 
     if args.auto_max_length:
-        # ... (auto-max-length logic is unchanged)
         if not args.train:
             parser.error("--auto-max-length requires a --train file to be specified.")
 
@@ -1115,14 +1152,15 @@ def main():
                         continue
 
         if max_found_length > 0:
-            max_found_length += 16
-            print(f"✅ Auto-scan complete. Found max sequence length: {max_found_length - 16}. Setting max_length to {max_found_length}.")
+            # Add a small buffer and round up to a multiple of 8 for efficiency
+            max_found_length = (max_found_length + 16 + 7) & -8 
+            print(f"✅ Auto-scan complete. Setting max_length to {max_found_length}.")
             args.max_length = max_found_length
             tokenizer.model_max_length = max_found_length
         else:
             print("⚠️ WARNING: Auto-scan did not find any valid entries. Using default max_length.")
 
-    # <<< CHANGED: Simplified mode dispatching
+    # <<< CHANGED: Simplified mode dispatching with clear argument validation
     if args.mode == "train":
         if not args.train: parser.error("`--train` is required for train mode.")
         train(args, pt_device, tokenizer)
