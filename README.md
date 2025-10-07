@@ -104,6 +104,8 @@ python chronos.py train \
     --batch_size 2
 ```
 
+> **Note:** You can use any compatible tokenizer from the Hugging Face Hub by changing the `--tokenizer-path` argument.
+
 #### Kayla Mode Training (Chain-of-Thought)
 
 Enable Kayla Mode by adding the `--kayla` flag. The dataset must have `Instruction`, `thought-process`, `feelings`, and `output` fields.
@@ -114,6 +116,9 @@ python chronos.py train \
     --kayla \
     --out-dir "./my_kayla_model"
 ```
+
+> **Note:** You can use any compatible tokenizer from the Hugging Face Hub by changing the `--tokenizer-path` argument.
+
 
 #### Resuming Training
 
