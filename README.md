@@ -80,6 +80,8 @@ Follow these steps to get a local copy up and running.
     ```
     This will create a `chronos_matmul` library file in your project root.
 
+    If this does not compile for you, try manually installing the kernel by navigating to the chronos root directory and running pip install .
+
 -----
 
 ## 📚 User Guide: A Step-by-Step Workflow
