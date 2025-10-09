@@ -1,19 +1,18 @@
 -----
 
-# Chronos v0.3 (alpha): A Hybrid Memory-Reasoning Architecture
+# Chronos v0.4 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 -----
 
-### 📢 **Major Update in v0.3: Self-Contained & Portable Models\!**
+### 📢 **Major Update in v0.4: Dynamic Online Learning Rate\!**
 
-> To improve reliability and ease of use, Chronos now saves and loads models as **self-contained directories**. Each directory includes the model weights (`.pt` or `.npz`), the necessary tokenizer files, and **the model's architecture configuration**.
+> To make the model's lifelong learning more robust and human-like, Chronos now uses a **Cosine Annealing schedule for its Long-Term Memory (LTM) updates by default**.
 >
-> This is a critical change with two major benefits:
+> This means the model learns more aggressively from new information at the start of a session and then gradually reduces its learning rate to refine its knowledge, preventing instability. This dynamic, scheduled approach replaces the previous static learning rate.
 >
-> 1.  It permanently fixes tokenizer mismatch errors.
-> 2.  You **no longer need to specify architecture flags** (`--context_dim`, etc.) when quantizing or running inference\! The model knows its own configuration.
+> You can still use a fixed learning rate by adding the `--static-ltm-lr` flag during chat.
 
 ## About The Project
 
@@ -33,13 +32,14 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
 
 ## Features
 
+  - 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a new **Cosine Annealing LR schedule** by default for more stable knowledge consolidation.
   - 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config.
-  - 🧠 **Hybrid Memory-Reasoning**: Deeply integrates a lifelong memory system with a hierarchical reasoning engine.
-  - 📚 **Continual "Online" Learning**: Learns and updates its Long-Term Memory (LTM) at inference time based on new experiences.
   - 💾 **Automatic Re-quantization**: After a learning session, Chronos can automatically re-quantize a model to persist the new knowledge.
   - ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`).
   - 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX) or on GPUs via Vulkan for broad hardware compatibility.
   - 🔧 **Comprehensive Tooling**: Includes a single, powerful script for training, LoRA fine-tuning, merging, quantization, and interactive chat.
+
+-----
 
 ## 🚀 Getting Started
 
@@ -56,14 +56,11 @@ Follow these steps to get a local copy up and running.
 ### Installation
 
 1.  **Clone the repository:**
-
     ```bash
     git clone https://github.com/necat101/Chronos.git
     cd chronos
     ```
-
 2.  **Create a virtual environment (recommended):**
-
     ```bash
     python -m venv .venv
 
@@ -73,9 +70,7 @@ Follow these steps to get a local copy up and running.
     # On Linux/macOS
     source .venv/bin/activate
     ```
-
 3.  **Run the setup script:** This will install Python dependencies and compile the C++ inference kernel.
-
     ```bash
     # On Windows
     setup.bat
@@ -83,8 +78,9 @@ Follow these steps to get a local copy up and running.
     # On Linux/macOS
     bash setup.sh
     ```
-
     This will create a `chronos_matmul` library file in your project root.
+
+-----
 
 ## 📚 User Guide: A Step-by-Step Workflow
 
@@ -104,30 +100,6 @@ python chronos.py train \
     --context_dim 512
 ```
 
-> **Note:** You can use any compatible tokenizer from the Hugging Face Hub by changing `--tokenizer-path`.
-
-#### Kayla Mode Training (Chain-of-Thought)
-
-Enable Kayla Mode by adding the `--kayla` flag. The dataset should have `Instruction`, `thought-process`, `output`, and optionally `feelings` fields.
-
-```bash
-python chronos.py train \
-    --train "path/to/kayla_data.jsonl" \
-    --kayla \
-    --out-dir "./my_kayla_model"
-```
-
-#### Resuming Training
-
-If your training is interrupted, resume by pointing to the specific checkpoint file you want to load using `--resume-from-ckpt`.
-
-```bash
-python chronos.py train \
-    --train "path/to/your_data.jsonl" \
-    --resume-from-ckpt "./my_chronos_model/chronos_epoch_3.pt" \
-    --out-dir "./my_chronos_model"
-```
-
 ### 2\. Fine-Tuning (LoRA)
 
 Adapt a pre-trained model using LoRA. This loads a full model directory and saves the adapter to a separate output directory.
@@ -139,8 +111,6 @@ python chronos.py finetune \
     --out-dir "./my_lora_adapter" \
     --epochs 3
 ```
-
-> **Tip**: Control the adapter size with `--finetune-unlock-percent 1.5` (for 1.5% trainable parameters).
 
 ### 3\. Merging a LoRA Adapter
 
@@ -155,7 +125,7 @@ python chronos.py merge-lora \
 
 ### 4\. Quantization
 
-Convert a full-precision model directory into a quantized model directory. **No architecture flags are needed\!** The script reads them from the model file.
+Convert a full-precision model directory into a quantized model directory. **No architecture flags are needed\!**
 
 ```bash
 python chronos.py quantize \
@@ -164,33 +134,18 @@ python chronos.py quantize \
     --qtype INT4
 ```
 
-> The output directory will contain the quantized `.npz` file and a copy of the tokenizer.
 > **Available `qtype`:** `INT4`, `Q4_0`, `Q8_0`, `Q2_K`.
 
 ### 5\. Inference (Chat Mode)
 
-Run an interactive chat session by pointing to any model directory (quantized or full-precision). **No architecture flags are needed\!**
-
-#### Running a Quantized Model (Recommended)
-
-**On CPU:**
-
-```bash
-python chronos.py chat --model-path "./my_model_merged-INT4"
-```
-
-**On GPU (Vulkan):**
-
-```bash
-python chronos.py chat --model-path "./my_model_merged-INT4" --device vulkan
-```
+Run an interactive chat session by pointing to any model directory (quantized or full-precision).
 
 #### Enabling Online Learning in Chat
 
 Allow the model to learn from your conversation. This requires both the quantized model (`--model-path`) and the original full-precision model (`--shadow-model-path`) to calculate the updates.
 
-**Method 1: Modify & Re-quantize (Recommended)**
-This updates the model in memory and asks if you want to save the changes by re-quantizing upon exit. This makes your model permanently smarter.
+**Method 1: Dynamic LR & Re-quantize (Recommended)**
+This is the default behavior. It uses a dynamic learning rate and asks to save changes by re-quantizing upon exit.
 
 ```bash
 python chronos.py chat \
@@ -199,15 +154,16 @@ python chronos.py chat \
     --shadow-model-path "./my_model_merged"
 ```
 
-**Method 2: Save Updates Separately (LoRA-style)**
-To save only the LTM updates without modifying the base model, use `--ltm-lora-path`. The memory updates will be saved to the specified file when you quit.
+**Method 2: Static LR & Re-quantize**
+To use a fixed learning rate instead of the dynamic schedule, add the `--static-ltm-lr` flag.
 
 ```bash
 python chronos.py chat \
     --model-path "./my_model_merged-INT4" \
     --enable-quantized-learning \
     --shadow-model-path "./my_model_merged" \
-    --ltm-lora-path "./my_ltm_updates.pt"
+    --static-ltm-lr \
+    --ltm_lr 0.005
 ```
 
 -----
@@ -216,13 +172,13 @@ python chronos.py chat \
 
 ### Main Modes
 
-| Mode       | Description                                         |
-| :--------- | :-------------------------------------------------- |
-| `train`    | Train a new model from scratch.                     |
-| `finetune` | Apply LoRA fine-tuning to an existing model.        |
-| `merge-lora`| Merge a LoRA adapter into a base model.             |
-| `quantize` | Convert a model directory to a quantized version.   |
-| `chat`     | Run an interactive chat session.                    |
+| Mode       | Description                                       |
+| :--------- | :------------------------------------------------ |
+| `train`    | Train a new model from scratch.                   |
+| `finetune` | Apply LoRA fine-tuning to an existing model.      |
+| `merge-lora`| Merge a LoRA adapter into a base model.           |
+| `quantize` | Convert a model directory to a quantized version. |
+| `chat`     | Run an interactive chat session.                  |
 
 ### Key Arguments
 
@@ -232,23 +188,18 @@ python chronos.py chat \
 | `--model-path`            | Path to the model directory (for `finetune`, `merge`, `quantize`, `chat`).        | `None`              |
 | `--train`                 | Path to the training `.json` or `.jsonl` file.                                  | `None`              |
 | `--out-dir`               | Directory to save new models, checkpoints, or adapters.                         | `./chronos_model`   |
-| `--tokenizer-path`        | `[Train]` Path or HF name of the tokenizer for a new model.                     | `microsoft/phi-2`   |
-| `--resume-from-ckpt`      | `[Train]` Path to a specific `.pt` checkpoint file to resume training.          | `None`              |
+| `--tokenizer-path`        | `[Train]` Path or HF name of the tokenizer for a new model.                       | `microsoft/phi-2`   |
 | `--shadow-model-path`     | `[Chat]` Path to the original full-precision model for online learning.         | `None`              |
 | **Training & Fine-Tuning** |                                                                                 |                     |
 | `--epochs`                | Number of training epochs.                                                      | `3`                 |
-| `--batch_size`            | Number of samples per batch.                                                    | `4`                 |
-| `--accumulation-steps`    | Accumulate gradients to simulate a larger batch size.                           | `1`                 |
-| `--starting-lr`           | The maximum learning rate for the scheduler.                                    | `1e-4`              |
+| `--starting-lr`           | The maximum learning rate for the main model scheduler.                         | `1e-4`              |
 | `--kayla`                 | `[Train]` Enable Chain-of-Thought style training.                               | `False`             |
-| `--finetune-unlock-percent`| `[Finetune]` Target percentage of trainable parameters for LoRA.                 | `None`              |
 | **Quantization & Inference** |                                                                                 |                     |
 | `--qtype`                 | Quantization format. Options: `INT4`, `Q4_0`, `Q8_0`, `Q2_K`.                   | `INT4`              |
 | `--device`                | `[Chat]` Device for quantized inference. Options: `cpu`, `vulkan`.              | `cpu`               |
-| `--enable-quantized-learning` | `[Chat]` Enable LTM updates for quantized models.                           | `False`             |
-| **Model Architecture (`train` only)** |                                                                                 |                     |
-| `--max_length`            | Maximum sequence length.                                                        | `1024`              |
-| `--context_dim`           | The main embedding dimension of the model.                                      | `512`               |
+| `--enable-quantized-learning` | `[Chat]` Enable LTM updates for quantized models.                             | `False`             |
+| `--ltm_lr`                | `[Chat]` Max LR for LTM schedule, or the fixed rate if `--static-ltm-lr` is used. | `0.01`              |
+| `--static-ltm-lr`         | `[Chat]` Disable the LTM cosine schedule and use a fixed learning rate.         | `False`             |
 
 -----
 
@@ -274,16 +225,12 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   - The quantization kernel design is heavily influenced by the groundbreaking work in **llama.cpp**.
   - **pybind11** for seamless C++/Python integration.
 
-<br>
 
-## v0.3 (alpha) Changelog
 
-  - **Models are now self-contained**, storing their own architecture configuration. You no longer need to re-specify hyperparameters for inference or quantization.
-  - Refactored to a **directory-based model system** to bundle weights, config, and tokenizer files together, fixing all tokenizer mismatch errors.
-  - Simplified the command-line interface by unifying model loading under the `--model-path` argument.
-  - Fixed the training resume process, which now correctly uses the `--resume-from-ckpt` flag to load a specific checkpoint file.
-  - Deprecated old file-based flags (`--ckpt`, `--load-quantized`, `--resume-from-model-path`) in favor of the new, more robust system.
+## v0.4 (alpha) Changelog
 
+  - **Implemented Dynamic LTM Learning Rate**: Online learning now defaults to a `CosineAnnealingLR` schedule. This improves learning stability by starting with a high learning rate for new information and gradually decaying it.
+  - **Added Static LR Fallback**: The `--static-ltm-lr` flag can be used in chat mode to revert to the old fixed learning rate behavior for the LTM.
 -----
 
 © 2025 Makhi Burroughs
