@@ -48,7 +48,7 @@ try:
         _HAS_VULKAN = False
 except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.          !!!")
+    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.           !!!")
     print("!!!                                                                         !!!")
     print("!!! To fix this, please run the appropriate setup script:                   !!!")
     print("!!!  - On Windows:   Run setup.bat                                          !!!")
@@ -352,9 +352,11 @@ class LTMModule(nn.Module):
         _, idx = torch.topk(sim, k=topk, dim=-1)
         return self.vals[idx], idx
 
-    def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor):
+    ### MODIFICATION START ###
+    def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor, current_lr: float):
         """
         Performs a meta-learning update on the LTM value slots based on the "surprise" gradient.
+        Now accepts a dynamic learning rate.
         """
         with torch.no_grad():
             if grads_tensor is None: return
@@ -372,8 +374,9 @@ class LTMModule(nn.Module):
                 slot_grads[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
 
             self._mom_vals.data.mul_(self.momentum).add_(slot_grads)
+            # Use the passed-in current_lr instead of self.lr
             update_delta = (self._mom_vals.data + self.weight_decay * self.vals.data)
-            update_delta.mul_(-self.lr)
+            update_delta.mul_(-current_lr)
 
             final_update = torch.zeros_like(self.vals.data)
             final_update[nonzero_mask] = update_delta[nonzero_mask]
@@ -383,6 +386,7 @@ class LTMModule(nn.Module):
                 self.vals.data.add_(final_update)
             else:
                 self.vals.data.add_(final_update)
+    ### MODIFICATION END ###
 
 class ChronosCore(nn.Module):
     """The full, trainable Chronos model, integrating HRM as the core processor."""
@@ -889,6 +893,23 @@ def chat(args, device, tokenizer):
 
     if not is_quantized:
         model.eval()
+        
+    ### MODIFICATION START ###
+    ltm_scheduler = None
+    # Setup LTM scheduler if not in static mode and learning is enabled
+    if not args.static_ltm_lr and (not is_quantized or args.enable_quantized_learning):
+        print("INFO: Using Cosine Annealing schedule for LTM updates.")
+        print(f"      - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
+        # Schedulers need an optimizer, so we create a dummy one for the LTM LR.
+        # We will call scheduler.step() manually, but never optimizer.step().
+        dummy_param = nn.Parameter(torch.tensor(0.0))
+        ltm_optimizer = torch.optim.SGD([dummy_param], lr=args.ltm_lr) # Use the main LTM LR as the MAX LR for the schedule
+        ltm_scheduler = CosineAnnealingLR(
+            ltm_optimizer,
+            T_max=args.ltm_schedule_steps,
+            eta_min=args.ltm_schedule_min_lr
+        )
+    ### MODIFICATION END ###
 
     print("\nWelcome to Chronos Chat. Type 'exit' or 'quit' to end.")
     if _HAS_KEYBOARD:
@@ -961,8 +982,20 @@ def chat(args, device, tokenizer):
                         loss.backward()
                         ltm_grads = outputs["topk_vals"].grad
 
-                        # Update happens on the SHADOW model's LTM (or the main model if not quantized)
-                        update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads)
+                        ### MODIFICATION START ###
+                        # Determine the current LTM learning rate based on mode
+                        if ltm_scheduler:
+                            current_ltm_lr = ltm_scheduler.get_last_lr()[0]
+                            print(f"[LTM LR: {current_ltm_lr:.2e}]", end="", flush=True)
+                            # Step the scheduler for the next update
+                            ltm_scheduler.step()
+                        else: # Static mode
+                            current_ltm_lr = update_model.ltm.lr
+                        
+                        # Call the modified inner_update function with the calculated LR
+                        update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=current_ltm_lr)
+                        ### MODIFICATION END ###
+
                         ltm_has_been_updated = True # Mark that a change has occurred
 
                         # Copy the updated LTM weights back to the live quantized model for immediate use
@@ -1063,7 +1096,7 @@ def main():
     train_group.add_argument("--starting-lr", type=float, default=1e-4)
     train_group.add_argument("--min-lr", type=float, default=1e-6, help="Min LR for cosine annealing.")
     train_group.add_argument("--disable-lr-schedule", action="store_true", help="Use a fixed LR instead of cosine annealing.")
-    train_group.add_argument("--ltm_lr", type=float, default=1e-2, help="LR for the LTM's internal 'surprise' updates.")
+    train_group.add_argument("--ltm_lr", type=float, default=1e-2, help="[Static] LR for LTM updates, or [Scheduled] MAX LR for the LTM cosine schedule.")
     train_group.add_argument("--kayla", action="store_true", help="Enable Kayla-style instruction tuning (with thought-process).")
     train_group.add_argument("--lora_r", type=int, default=8, help="[Finetune] LoRA rank.")
     train_group.add_argument("--lora_alpha", type=int, default=16, help="[Finetune] LoRA alpha.")
@@ -1076,6 +1109,11 @@ def main():
     infer_group.add_argument("--enable-quantized-learning", action="store_true", help="[Chat] Enable LTM updates for quantized models. Requires --shadow-model-path.")
     infer_group.add_argument("--ltm-lora-path", type=str, default=None, help="[Chat] Optional: Path to save/load LTM updates as a separate delta file.")
     infer_group.add_argument("--device", type=str, default="cpu", choices=["cpu", "vulkan"], help="[Chat] Device for quantized inference.")
+    ### MODIFICATION START ###
+    infer_group.add_argument("--static-ltm-lr", action="store_true", help="[Chat] Disable the cosine annealing schedule for LTM updates and use a fixed LR instead.")
+    infer_group.add_argument("--ltm-schedule-steps", type=int, default=100, help="[Chat] The number of updates in one cosine annealing cycle for LTM learning.")
+    infer_group.add_argument("--ltm-schedule-min-lr", type=float, default=1e-5, help="[Chat] The minimum learning rate for the LTM cosine annealing schedule.")
+    ### MODIFICATION END ###
 
     # --- Other Arguments ---
     other_group = parser.add_argument_group('Other Settings')
