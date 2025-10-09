@@ -50,14 +50,14 @@ except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.           !!!")
     print("!!!                                                                         !!!")
-    print("!!! To fix this, please run the appropriate setup script:                   !!!")
-    print("!!!  - On Windows:   Run setup.bat                                          !!!")
-    print("!!!  - On Linux/macOS: Run bash setup.sh                                    !!!")
+    print("!!! To fix this, please run the appropriate setup script:                     !!!")
+    print("!!!  - On Windows:   Run setup.bat                                            !!!")
+    print("!!!  - On Linux/macOS: Run bash setup.sh                                      !!!")
     print("!!!                                                                         !!!")
     print("!!! If you have already run the setup, you may need to activate the         !!!")
     print("!!! virtual environment first:                                              !!!")
-    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                               !!!")
-    print("!!!  - On Linux/macOS: source .venv/bin/activate                            !!!")
+    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                                !!!")
+    print("!!!  - On Linux/macOS: source .venv/bin/activate                              !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1) # Exit the program because the kernel is essential
 
@@ -463,14 +463,25 @@ class ChronosCore(nn.Module):
 
             mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
             enc = F.gelu(self.in_proj(mac_input))
-
+            
+            ### MODIFIED: Replaced fixed-step HRM with convergence-based logic ###
             for _ in range(self.config.h_steps):
                 h_state = self.h_rnn(enc, h_state)
                 context = self.h_to_context(h_state)
-                for _ in range(self.config.l_steps):
-                    l_input = torch.cat([enc, context], dim=-1)
+                l_input = torch.cat([enc, context], dim=-1)
+                
+                # L-module converges to equilibrium
+                l_state_prev = torch.zeros_like(l_state) # Initialize for the first check
+                for _ in range(self.config.max_l_steps):
+                    l_state_prev = l_state.clone() # Must clone to prevent reference issues
                     l_state = self.l_rnn(l_input, l_state)
+                    # Check for convergence
+                    if torch.allclose(l_state, l_state_prev, atol=self.config.l_conv_atol):
+                        break
+                
+                # The output for this H-step is the converged L-state
                 enc = enc + self.l_to_out(l_state)
+            ### END MODIFICATION ###
 
             final_token_embeddings.append(enc)
 
@@ -541,13 +552,17 @@ class QuantizedChronos:
             mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
             enc = F.gelu(self.in_proj(mac_input, device=device))
 
+            ### MODIFIED: Replaced fixed-step HRM with convergence-based logic for inference ###
+            # Note: The convergence check is not performed here for speed. We just use the max steps.
+            # True convergence in a non-PyTorch quantized model would be more complex to implement.
             for _ in range(self.config.h_steps):
                 h_state = self.h_rnn(enc, h_state, device=device)
                 context = self.h_to_context(h_state, device=device)
-                for _ in range(self.config.l_steps):
+                for _ in range(self.config.max_l_steps): # Use max_l_steps
                     l_input = torch.cat([enc, context], dim=-1)
                     l_state = self.l_rnn(l_input, l_state, device=device)
                 enc = enc + self.l_to_out(l_state, device=device)
+            ### END MODIFICATION ###
         
         final_embedding = self.out_norm(enc)
         logits = self.lm_head(final_embedding, device=device)
@@ -672,16 +687,16 @@ def train(args, device, tokenizer):
                 current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
                 pbar.set_postfix({"loss": f"{total_loss / (i + 1):.4f}", "lr": f"{current_lr:.2e}"})
 
-        # <<< CHANGED: Checkpoint saving now saves inside the output directory and includes config
-        ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
-        print(f"Epoch {epoch + 1} complete. Saving training checkpoint to {ckpt_path}")
-        torch.save({
-            'completed_epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'config': dict(model.config), # <<< FIXED: Save config
-        }, ckpt_path)
+    # <<< CHANGED: Checkpoint saving now saves inside the output directory and includes config
+    ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
+    print(f"Epoch {epoch + 1} complete. Saving training checkpoint to {ckpt_path}")
+    torch.save({
+        'completed_epoch': epoch + 1,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'config': dict(model.config), # <<< FIXED: Save config
+    }, ckpt_path)
 
     # <<< CHANGED: Final save now includes the config and tokenizer in the directory
     final_save_path = os.path.join(args.out_dir, MODEL_WEIGHTS_NAME)
@@ -899,7 +914,7 @@ def chat(args, device, tokenizer):
     # Setup LTM scheduler if not in static mode and learning is enabled
     if not args.static_ltm_lr and (not is_quantized or args.enable_quantized_learning):
         print("INFO: Using Cosine Annealing schedule for LTM updates.")
-        print(f"      - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
+        print(f"       - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
         # Schedulers need an optimizer, so we create a dummy one for the LTM LR.
         # We will call scheduler.step() manually, but never optimizer.step().
         dummy_param = nn.Parameter(torch.tensor(0.0))
@@ -1023,20 +1038,20 @@ def chat(args, device, tokenizer):
                 print("\nNo new LTM updates to save as LoRA.")
         
         elif not is_quantized and not args.ltm_lora_path and ltm_has_been_updated:
-             while True:
-                response = input(f"Do you want to save the learned LTM updates back to '{args.model_path}'? (y/n): ").lower()
-                if response in ["y", "yes"]:
-                    print(f"\nSaving updated model to {args.model_path}...")
-                    output_weights_path = os.path.join(args.model_path, MODEL_WEIGHTS_NAME)
-                    torch.save({
-                        'model_state_dict': model.state_dict(),
-                        'config': dict(model.config)
-                    }, output_weights_path)
-                    print("✅ Save complete.")
-                    break
-                elif response in ["n", "no"]:
-                    print("Changes will be discarded. Exiting.")
-                    break
+                while True:
+                    response = input(f"Do you want to save the learned LTM updates back to '{args.model_path}'? (y/n): ").lower()
+                    if response in ["y", "yes"]:
+                        print(f"\nSaving updated model to {args.model_path}...")
+                        output_weights_path = os.path.join(args.model_path, MODEL_WEIGHTS_NAME)
+                        torch.save({
+                            'model_state_dict': model.state_dict(),
+                            'config': dict(model.config)
+                        }, output_weights_path)
+                        print("✅ Save complete.")
+                        break
+                    elif response in ["n", "no"]:
+                        print("Changes will be discarded. Exiting.")
+                        break
         
         elif is_quantized and args.enable_quantized_learning and ltm_has_been_updated:
             print("\n--- LTM has been updated during this session ---")
@@ -1082,8 +1097,11 @@ def main():
     arch_group.add_argument("--ltm_val_dim", type=int, default=128)
     arch_group.add_argument("--h_hidden", type=int, default=512)
     arch_group.add_argument("--l_hidden", type=int, default=512)
-    arch_group.add_argument("--h_steps", type=int, default=2)
-    arch_group.add_argument("--l_steps", type=int, default=3)
+    arch_group.add_argument("--h_steps", type=int, default=1, help="Number of high-level refinement steps in HRM.")
+    ### MODIFIED: Replaced l_steps with max_l_steps and added convergence tolerance ###
+    arch_group.add_argument("--max_l_steps", type=int, default=10, help="[HRM] Maximum number of low-level iterations before forcing completion.")
+    arch_group.add_argument("--l_conv_atol", type=float, default=1e-5, help="[HRM] Absolute tolerance for checking L-module state convergence.")
+    ### END MODIFICATION ###
     arch_group.add_argument("--ltm_topk", type=int, default=4, help="Number of LTM slots to retrieve per token.")
     arch_group.add_argument("--max_length", type=int, default=1024)
     arch_group.add_argument("--auto-max-length", action="store_true", help="Automatically scan the dataset to find the longest sequence and set it as max_length.")
