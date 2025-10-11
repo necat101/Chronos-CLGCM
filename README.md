@@ -56,11 +56,14 @@ Follow these steps to get a local copy up and running.
 ### Installation
 
 1.  **Clone the repository:**
+
     ```bash
     git clone https://github.com/necat101/Chronos.git
     cd chronos
     ```
+
 2.  **Create a virtual environment (recommended):**
+
     ```bash
     python -m venv .venv
 
@@ -70,7 +73,9 @@ Follow these steps to get a local copy up and running.
     # On Linux/macOS
     source .venv/bin/activate
     ```
+
 3.  **Run the setup script:** This will install Python dependencies and compile the C++ inference kernel.
+
     ```bash
     # On Windows
     setup.bat
@@ -78,11 +83,12 @@ Follow these steps to get a local copy up and running.
     # On Linux/macOS
     bash setup.sh
     ```
+
     This will create a `chronos_matmul` library file in your project root.
 
-    If this does not compile for you, try manually installing the kernel by navigating to the chronos root directory and running ```pip install .```
+    If this does not compile for you, try manually installing the kernel by navigating to the chronos root directory and running `pip install .`
 
-    for CUDA support, please install the cuda accelerated version of torch by running the following command: ```pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121```
+    for CUDA support, please install the cuda accelerated version of torch by running the following command: `pip install torch torchvision torau dio --index-url https://download.pytorch.org/whl/cu121`
 
 -----
 
@@ -170,40 +176,71 @@ python chronos.py chat \
     --ltm_lr 0.005
 ```
 
+### Advanced Model Surgery: Using `expand_model.py`
+
+The `expand_model.py` script is a powerful utility for increasing a model's capacity without retraining from scratch. It allows you to "transplant" the learned weights from a smaller, trained model into a new, larger architecture. The new, larger parts of the model are randomly initialized, while the existing parts retain their knowledge, providing an excellent starting point for further fine-tuning.
+
+**Step 1: Expand the Model Checkpoint**
+
+Run the script, pointing to an existing training checkpoint (`.pt` file) and defining the new, larger dimensions.
+
+```bash
+# Example: Expanding a model with context_dim=128 to context_dim=512
+python expand_model.py \
+    --old-model-path "./my_chronos_model/chronos_epoch_5.pt" \
+    --output-path "./my_expanded_model/expanded_checkpoint.pt" \
+    --context_dim 512 \
+    --h_hidden 512 \
+    --l_hidden 512
+```
+
+**Step 2: Fine-Tune the Expanded Model**
+
+This command creates a new, full **training checkpoint** at the specified output path. You can then use this checkpoint with `--resume-from-ckpt` to fine-tune your new, larger model on your dataset, allowing it to learn how to use its expanded capacity.
+
+```bash
+# Now, resume training to fine-tune the expanded model
+python chronos.py train \
+    --train "path/to/your_data.jsonl" \
+    --out-dir "./my_expanded_model_finetuned" \
+    --resume-from-ckpt "./my_expanded_model/expanded_checkpoint.pt" \
+    --epochs 10
+```
+
 -----
 
 ## ⚙️ Command-Line Reference
 
 ### Main Modes
 
-| Mode       | Description                                       |
-| :--------- | :------------------------------------------------ |
-| `train`    | Train a new model from scratch.                   |
-| `finetune` | Apply LoRA fine-tuning to an existing model.      |
-| `merge-lora`| Merge a LoRA adapter into a base model.           |
-| `quantize` | Convert a model directory to a quantized version. |
-| `chat`     | Run an interactive chat session.                  |
+| Mode         | Description                                       |
+| :----------- | :------------------------------------------------ |
+| `train`      | Train a new model from scratch.                   |
+| `finetune`   | Apply LoRA fine-tuning to an existing model.      |
+| `merge-lora` | Merge a LoRA adapter into a base model.           |
+| `quantize`   | Convert a model directory to a quantized version. |
+| `chat`       | Run an interactive chat session.                  |
 
 ### Key Arguments
 
-| Argument                  | Description                                                                     | Default             |
-| :------------------------ | :------------------------------------------------------------------------------ | :------------------ |
-| **Paths** |                                                                                 |                     |
-| `--model-path`            | Path to the model directory (for `finetune`, `merge`, `quantize`, `chat`).        | `None`              |
-| `--train`                 | Path to the training `.json` or `.jsonl` file.                                  | `None`              |
-| `--out-dir`               | Directory to save new models, checkpoints, or adapters.                         | `./chronos_model`   |
-| `--tokenizer-path`        | `[Train]` Path or HF name of the tokenizer for a new model.                       | `microsoft/phi-2`   |
-| `--shadow-model-path`     | `[Chat]` Path to the original full-precision model for online learning.         | `None`              |
-| **Training & Fine-Tuning** |                                                                                 |                     |
-| `--epochs`                | Number of training epochs.                                                      | `3`                 |
-| `--starting-lr`           | The maximum learning rate for the main model scheduler.                         | `1e-4`              |
-| `--kayla`                 | `[Train]` Enable Chain-of-Thought style training.                               | `False`             |
-| **Quantization & Inference** |                                                                                 |                     |
-| `--qtype`                 | Quantization format. Options: `INT4`, `Q4_0`, `Q8_0`, `Q2_K`.                   | `INT4`              |
-| `--device`                | `[Chat]` Device for quantized inference. Options: `cpu`, `vulkan`.              | `cpu`               |
-| `--enable-quantized-learning` | `[Chat]` Enable LTM updates for quantized models.                             | `False`             |
-| `--ltm_lr`                | `[Chat]` Max LR for LTM schedule, or the fixed rate if `--static-ltm-lr` is used. | `0.01`              |
-| `--static-ltm-lr`         | `[Chat]` Disable the LTM cosine schedule and use a fixed learning rate.         | `False`             |
+| Argument                  | Description                                                                  | Default             |
+| :------------------------ | :--------------------------------------------------------------------------- | :------------------ |
+| **Paths** |                                                                              |                     |
+| `--model-path`            | Path to the model directory (for `finetune`, `merge`, `quantize`, `chat`).   | `None`              |
+| `--train`                 | Path to the training `.json` or `.jsonl` file.                               | `None`              |
+| `--out-dir`               | Directory to save new models, checkpoints, or adapters.                      | `./chronos_model`   |
+| `--tokenizer-path`        | `[Train]` Path or HF name of the tokenizer for a new model.                  | `microsoft/phi-2`   |
+| `--shadow-model-path`     | `[Chat]` Path to the original full-precision model for online learning.      | `None`              |
+| **Training & Fine-Tuning** |                                                                              |                     |
+| `--epochs`                | Number of training epochs.                                                   | `3`                 |
+| `--starting-lr`           | The maximum learning rate for the main model scheduler.                      | `1e-4`              |
+| `--kayla`                 | `[Train]` Enable Chain-of-Thought style training.                            | `False`             |
+| **Quantization & Inference**|                                                                              |                     |
+| `--qtype`                 | Quantization format. Options: `INT4`, `Q4_0`, `Q8_0`, `Q2_K`.                | `INT4`              |
+| `--device`                | `[Chat]` Device for quantized inference. Options: `cpu`, `vulkan`.           | `cpu`               |
+| `--enable-quantized-learning`| `[Chat]` Enable LTM updates for quantized models.                           | `False`             |
+| `--ltm_lr`                | `[Chat]` Max LR for LTM schedule, or the fixed rate if `--static-ltm-lr` is used.| `0.01`              |
+| `--static-ltm-lr`         | `[Chat]` Disable the LTM cosine schedule and use a fixed learning rate.      | `False`             |
 
 -----
 
@@ -229,12 +266,11 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   - The quantization kernel design is heavily influenced by the groundbreaking work in **llama.cpp**.
   - **pybind11** for seamless C++/Python integration.
 
-
-
 ## v0.4 (alpha) Changelog
 
   - **Implemented Dynamic LTM Learning Rate**: Online learning now defaults to a `CosineAnnealingLR` schedule. This improves learning stability by starting with a high learning rate for new information and gradually decaying it.
   - **Added Static LR Fallback**: The `--static-ltm-lr` flag can be used in chat mode to revert to the old fixed learning rate behavior for the LTM.
+
 -----
 
 © 2025 Makhi Burroughs
