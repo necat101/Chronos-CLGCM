@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from tqdm import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.serialization import safe_globals
 
 # --- Optional Imports ---
 try:
@@ -48,7 +49,7 @@ try:
         _HAS_VULKAN = False
 except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.          !!!")
+    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.           !!!")
     print("!!!                                                                         !!!")
     print("!!! To fix this, please run the appropriate setup script:                   !!!")
     print("!!!  - On Windows:   Run setup.bat                                          !!!")
@@ -635,7 +636,9 @@ def train(args, device, tokenizer):
             raise FileNotFoundError(f"Checkpoint to resume from not found at {args.resume_from_ckpt}")
 
         print(f"Resuming training from checkpoint: {args.resume_from_ckpt}")
-        checkpoint = torch.load(args.resume_from_ckpt, map_location=device)
+        
+        # <<< FIX APPLIED HERE: Using weights_only=False as requested >>>
+        checkpoint = torch.load(args.resume_from_ckpt, map_location=device, weights_only=False)
 
         if 'optimizer_state_dict' not in checkpoint:
             raise ValueError("The specified checkpoint is a final inference model, not a training checkpoint. Cannot resume.")
