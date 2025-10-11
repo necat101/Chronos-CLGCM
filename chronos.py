@@ -689,15 +689,16 @@ def train(args, device, tokenizer):
 
                 # Perform weight update step after accumulating gradients
                 if (i + 1) % args.accumulation_steps == 0:
-                    # --- START: CORE FIX ---
+                    # --- START: LTM UPDATE ---
                     # This is the "surprise" update for the Long-Term Memory (LTM).
-                    # We use the gradient on the retrieved memory values as the learning signal.
                     ltm_grads = outputs["topk_vals"].grad
                     if ltm_grads is not None:
-                        # Perform the special meta-learning update on the LTM module's values.
-                        # This happens outside the main optimizer's control.
                         model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=args.ltm_lr)
-                    # --- END: CORE FIX ---
+                    # --- END: LTM UPDATE ---
+
+                    # <<< NEW: GRADIENT CLIPPING >>>
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
                     # Now, step the main optimizer for all other model parameters
                     optimizer.step()
@@ -713,7 +714,6 @@ def train(args, device, tokenizer):
             pbar.set_postfix({"loss": f"{total_loss / (i + 1):.4f}", "lr": f"{current_lr:.2e}"})
 
         # <<< FIX: Indented this block to save after each epoch >>>
-        # This entire block was previously outside the `for epoch...` loop.
         ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
         print(f"Epoch {epoch + 1} complete. Saving training checkpoint to {ckpt_path}")
         torch.save({
@@ -808,13 +808,16 @@ def finetune(args, device, tokenizer):
                 total_loss += loss.item() * args.accumulation_steps
 
                 if (i + 1) % args.accumulation_steps == 0:
-                    # --- START: CORE FIX ---
-                    # This is the "surprise" update for the Long-Term Memory (LTM).
+                    # --- START: LTM UPDATE ---
                     ltm_grads = outputs["topk_vals"].grad
                     if ltm_grads is not None:
                         # When using PEFT, the original model is stored in .base_model
                         model.base_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=args.ltm_lr)
-                    # --- END: CORE FIX ---
+                    # --- END: LTM UPDATE ---
+
+                    # <<< NEW: GRADIENT CLIPPING >>>
+                    if args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
                     optimizer.step()
                     if scheduler:
@@ -1154,6 +1157,9 @@ def main():
     train_group.add_argument("--lora_alpha", type=int, default=16, help="[Finetune] LoRA alpha.")
     train_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="[Finetune] Target percentage of params to train (e.g., 1.5 for 1.5%%). Overrides --lora_r.")
     train_group.add_argument("--quantize-on-complete", action="store_true", help="[Train] Automatically quantize after training.")
+    # <<< NEW: GRADIENT CLIPPING ARGUMENT >>>
+    train_group.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value. Set to 0 to disable.")
+
 
     # --- Inference Arguments ---
     infer_group = parser.add_argument_group('Inference (Chat)')
