@@ -1,18 +1,18 @@
 -----
 
-# Chronos v0.4 (alpha): A Hybrid Memory-Reasoning Architecture
+# Chronos v0.5 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
 -----
 
-### 📢 **Major Update in v0.4: Dynamic Online Learning Rate & Stability**
+### 📢 **Major Update in v0.5: Enhanced Reasoning & Structured Memory**
 
-> To make the model's lifelong learning more robust and human-like, Chronos now uses a **Cosine Annealing schedule for its Long-Term Memory (LTM) updates by default**.
+> This version introduces two major architectural upgrades that work in tandem to create a more powerful and efficient cognitive process.
 >
-> This means the model learns more aggressively from new information at the start of a session and then gradually reduces its learning rate to refine its knowledge, preventing instability. This dynamic, scheduled approach replaces the previous static learning rate.
+> 1.  **Adaptive Reasoning Depth ("Ponder Time"):** Chronos can now **"think longer" for harder problems**. The fixed-step reasoning loop has been replaced with a dynamic mechanism where the model learns to decide when it's confident enough to stop reasoning. This makes the model both more powerful and more efficient, better emulating the variable effort of human thought.
 >
-> You can still use a fixed learning rate by adding the `--static-ltm-lr` flag during chat.
+> 2.  **Structured & Queryable Long-Term Memory:** The LTM is no longer just an associative memory. Each memory slot is now **augmented with metadata, including a timestamp and a source identifier**. This allows the model—and the user—to perform sophisticated, context-aware queries, such as retrieving only memories learned from user interaction within the last hour. This brings the "Chronos" name to life.
 
 ## About The Project
 
@@ -25,16 +25,18 @@ This project introduces a novel hybrid model where a deep reasoning engine opera
 Chronos is built on two revolutionary, brain-inspired pillars:
 
 🧠 **Titans Architecture (The Cognitive Substrate)**
-A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," allowing it to consolidate new knowledge at inference time without catastrophic forgetting.
+A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," and its memory slots are now structured with timestamps and source metadata, allowing for sophisticated, context-aware queries.
 
 ⚙️ **Hierarchical Reasoning Model (The Cognitive Process)**
 A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a high-level "CEO" and low-level "Workers") allows for profound computational depth, enabling it to solve complex, multi-step algorithmic problems where massive LLMs fail.
 
 ## Features
 
-  - 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a new **Cosine Annealing LR schedule** by default for more stable knowledge consolidation.
-  - 🛡️ **Stable Training**: Built-in gradient clipping to prevent model instability and ensure smoother convergence during training and fine-tuning.
-  - 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config.
+  - 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
+  - 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
+  - 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
+  - 🛡️ **Stable Training**: Built-in gradient clipping to prevent model instability and ensure smoother convergence.
+  - 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config for easy sharing and use.
   - 💾 **Automatic Re-quantization**: After a learning session, Chronos can automatically re-quantize a model to persist the new knowledge.
   - ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`).
   - 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX) or on GPUs via Vulkan for broad hardware compatibility.
@@ -59,18 +61,16 @@ Follow these steps to get a local copy up and running.
 1.  **Clone the repository:**
 
     ```bash
-    git clone https://github.com/necat101/Chronos.git
-    cd chronos
+    git clone https://github.com/your-username/Chronos.git
+    cd Chronos
     ```
 
 2.  **Create a virtual environment (recommended):**
 
     ```bash
     python -m venv .venv
-
     # On Windows
     .\.venv\Scripts\Activate
-
     # On Linux/macOS
     source .venv/bin/activate
     ```
@@ -80,16 +80,11 @@ Follow these steps to get a local copy up and running.
     ```bash
     # On Windows
     setup.bat
-
     # On Linux/macOS
     bash setup.sh
     ```
 
-    This will create a `chronos_matmul` library file in your project root.
-
-    If this does not compile for you, try manually installing the kernel by navigating to the chronos root directory and running `pip install .`
-
-    for CUDA support, please install the cuda accelerated version of torch by running the following command: `pip install torch torchvision torau dio --index-url https://download.pytorch.org/whl/cu121`
+    This will create a `chronos_matmul` library file in your project root. If this fails, you can try running `pip install .` from the project root.
 
 -----
 
@@ -99,7 +94,7 @@ The `chronos.py` script is the main entry point for all operations. All models a
 
 ### 1\. Training
 
-Train a new model from scratch. This creates a new, self-contained model directory at `--out-dir`. Using `--grad-clip 1.0` is recommended for stability.
+Train a new model from scratch. This creates a new, self-contained model directory at `--out-dir`. The `--max_h_steps` defines the upper limit for the model's reasoning depth.
 
 ```bash
 python chronos.py train \
@@ -109,6 +104,8 @@ python chronos.py train \
     --epochs 5 \
     --batch_size 2 \
     --context_dim 512 \
+    --max_h_steps 10 \
+    --ponder-loss-weight 0.01 \
     --grad-clip 1.0
 ```
 
@@ -150,14 +147,45 @@ python chronos.py quantize \
 
 ### 5\. Inference (Chat Mode)
 
-Run an interactive chat session by pointing to any model directory (quantized or full-precision).
+Run an interactive chat session by pointing to any model directory.
+
+```bash
+python chronos.py chat \
+    --model-path "./my_model_merged-INT4"
+```
+
+#### Querying Structured Memory
+
+During a chat session, you can use the `/filter` command to constrain the model's memory retrieval for its next response.
+
+  - **Filter by time:**
+
+    ```
+    >>> /filter time=-3600
+    [INFO: Memory filtered to events after Fri Oct 17 01:45:00 2025]
+    ```
+
+    This command tells Chronos to only use memories it has learned in the last hour (3600 seconds).
+
+  - **Filter by source:**
+
+    ```
+    >>> /filter source=1
+    [INFO: Memory filtered to source ID: 1]
+    ```
+
+    This tells Chronos to only use memories learned from `user interaction` (Source ID 1).
+
+  - **Reset filters:**
+
+    ```
+    >>> /filter reset
+    [INFO: Memory filters have been reset.]
+    ```
 
 #### Enabling Online Learning in Chat
 
-Allow the model to learn from your conversation. This requires both the quantized model (`--model-path`) and the original full-precision model (`--shadow-model-path`) to calculate the updates.
-
-**Method 1: Dynamic LR & Re-quantize (Recommended)**
-This is the default behavior. It uses a dynamic learning rate and asks to save changes by re-quantizing upon exit.
+This requires both the quantized model (`--model-path`) and the original full-precision model (`--shadow-model-path`) to calculate the updates.
 
 ```bash
 python chronos.py chat \
@@ -166,84 +194,41 @@ python chronos.py chat \
     --shadow-model-path "./my_model_merged"
 ```
 
-**Method 2: Static LR & Re-quantize**
-To use a fixed learning rate instead of the dynamic schedule, add the `--static-ltm-lr` flag.
-
-```bash
-python chronos.py chat \
-    --model-path "./my_model_merged-INT4" \
-    --enable-quantized-learning \
-    --shadow-model-path "./my_model_merged" \
-    --static-ltm-lr \
-    --ltm_lr 0.005
-```
-
-### Advanced Model Surgery: Using `expand_model.py`
-
-The `expand_model.py` script is a powerful utility for increasing a model's capacity without retraining from scratch. It allows you to "transplant" the learned weights from a smaller, trained model into a new, larger architecture. The new, larger parts of the model are randomly initialized, while the existing parts retain their knowledge, providing an excellent starting point for further fine-tuning.
-
-**Step 1: Expand the Model Checkpoint**
-
-Run the script, pointing to an existing training checkpoint (`.pt` file) and defining the new, larger dimensions.
-
-```bash
-# Example: Expanding a model with context_dim=128 to context_dim=512
-python expand_model.py \
-    --old-model-path "./my_chronos_model/chronos_epoch_5.pt" \
-    --output-path "./my_expanded_model/expanded_checkpoint.pt" \
-    --context_dim 512 \
-    --h_hidden 512 \
-    --l_hidden 512
-```
-
-**Step 2: Fine-Tune the Expanded Model**
-
-This command creates a new, full **training checkpoint** at the specified output path. You can then use this checkpoint with `--resume-from-ckpt` to fine-tune your new, larger model on your dataset, allowing it to learn how to use its expanded capacity.
-
-```bash
-# Now, resume training to fine-tune the expanded model
-python chronos.py train \
-    --train "path/to/your_data.jsonl" \
-    --out-dir "./my_expanded_model_finetuned" \
-    --resume-from-ckpt "./my_expanded_model/expanded_checkpoint.pt" \
-    --epochs 10
-```
-
 -----
 
 ## ⚙️ Command-Line Reference
 
 ### Main Modes
 
-| Mode | Description |
-| :--- | :--- |
-| `train` | Train a new model from scratch. |
+| Mode       | Description                                  |
+| :--------- | :------------------------------------------- |
+| `train`    | Train a new model from scratch.              |
 | `finetune` | Apply LoRA fine-tuning to an existing model. |
-| `merge-lora` | Merge a LoRA adapter into a base model. |
+| `merge-lora`| Merge a LoRA adapter into a base model.      |
 | `quantize` | Convert a model directory to a quantized version. |
-| `chat` | Run an interactive chat session. |
+| `chat`     | Run an interactive chat session.             |
 
 ### Key Arguments
 
-| Argument | Description | Default |
-| :--- | :--- | :--- |
-| **Paths** | | |
-| `--model-path` | Path to the model directory (for `finetune`, `merge`, `quantize`, `chat`). | `None` |
-| `--train` | Path to the training `.json` or `.jsonl` file. | `None` |
-| `--out-dir` | Directory to save new models, checkpoints, or adapters. | `./chronos_model` |
-| `--tokenizer-path` | `[Train]` Path or HF name of the tokenizer for a new model. | `microsoft/phi-2` |
-| `--shadow-model-path` | `[Chat]` Path to the original full-precision model for online learning. | `None` |
-| **Training & Fine-Tuning** | | |
-| `--epochs` | Number of training epochs. | `3` |
-| `--starting-lr` | The maximum learning rate for the main model scheduler. | `1e-4` |
-| `--grad-clip` | `[Train/Finetune]` Prevents gradient explosion for stable training. 0 to disable. | `1.0` |
-| `--kayla` | `[Train]` Enable Chain-of-Thought style training. | `False` |
-| **Quantization & Inference**| | |
-| `--qtype` | Quantization format. Options: `INT4`, `Q4_0`, `Q8_0`, `Q2_K`. | `INT4` |
-| `--device` | `[Chat]` Device for quantized inference. Options: `cpu`, `vulkan`. | `cpu` |
-| `--enable-quantized-learning`| `[Chat]` Enable LTM updates for quantized models. | `False` |
-| `--ltm_lr` | `[Chat]` Max LR for LTM schedule, or the fixed rate if `--static-ltm-lr` is used.| `0.01` |
-| `--static-ltm-lr` | `[Chat]` Disable the LTM cosine schedule and use a fixed learning rate. | `False` |
+| Argument                  | Description                                                                     | Default           |
+| :------------------------ | :------------------------------------------------------------------------------ | :---------------- |
+| **Paths** |                                                                                 |                   |
+| `--model-path`            | Path to the model directory (for `finetune`, `merge`, `quantize`, `chat`).        | `None`            |
+| `--train`                 | Path to the training `.json` or `.jsonl` file.                                  | `None`            |
+| `--out-dir`               | Directory to save new models, checkpoints, or adapters.                         | `./chronos_model` |
+| `--tokenizer-path`        | `[Train]` Path or HF name of the tokenizer for a new model.                     | `microsoft/phi-2` |
+| **Training & Fine-Tuning**|                                                                                 |                   |
+| `--epochs`                | Number of training epochs.                                                      | `3`               |
+| `--grad-clip`             | `[Train/Finetune]` Prevents gradient explosion for stable training. 0 to disable.| `1.0`             |
+| `--ponder-loss-weight`    | `[Train/Finetune]` Weight for the Ponder Cost auxiliary loss.                     | `0.01`            |
+| **Quantization & Inference**|                                                                                 |                   |
+| `--qtype`                 | Quantization format. Options: `INT4`, `Q4_0`, `Q8_0`, `Q2_K`.                     | `INT4`            |
+| `--device`                | `[Chat]` Device for quantized inference. Options: `cpu`, `vulkan`.              | `cpu`             |
+| `--h-halt-thresh`         | `[Chat]` Probability threshold for early exiting the reasoning loop.              | `0.9`             |
+| `--enable-quantized-learning`| `[Chat]` Enable LTM updates for quantized models.                                 | `False`           |
+| `--ltm_lr`                | `[Chat]` Max LR for LTM schedule, or the fixed rate if `--static-ltm-lr` is used.| `0.01`            |
+| **Model Architecture** |                                                                                 |                   |
+| `--max_h_steps`           | `[Train]` Maximum number of reasoning steps the H-module can take.              | `10`              |
 
 -----
 
@@ -269,11 +254,20 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   - The quantization kernel design is heavily influenced by the groundbreaking work in **llama.cpp**.
   - **pybind11** for seamless C++/Python integration.
 
-## v0.4 (alpha) Changelog
+## Changelog
 
-  - **Implemented Dynamic LTM Learning Rate**: Online learning now defaults to a `CosineAnnealingLR` schedule. This improves learning stability by starting with a high learning rate for new information and gradually decaying it.
-  - **Added Static LR Fallback**: The `--static-ltm-lr` flag can be used in chat mode to revert to the old fixed learning rate behavior for the LTM.
-  - **Added Gradient Clipping**: The `--grad-clip` argument is now available for `train` and `finetune` modes to prevent gradient explosion and improve training stability.
+### v0.5 (alpha)
+
+  - **Implemented Structured Long-Term Memory**: Memory slots are now augmented with timestamps and source metadata, enabling temporal and source-based filtering during chat.
+  - **Implemented Adaptive Reasoning Depth (Ponder Time)**: The HRM's reasoning depth is now dynamic. The model learns to "think longer" for complex tokens and halt early on simple ones.
+  - **Added Ponder Cost**: A new auxiliary loss (`--ponder-loss-weight`) trains the model to be computationally efficient.
+  - **Added Halting Threshold**: A new inference flag (`--h-halt-thresh`) allows users to control the trade-off between speed and reasoning depth during chat.
+
+### v0.4 (alpha)
+
+  - **Implemented Dynamic LTM Learning Rate**: Online learning now defaults to a `CosineAnnealingLR` schedule for more stable knowledge consolidation.
+  - **Added Static LR Fallback**: The `--static-ltm-lr` flag can be used in chat mode to revert to a fixed LTM learning rate.
+  - **Added Gradient Clipping**: The `--grad-clip` argument was added to `train` and `finetune` modes to improve training stability.
 
 -----
 
