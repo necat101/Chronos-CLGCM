@@ -41,7 +41,7 @@ try:
     import chronos_matmul
     _HAS_KERNEL = True
     print("Successfully imported C++ quantization kernel.")
-    if hasattr(chronos_matmul, "VULKAN_SUPPORT") and chronos_matmul.VULKAN_SUPPORT:
+    if hasattr(chronos_matmul, "Vulkan_SUPPORT") and chronos_matmul.VULKAN_SUPPORT:
         print("INFO: Vulkan support is enabled in the compiled kernel.")
         _HAS_VULKAN = True
     else:
@@ -57,7 +57,7 @@ except ImportError:
     print("!!!                                                                         !!!")
     print("!!! If you have already run the setup, you may need to activate the         !!!")
     print("!!! virtual environment first:                                              !!!")
-    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                               !!!")
+    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                              !!!")
     print("!!!  - On Linux/macOS: source .venv/bin/activate                            !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1) # Exit the program because the kernel is essential
@@ -244,7 +244,7 @@ def export_and_quantize_model(output_dir: str, model: nn.Module, tokenizer, qtyp
     Q_BLOCK_SIZE = get_q_block_size(qtype)
 
     for name, tensor in tqdm(state_dict.items(), desc="Quantizing Tensors"):
-        if tensor.ndim == 2 and "emb" not in name and "ltm" not in name:
+        if tensor.ndim == 2 and "emb" not in name and "ltm" not in name and "timestamps" not in name and "sources" not in name:
             float_tensor_np = tensor.cpu().float().numpy()
             M, K = float_tensor_np.shape
 
@@ -336,6 +336,13 @@ class GRUCell(nn.Module):
 
 class LTMModule(nn.Module):
     """Titans Long-Term Memory Module. Capable of test-time updates."""
+    ### MODIFICATION START: Define Source IDs for clarity ###
+    # SOURCE_ID definitions
+    SRC_UNKNOWN = 0
+    SRC_USER_INTERACTION = 1
+    SRC_TRAINING_DATA = 2
+    ### MODIFICATION END ###
+
     def __init__(self, n_slots=1024, key_dim=64, val_dim=64, lr=1e-3, momentum=0.9, wd=1e-4):
         super().__init__()
         self.keys = nn.Parameter(torch.randn(n_slots, key_dim) * 0.02)
@@ -343,21 +350,52 @@ class LTMModule(nn.Module):
         self.register_buffer("_mom_vals", torch.zeros_like(self.vals.data))
         self.lr, self.momentum, self.weight_decay = lr, momentum, wd
 
+        ### MODIFICATION START: Add buffers for metadata ###
+        # Buffers are not parameters; they are part of the model's state
+        # but are not updated by the optimizer during training.
+        self.register_buffer("timestamps", torch.zeros(n_slots, dtype=torch.float32))
+        self.register_buffer("sources", torch.full((n_slots,), self.SRC_UNKNOWN, dtype=torch.long))
+        ### MODIFICATION END ###
+
         # Buffer for accumulating deltas if not updating in-place
         self.register_buffer("ltm_deltas", torch.zeros_like(self.vals.data))
         self.accumulate_deltas = False
 
-    def retrieve_topk(self, queries: torch.Tensor, topk: int = 4) -> Tuple[torch.Tensor, torch.LongTensor]:
-        """Retrieves the top-k most similar values from memory."""
+    ### MODIFICATION START: Enhance retrieval with filtering ###
+    def retrieve_topk(self, queries: torch.Tensor, topk: int = 4, min_timestamp: float = 0.0, source_filter: Optional[int] = None) -> Tuple[torch.Tensor, torch.LongTensor]:
+        """
+        Retrieves the top-k most similar values from memory, with optional filtering
+        by timestamp and source.
+        """
         sim = queries @ self.keys.t()
+
+        # Apply filters by creating a mask of valid slots
+        if min_timestamp > 0.0 or source_filter is not None:
+            with torch.no_grad():
+                # Start with all slots being valid
+                valid_mask = torch.ones(self.keys.size(0), dtype=torch.bool, device=self.keys.device)
+
+                if min_timestamp > 0.0:
+                    # Filter out memories that are older than the specified timestamp
+                    valid_mask &= (self.timestamps >= min_timestamp)
+
+                if source_filter is not None:
+                    # Filter for a specific source
+                    valid_mask &= (self.sources == source_filter)
+
+                # Set the similarity score of invalid slots to negative infinity
+                # so they are never chosen by topk.
+                sim[:, ~valid_mask] = -torch.inf
+
         _, idx = torch.topk(sim, k=topk, dim=-1)
         return self.vals[idx], idx
+    ### MODIFICATION END ###
 
-    ### MODIFICATION START ###
-    def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor, current_lr: float):
+    ### MODIFICATION START: Update metadata during memory consolidation ###
+    def inner_update(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor, current_lr: float, source: int = SRC_USER_INTERACTION):
         """
         Performs a meta-learning update on the LTM value slots based on the "surprise" gradient.
-        Now accepts a dynamic learning rate.
+        Now also updates the timestamp and source metadata for the modified slots.
         """
         with torch.no_grad():
             if grads_tensor is None: return
@@ -375,12 +413,17 @@ class LTMModule(nn.Module):
                 slot_grads[nonzero_mask] /= counts[nonzero_mask].unsqueeze(-1)
 
             self._mom_vals.data.mul_(self.momentum).add_(slot_grads)
-            # Use the passed-in current_lr instead of self.lr
             update_delta = (self._mom_vals.data + self.weight_decay * self.vals.data)
             update_delta.mul_(-current_lr)
 
             final_update = torch.zeros_like(self.vals.data)
             final_update[nonzero_mask] = update_delta[nonzero_mask]
+
+            # --- UPDATE METADATA ---
+            current_time = time.time()
+            self.timestamps.data[nonzero_mask] = current_time
+            self.sources.data[nonzero_mask] = source
+            # --- END METADATA UPDATE ---
 
             if self.accumulate_deltas:
                 self.ltm_deltas.data.add_(final_update)
@@ -388,6 +431,7 @@ class LTMModule(nn.Module):
             else:
                 self.vals.data.add_(final_update)
     ### MODIFICATION END ###
+
 
 class ChronosCore(nn.Module):
     """The full, trainable Chronos model, integrating HRM as the core processor."""
@@ -416,6 +460,11 @@ class ChronosCore(nn.Module):
         self.l_rnn = GRUCell(self.config.context_dim * 2, self.config.l_hidden)
         self.l_to_out = nn.Linear(self.config.l_hidden, self.config.context_dim)
 
+        ### MODIFICATION START ###
+        # Add the halting projection layer
+        self.h_halt_proj = nn.Linear(self.config.h_hidden, 1)
+        ### MODIFICATION END ###
+
         self.out_norm = nn.LayerNorm(self.config.context_dim)
         self.lm_head = nn.Linear(self.config.context_dim, self.config.vocab_size, bias=False)
         self.tok_emb.weight = self.lm_head.weight
@@ -427,7 +476,9 @@ class ChronosCore(nn.Module):
     def _get_prompt_embedding(self, prompt_embedding):
         return prompt_embedding
 
-    def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, labels: Optional[torch.LongTensor] = None, **kwargs):
+    ### MODIFICATION START: Add filtering args to forward method ###
+    def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, labels: Optional[torch.LongTensor] = None, min_timestamp: float = 0.0, source_filter: Optional[int] = None, **kwargs):
+    ### MODIFICATION END ###
         B, T = input_ids.shape
         device = input_ids.device
 
@@ -440,6 +491,7 @@ class ChronosCore(nn.Module):
         all_topk_vals = []
         all_topk_idx = []
         final_token_embeddings = []
+        all_ponder_costs = []
 
         h_state = torch.zeros(B, self.config.h_hidden, device=device)
         l_state = torch.zeros(B, self.config.l_hidden, device=device)
@@ -449,7 +501,15 @@ class ChronosCore(nn.Module):
 
             p_read = self.persistent.unsqueeze(0).expand(B, -1)
             query = self.qproj(token_emb)
-            topk_vals, topk_idx = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk)
+            
+            ### MODIFICATION START: Pass filters to retrieve_topk ###
+            topk_vals, topk_idx = self.ltm.retrieve_topk(
+                query,
+                topk=self.config.ltm_topk,
+                min_timestamp=min_timestamp,
+                source_filter=source_filter
+            )
+            ### MODIFICATION END ###
 
             # NOTE: This UserWarning is expected and necessary.
             # We must retain the grad on a non-leaf tensor (the retrieved values)
@@ -465,11 +525,17 @@ class ChronosCore(nn.Module):
             mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
             enc = F.gelu(self.in_proj(mac_input))
 
-            ### MODIFIED: Replaced fixed-step HRM with convergence-based logic ###
-            for _ in range(self.config.h_steps):
-                h_state = self.h_rnn(enc, h_state)
+            ### MODIFICATION START: Adaptive HRM Loop ###
+            step_outputs = []
+            halt_probs = []
+            
+            # The initial 'enc' is passed to the first H-step
+            current_enc = enc 
+            
+            for h_step in range(self.config.max_h_steps):
+                h_state = self.h_rnn(current_enc, h_state)
                 context = self.h_to_context(h_state)
-                l_input = torch.cat([enc, context], dim=-1)
+                l_input = torch.cat([current_enc, context], dim=-1)
 
                 # L-module converges to equilibrium
                 l_state_prev = torch.zeros_like(l_state) # Initialize for the first check
@@ -479,28 +545,74 @@ class ChronosCore(nn.Module):
                     # Check for convergence
                     if torch.allclose(l_state, l_state_prev, atol=self.config.l_conv_atol):
                         break
+                
+                # The output for this H-step is the converged L-state applied as a residual
+                step_update = self.l_to_out(l_state)
+                current_enc = current_enc + step_update
 
-                # The output for this H-step is the converged L-state
-                enc = enc + self.l_to_out(l_state)
-            ### END MODIFICATION ###
+                # Calculate halt probability for this step
+                halt_logit = self.h_halt_proj(h_state).squeeze(-1) # Shape: (B,)
+                halt_prob = torch.sigmoid(halt_logit)
+                
+                step_outputs.append(current_enc)
+                halt_probs.append(halt_prob)
 
-            final_token_embeddings.append(enc)
+                # For inference, we can exit early for efficiency
+                if not self.training and (halt_prob.mean() > self.config.h_halt_thresh):
+                    break
+            
+            # After the loop, calculate the final output and ponder cost using ACT logic
+            step_outputs_t = torch.stack(step_outputs, dim=0) # Shape: (H, B, D)
+            halt_probs_t = torch.stack(halt_probs, dim=0)     # Shape: (H, B)
+            num_steps_taken = halt_probs_t.shape[0]
+
+            # Calculate probabilities for weighting
+            unhalt_probs = 1.0 - halt_probs_t
+            # Cumulative product of unhalting probabilities up to the previous step
+            unhalt_probs_shifted = torch.cat([torch.ones_like(unhalt_probs[:1]), unhalt_probs[:-1]], dim=0)
+            cum_unhalt_probs = torch.cumprod(unhalt_probs_shifted, dim=0)
+
+            # Weight for each step is p_h * product_{i<h}(1-p_i)
+            weights = halt_probs_t * cum_unhalt_probs
+            
+            # Remainder is the probability of not having halted after all steps
+            remainder = cum_unhalt_probs[-1] * (1.0 - halt_probs_t[-1])
+
+            # Normalize weights to ensure they sum to 1
+            total_prob_sum = weights.sum(dim=0) + remainder
+            weights = weights / total_prob_sum.unsqueeze(0)
+
+            # Weighted average of step outputs
+            final_enc = (weights.unsqueeze(-1) * step_outputs_t).sum(dim=0)
+            
+            # Ponder cost: number of steps executed + probability of not halting
+            ponder_cost = num_steps_taken + remainder
+            all_ponder_costs.append(ponder_cost)
+            ### MODIFICATION END ###
+
+            final_token_embeddings.append(final_enc)
 
         final_embeddings = torch.stack(final_token_embeddings, dim=1)
         final_embeddings = self.out_norm(final_embeddings)
         logits = self.lm_head(final_embeddings)
 
         loss = None
+        ponder_cost_out = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            
+            ### MODIFICATION START ###
+            # Average the ponder cost across the sequence length and batch
+            ponder_cost_out = torch.stack(all_ponder_costs, dim=1).mean()
+            ### MODIFICATION END ###
 
         seq_topk_vals = torch.stack(all_topk_vals, dim=1)
         seq_topk_idx = torch.stack(all_topk_idx, dim=1)
 
-        return {"loss": loss, "logits": logits, "topk_vals": seq_topk_vals, "topk_idx": seq_topk_idx}
+        return {"loss": loss, "logits": logits, "topk_vals": seq_topk_vals, "topk_idx": seq_topk_idx, "ponder_cost": ponder_cost_out}
 
 
 class QuantizedChronos:
@@ -523,7 +635,9 @@ class QuantizedChronos:
         self.ltm = LTMModule(n_slots=self.config.ltm_slots, key_dim=self.config.ltm_key_dim, val_dim=self.config.ltm_val_dim)
         self.ltm.load_state_dict({
             'keys': torch.from_numpy(q_data['ltm.keys'].item()['raw']),
-            'vals': torch.from_numpy(q_data['ltm.vals'].item()['raw'])
+            'vals': torch.from_numpy(q_data['ltm.vals'].item()['raw']),
+            'timestamps': torch.from_numpy(q_data['ltm.timestamps'].item()['raw']),
+            'sources': torch.from_numpy(q_data['ltm.sources'].item()['raw']),
         }, strict=False)
 
         self.qproj = QuantizedLinear('qproj', q_data)
@@ -533,9 +647,17 @@ class QuantizedChronos:
         self.l_rnn = QuantizedGRUCell(self.config.context_dim * 2, self.config.l_hidden, 'l_rnn', q_data)
         self.l_to_out = QuantizedLinear('l_to_out', q_data)
         self.lm_head = QuantizedLinear('lm_head', q_data)
+        
+        ### MODIFICATION START ###
+        # Add the quantized halting projection layer
+        self.h_halt_proj = QuantizedLinear('h_halt_proj', q_data)
+        ### MODIFICATION END ###
+        
         print("Initialized QuantizedChronos model from config.")
 
-    def __call__(self, input_ids: torch.LongTensor, h_state: torch.Tensor, l_state: torch.Tensor, device: str = "cpu"):
+    ### MODIFICATION START: Add filtering args to call method ###
+    def __call__(self, input_ids: torch.LongTensor, h_state: torch.Tensor, l_state: torch.Tensor, device: str = "cpu", min_timestamp: float = 0.0, source_filter: Optional[int] = None):
+    ### MODIFICATION END ###
         B, T = input_ids.shape
         # Use T-1 for single-token generation, but allow for longer sequences during initial prompt processing.
         current_pos_start = T - 1 if T > 1 else 0
@@ -547,23 +669,41 @@ class QuantizedChronos:
 
             p_read = self.persistent.unsqueeze(0).expand(B, -1)
             query = self.qproj(token_emb, device=device)
-            topk_vals, _ = self.ltm.retrieve_topk(query, topk=self.config.ltm_topk)
+            
+            ### MODIFICATION START: Pass filters to retrieve_topk ###
+            topk_vals, _ = self.ltm.retrieve_topk(
+                query,
+                topk=self.config.ltm_topk,
+                min_timestamp=min_timestamp,
+                source_filter=source_filter
+            )
+            ### MODIFICATION END ###
+
             ltm_summary_flat = topk_vals.view(B, -1)
 
             mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
             enc = F.gelu(self.in_proj(mac_input, device=device))
 
-            ### MODIFIED: Replaced fixed-step HRM with convergence-based logic for inference ###
-            # Note: The convergence check is not performed here for speed. We just use the max steps.
-            # True convergence in a non-PyTorch quantized model would be more complex to implement.
-            for _ in range(self.config.h_steps):
+            ### MODIFICATION START: Adaptive HRM Loop for Inference ###
+            for _ in range(self.config.max_h_steps):
                 h_state = self.h_rnn(enc, h_state, device=device)
+                
+                # Check for halt condition
+                halt_logit = self.h_halt_proj(h_state, device=device)
+                halt_prob = torch.sigmoid(halt_logit)
+
                 context = self.h_to_context(h_state, device=device)
-                for _ in range(self.config.max_l_steps): # Use max_l_steps
+                # L-module runs for its max steps; convergence check is omitted for speed in quantized inference
+                for _ in range(self.config.max_l_steps):
                     l_input = torch.cat([enc, context], dim=-1)
                     l_state = self.l_rnn(l_input, l_state, device=device)
+                
                 enc = enc + self.l_to_out(l_state, device=device)
-            ### END MODIFICATION ###
+
+                # Early exit based on halt probability
+                if halt_prob.item() > self.config.h_halt_thresh:
+                    break
+            ### MODIFICATION END ###
 
         final_embedding = self.out_norm(enc)
         logits = self.lm_head(final_embedding, device=device)
@@ -670,22 +810,33 @@ def train(args, device, tokenizer):
         print(f"\n--- Epoch {epoch + 1} / {args.epochs} ---")
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}")
         total_loss = 0.0
+        total_ponder_cost = 0.0
 
         for i, batch in enumerate(pbar):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
 
             # Run the forward pass to get outputs and loss
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs["loss"]
+            
+            ### MODIFICATION START ###
+            # Calculate combined loss with ponder cost
+            cross_entropy_loss = outputs["loss"]
+            ponder_cost = outputs["ponder_cost"]
+            
+            combined_loss = None
+            if cross_entropy_loss is not None and ponder_cost is not None:
+                combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
+            ### MODIFICATION END ###
 
-            if loss is not None:
+            if combined_loss is not None:
                 # Scale loss for gradient accumulation
-                loss = loss / args.accumulation_steps
+                loss_to_backward = combined_loss / args.accumulation_steps
 
                 # Calculate gradients for all parameters, including the non-leaf "topk_vals"
-                loss.backward()
+                loss_to_backward.backward()
 
-                total_loss += loss.item() * args.accumulation_steps
+                total_loss += cross_entropy_loss.item() * args.accumulation_steps
+                total_ponder_cost += ponder_cost.item() * args.accumulation_steps
 
                 # Perform weight update step after accumulating gradients
                 if (i + 1) % args.accumulation_steps == 0:
@@ -693,7 +844,9 @@ def train(args, device, tokenizer):
                     # This is the "surprise" update for the Long-Term Memory (LTM).
                     ltm_grads = outputs["topk_vals"].grad
                     if ltm_grads is not None:
-                        model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=args.ltm_lr)
+                        ### MODIFICATION START: Specify source as Training Data ###
+                        model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=args.ltm_lr, source=LTMModule.SRC_TRAINING_DATA)
+                        ### MODIFICATION END ###
                     # --- END: LTM UPDATE ---
 
                     # <<< NEW: GRADIENT CLIPPING >>>
@@ -711,7 +864,11 @@ def train(args, device, tokenizer):
                     optimizer.zero_grad()
 
             current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
-            pbar.set_postfix({"loss": f"{total_loss / (i + 1):.4f}", "lr": f"{current_lr:.2e}"})
+            pbar.set_postfix({
+                "loss": f"{total_loss / (i + 1):.4f}", 
+                "ponder": f"{total_ponder_cost / (i + 1):.2f}",
+                "lr": f"{current_lr:.2e}"
+            })
 
         # <<< FIX: Indented this block to save after each epoch >>>
         ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
@@ -756,7 +913,9 @@ def finetune(args, device, tokenizer):
             print(f"Warning: Both --lora_r ({args.lora_r}) and --finetune-unlock-percent were specified. Prioritizing --lora_r.")
         else:
             total_params = sum(p.numel() for p in model.parameters())
-            target_modules = ["qproj", "in_proj", "h_to_context", "l_to_out", "lm_head"]
+            ### MODIFICATION START ###
+            target_modules = ["qproj", "in_proj", "h_to_context", "l_to_out", "h_halt_proj"]
+            ### MODIFICATION END ###
             lora_param_sum_per_r = 0
             for name, module in model.named_modules():
                 if isinstance(module, nn.Linear) and any(tm in name for tm in target_modules):
@@ -773,7 +932,9 @@ def finetune(args, device, tokenizer):
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=args.lora_alpha,
-        target_modules=["qproj", "in_proj", "h_to_context", "l_to_out"],
+        ### MODIFICATION START ###
+        target_modules=["qproj", "in_proj", "h_to_context", "l_to_out", "h_halt_proj"],
+        ### MODIFICATION END ###
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
@@ -798,21 +959,33 @@ def finetune(args, device, tokenizer):
         print(f"\n--- LoRA Finetune Epoch {epoch + 1} / {args.epochs} ---")
         pbar = tqdm(dataloader, desc=f"Finetune Epoch {epoch + 1}")
         total_loss = 0.0
+        total_ponder_cost = 0.0
         for i, batch in enumerate(pbar):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs["loss"]
-            if loss is not None:
-                loss = loss / args.accumulation_steps
-                loss.backward()
-                total_loss += loss.item() * args.accumulation_steps
+            
+            ### MODIFICATION START ###
+            cross_entropy_loss = outputs["loss"]
+            ponder_cost = outputs["ponder_cost"]
+            combined_loss = None
+            if cross_entropy_loss is not None and ponder_cost is not None:
+                combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
+            ### MODIFICATION END ###
+            
+            if combined_loss is not None:
+                loss_to_backward = combined_loss / args.accumulation_steps
+                loss_to_backward.backward()
+                total_loss += cross_entropy_loss.item() * args.accumulation_steps
+                total_ponder_cost += ponder_cost.item() * args.accumulation_steps
 
                 if (i + 1) % args.accumulation_steps == 0:
                     # --- START: LTM UPDATE ---
                     ltm_grads = outputs["topk_vals"].grad
                     if ltm_grads is not None:
                         # When using PEFT, the original model is stored in .base_model
-                        model.base_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=args.ltm_lr)
+                        ### MODIFICATION START: Specify source as Training Data ###
+                        model.base_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=args.ltm_lr, source=LTMModule.SRC_TRAINING_DATA)
+                        ### MODIFICATION END ###
                     # --- END: LTM UPDATE ---
 
                     # <<< NEW: GRADIENT CLIPPING >>>
@@ -825,7 +998,11 @@ def finetune(args, device, tokenizer):
                     optimizer.zero_grad()
 
             current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
-            pbar.set_postfix({"loss": f"{total_loss / (i+1):.4f}", "lr": f"{current_lr:.2e}"})
+            pbar.set_postfix({
+                "loss": f"{total_loss / (i+1):.4f}", 
+                "ponder": f"{total_ponder_cost / (i + 1):.2f}",
+                "lr": f"{current_lr:.2e}"
+            })
 
     print(f"Saving LoRA adapter to {args.out_dir}")
     model.save_pretrained(args.out_dir)
@@ -946,12 +1123,11 @@ def chat(args, device, tokenizer):
     if not is_quantized:
         model.eval()
 
-    ### MODIFICATION START ###
     ltm_scheduler = None
     # Setup LTM scheduler if not in static mode and learning is enabled
     if not args.static_ltm_lr and (not is_quantized or args.enable_quantized_learning):
         print("INFO: Using Cosine Annealing schedule for LTM updates.")
-        print(f"         - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
+        print(f"             - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
         # Schedulers need an optimizer, so we create a dummy one for the LTM LR.
         # We will call scheduler.step() manually, but never optimizer.step().
         dummy_param = nn.Parameter(torch.tensor(0.0))
@@ -961,18 +1137,48 @@ def chat(args, device, tokenizer):
             T_max=args.ltm_schedule_steps,
             eta_min=args.ltm_schedule_min_lr
         )
-    ### MODIFICATION END ###
 
     print("\nWelcome to Chronos Chat. Type 'exit' or 'quit' to end.")
+    ### MODIFICATION START: Add help text for new filter command ###
+    print("Use '/filter time=-<seconds>' or '/filter source=<id>' to constrain memory.")
+    print("Example: /filter time=-3600  (memories from the last hour)")
+    ### MODIFICATION END ###
     if _HAS_KEYBOARD:
         print("Press Ctrl+X to stop generation at any time.")
     print("="*50)
 
     try:
+        ### MODIFICATION START: Initialize filter variables ###
+        min_ts_filter = 0.0
+        source_id_filter = None
+        ### MODIFICATION END ###
         while True:
             prompt = input(">>> ")
             if prompt.lower() in ["exit", "quit"]:
                 break
+
+            ### MODIFICATION START: Simple command parser for filtering ###
+            if prompt.startswith('/filter'):
+                parts = prompt.split()
+                try:
+                    for part in parts[1:]:
+                        key, value = part.split('=')
+                        if key == 'time':
+                            # time=-3600 means "minimum timestamp is 3600 seconds ago"
+                            min_ts_filter = time.time() + float(value)
+                            print(f"[INFO: Memory filtered to events after {time.ctime(min_ts_filter)}]")
+                        elif key == 'source':
+                            source_id_filter = int(value)
+                            print(f"[INFO: Memory filtered to source ID: {source_id_filter}]")
+                except ValueError:
+                    print("[ERROR: Invalid filter format. Use 'time=-<seconds>' or 'source=<id>']")
+                continue
+            elif prompt == '/filter reset':
+                min_ts_filter = 0.0
+                source_id_filter = None
+                print("[INFO: Memory filters have been reset.]")
+                continue
+            ### MODIFICATION END ###
 
             prompt_format = f"### Instruction:\n{prompt}\n\n### Response:\n"
             # Always use the main device for tokenization, even for quantized models
@@ -995,10 +1201,15 @@ def chat(args, device, tokenizer):
                     model_input_ids = current_ids.to("cpu") if is_quantized else current_ids.to(device)
 
                     if is_quantized:
-                        outputs = model(model_input_ids, h_state, l_state, device=inference_device)
+                        ### MODIFICATION START: Pass filters to quantized model ###
+                        outputs = model(model_input_ids, h_state, l_state, device=inference_device, min_timestamp=min_ts_filter, source_filter=source_id_filter)
+                        ### MODIFICATION END ###
                         h_state, l_state = outputs['h_state'], outputs['l_state']
                     else:
-                        outputs = model(model_input_ids)
+                        ### MODIFICATION START: Pass filters to full model ###
+                        outputs = model(model_input_ids, min_timestamp=min_ts_filter, source_filter=source_id_filter)
+                        ### MODIFICATION END ###
+
 
                     logits = outputs["logits"].to(device) # Move logits to main device for sampling
                     next_token_id = torch.argmax(logits[:, -1, :], dim=-1).unsqueeze(0)
@@ -1028,13 +1239,27 @@ def chat(args, device, tokenizer):
 
                     update_model.zero_grad()
                     outputs = update_model(input_ids=full_sequence, labels=labels)
-                    loss = outputs["loss"]
 
-                    if loss is not None and not torch.isnan(loss):
-                        loss.backward()
+                    # --- MODIFICATION START ---
+                    # The "surprise" metric should be based on the total training objective,
+                    # which now includes the ponder cost.
+                    cross_entropy_loss = outputs["loss"]
+                    ponder_cost = outputs["ponder_cost"]
+
+                    # Retrieve the ponder weight from the model's config to ensure consistency
+                    ponder_loss_weight = update_model.config.get('ponder_loss_weight', 0.01) # Safe default
+
+                    combined_loss = None
+                    if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and ponder_cost is not None:
+                        print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: {ponder_cost.item():.2f}]", end="", flush=True)
+                        combined_loss = cross_entropy_loss + ponder_loss_weight * ponder_cost
+                    # --- MODIFICATION END ---
+
+                    # Use the combined_loss for backpropagation
+                    if combined_loss is not None:
+                        combined_loss.backward()
                         ltm_grads = outputs["topk_vals"].grad
 
-                        ### MODIFICATION START ###
                         # Determine the current LTM learning rate based on mode
                         if ltm_scheduler:
                             current_ltm_lr = ltm_scheduler.get_last_lr()[0]
@@ -1042,12 +1267,12 @@ def chat(args, device, tokenizer):
                             # Step the scheduler for the next update
                             ltm_scheduler.step()
                         else: # Static mode
-                            current_ltm_lr = update_model.ltm.lr
+                            current_ltm_lr = update_model.config.get('ltm_lr', 1e-2)
 
                         # Call the modified inner_update function with the calculated LR
-                        update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=current_ltm_lr)
+                        ### MODIFICATION START: Update source as User Interaction ###
+                        update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=current_ltm_lr, source=LTMModule.SRC_USER_INTERACTION)
                         ### MODIFICATION END ###
-
                         ltm_has_been_updated = True # Mark that a change has occurred
 
                         # Copy the updated LTM weights back to the live quantized model for immediate use
@@ -1120,7 +1345,6 @@ def main():
     path_group.add_argument("--out-dir", type=str, default="./chronos_model", help="[Train/Finetune/Merge/Quantize] Directory to save the new model/adapter.")
     path_group.add_argument("--lora-adapter-path", type=str, default=None, help="[Merge] Path to the trained LoRA adapter directory.")
     path_group.add_argument("--tokenizer-path", type=str, default="microsoft/phi-2", help="[Train] Path or HF name of the tokenizer to use for a new model.")
-    # <<< FIXED: Changed resume argument to be a direct file path.
     path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="[Train] Path to a specific training checkpoint .pt file to resume from.")
     path_group.add_argument("--shadow-model-path", type=str, default=None, help="[Chat] Path to the original full-precision model dir, required for online learning with a quantized model.")
 
@@ -1134,11 +1358,11 @@ def main():
     arch_group.add_argument("--ltm_val_dim", type=int, default=128)
     arch_group.add_argument("--h_hidden", type=int, default=512)
     arch_group.add_argument("--l_hidden", type=int, default=512)
-    arch_group.add_argument("--h_steps", type=int, default=1, help="Number of high-level refinement steps in HRM.")
-    ### MODIFIED: Replaced l_steps with max_l_steps and added convergence tolerance ###
+    ### MODIFICATION START ###
+    arch_group.add_argument("--max_h_steps", type=int, default=10, help="[HRM] Maximum number of high-level refinement steps.")
     arch_group.add_argument("--max_l_steps", type=int, default=10, help="[HRM] Maximum number of low-level iterations before forcing completion.")
     arch_group.add_argument("--l_conv_atol", type=float, default=1e-5, help="[HRM] Absolute tolerance for checking L-module state convergence.")
-    ### END MODIFICATION ###
+    ### MODIFICATION END ###
     arch_group.add_argument("--ltm_topk", type=int, default=4, help="Number of LTM slots to retrieve per token.")
     arch_group.add_argument("--max_length", type=int, default=1024)
     arch_group.add_argument("--auto-max-length", action="store_true", help="Automatically scan the dataset to find the longest sequence and set it as max_length.")
@@ -1157,8 +1381,10 @@ def main():
     train_group.add_argument("--lora_alpha", type=int, default=16, help="[Finetune] LoRA alpha.")
     train_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="[Finetune] Target percentage of params to train (e.g., 1.5 for 1.5%%). Overrides --lora_r.")
     train_group.add_argument("--quantize-on-complete", action="store_true", help="[Train] Automatically quantize after training.")
-    # <<< NEW: GRADIENT CLIPPING ARGUMENT >>>
     train_group.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value. Set to 0 to disable.")
+    ### MODIFICATION START ###
+    train_group.add_argument("--ponder-loss-weight", type=float, default=0.01, help="[HRM] Weight for the ponder cost auxiliary loss.")
+    ### MODIFICATION END ###
 
 
     # --- Inference Arguments ---
@@ -1168,10 +1394,11 @@ def main():
     infer_group.add_argument("--ltm-lora-path", type=str, default=None, help="[Chat] Optional: Path to save/load LTM updates as a separate delta file.")
     infer_group.add_argument("--device", type=str, default="cpu", choices=["cpu", "vulkan"], help="[Chat] Device for quantized inference.")
     ### MODIFICATION START ###
+    infer_group.add_argument("--h-halt-thresh", type=float, default=0.9, help="[HRM] Probability threshold for early exiting the H-module loop during inference.")
+    ### MODIFICATION END ###
     infer_group.add_argument("--static-ltm-lr", action="store_true", help="[Chat] Disable the cosine annealing schedule for LTM updates and use a fixed LR instead.")
     infer_group.add_argument("--ltm-schedule-steps", type=int, default=100, help="[Chat] The number of updates in one cosine annealing cycle for LTM learning.")
     infer_group.add_argument("--ltm-schedule-min-lr", type=float, default=1e-5, help="[Chat] The minimum learning rate for the LTM cosine annealing schedule.")
-    ### MODIFICATION END ###
 
     # --- Other Arguments ---
     other_group = parser.add_argument_group('Other Settings')
@@ -1184,7 +1411,6 @@ def main():
     pt_device = pick_device()
     print(f"Using PyTorch device: {pt_device}")
 
-    # <<< CHANGED: Tokenizer loading is now context-dependent based on mode
     tokenizer = None
     if args.mode == "train":
         print(f"Loading tokenizer '{args.tokenizer_path}' for new model training...")
@@ -1196,7 +1422,6 @@ def main():
         except Exception as e:
             print(f"Error loading tokenizer from '{args.model_path}': {e}")
             sys.exit(1)
-    # The 'quantize' mode can also load from model_path, so it's covered above.
     elif args.mode not in ['train', 'quantize']:
         parser.error(f"--model-path is required for mode '{args.mode}'.")
 
@@ -1256,7 +1481,6 @@ def main():
         else:
             print("⚠️ WARNING: Auto-scan did not find any valid entries. Using default max_length.")
 
-    # <<< CHANGED: Simplified mode dispatching with clear argument validation
     if args.mode == "train":
         if not args.train: parser.error("`--train` is required for train mode.")
         train(args, pt_device, tokenizer)
