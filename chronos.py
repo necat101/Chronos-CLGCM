@@ -41,7 +41,7 @@ try:
     import chronos_matmul
     _HAS_KERNEL = True
     print("Successfully imported C++ quantization kernel.")
-    if hasattr(chronos_matmul, "Vulkan_SUPPORT") and chronos_matmul.VULKAN_SUPPORT:
+    if hasattr(chronos_matmul, "VULKAN_SUPPORT") and chronos_matmul.VULKAN_SUPPORT:
         print("INFO: Vulkan support is enabled in the compiled kernel.")
         _HAS_VULKAN = True
     else:
@@ -51,13 +51,13 @@ except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.           !!!")
     print("!!!                                                                         !!!")
-    print("!!! To fix this, please run the appropriate setup script:                   !!!")
+    print("!!! To fix this, please run the appropriate setup script:                     !!!")
     print("!!!  - On Windows:   Run setup.bat                                          !!!")
     print("!!!  - On Linux/macOS: Run bash setup.sh                                    !!!")
     print("!!!                                                                         !!!")
     print("!!! If you have already run the setup, you may need to activate the         !!!")
     print("!!! virtual environment first:                                              !!!")
-    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                              !!!")
+    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                                  !!!")
     print("!!!  - On Linux/macOS: source .venv/bin/activate                            !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1) # Exit the program because the kernel is essential
@@ -501,7 +501,7 @@ class ChronosCore(nn.Module):
 
             p_read = self.persistent.unsqueeze(0).expand(B, -1)
             query = self.qproj(token_emb)
-            
+
             ### MODIFICATION START: Pass filters to retrieve_topk ###
             topk_vals, topk_idx = self.ltm.retrieve_topk(
                 query,
@@ -528,10 +528,10 @@ class ChronosCore(nn.Module):
             ### MODIFICATION START: Adaptive HRM Loop ###
             step_outputs = []
             halt_probs = []
-            
+
             # The initial 'enc' is passed to the first H-step
-            current_enc = enc 
-            
+            current_enc = enc
+
             for h_step in range(self.config.max_h_steps):
                 h_state = self.h_rnn(current_enc, h_state)
                 context = self.h_to_context(h_state)
@@ -545,7 +545,7 @@ class ChronosCore(nn.Module):
                     # Check for convergence
                     if torch.allclose(l_state, l_state_prev, atol=self.config.l_conv_atol):
                         break
-                
+
                 # The output for this H-step is the converged L-state applied as a residual
                 step_update = self.l_to_out(l_state)
                 current_enc = current_enc + step_update
@@ -553,14 +553,14 @@ class ChronosCore(nn.Module):
                 # Calculate halt probability for this step
                 halt_logit = self.h_halt_proj(h_state).squeeze(-1) # Shape: (B,)
                 halt_prob = torch.sigmoid(halt_logit)
-                
+
                 step_outputs.append(current_enc)
                 halt_probs.append(halt_prob)
 
                 # For inference, we can exit early for efficiency
                 if not self.training and (halt_prob.mean() > self.config.h_halt_thresh):
                     break
-            
+
             # After the loop, calculate the final output and ponder cost using ACT logic
             step_outputs_t = torch.stack(step_outputs, dim=0) # Shape: (H, B, D)
             halt_probs_t = torch.stack(halt_probs, dim=0)     # Shape: (H, B)
@@ -574,7 +574,7 @@ class ChronosCore(nn.Module):
 
             # Weight for each step is p_h * product_{i<h}(1-p_i)
             weights = halt_probs_t * cum_unhalt_probs
-            
+
             # Remainder is the probability of not having halted after all steps
             remainder = cum_unhalt_probs[-1] * (1.0 - halt_probs_t[-1])
 
@@ -584,7 +584,7 @@ class ChronosCore(nn.Module):
 
             # Weighted average of step outputs
             final_enc = (weights.unsqueeze(-1) * step_outputs_t).sum(dim=0)
-            
+
             # Ponder cost: number of steps executed + probability of not halting
             ponder_cost = num_steps_taken + remainder
             all_ponder_costs.append(ponder_cost)
@@ -603,7 +603,7 @@ class ChronosCore(nn.Module):
             shift_labels = labels[..., 1:].contiguous()
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
-            
+
             ### MODIFICATION START ###
             # Average the ponder cost across the sequence length and batch
             ponder_cost_out = torch.stack(all_ponder_costs, dim=1).mean()
@@ -647,12 +647,12 @@ class QuantizedChronos:
         self.l_rnn = QuantizedGRUCell(self.config.context_dim * 2, self.config.l_hidden, 'l_rnn', q_data)
         self.l_to_out = QuantizedLinear('l_to_out', q_data)
         self.lm_head = QuantizedLinear('lm_head', q_data)
-        
+
         ### MODIFICATION START ###
         # Add the quantized halting projection layer
         self.h_halt_proj = QuantizedLinear('h_halt_proj', q_data)
         ### MODIFICATION END ###
-        
+
         print("Initialized QuantizedChronos model from config.")
 
     ### MODIFICATION START: Add filtering args to call method ###
@@ -669,7 +669,7 @@ class QuantizedChronos:
 
             p_read = self.persistent.unsqueeze(0).expand(B, -1)
             query = self.qproj(token_emb, device=device)
-            
+
             ### MODIFICATION START: Pass filters to retrieve_topk ###
             topk_vals, _ = self.ltm.retrieve_topk(
                 query,
@@ -687,7 +687,7 @@ class QuantizedChronos:
             ### MODIFICATION START: Adaptive HRM Loop for Inference ###
             for _ in range(self.config.max_h_steps):
                 h_state = self.h_rnn(enc, h_state, device=device)
-                
+
                 # Check for halt condition
                 halt_logit = self.h_halt_proj(h_state, device=device)
                 halt_prob = torch.sigmoid(halt_logit)
@@ -697,7 +697,7 @@ class QuantizedChronos:
                 for _ in range(self.config.max_l_steps):
                     l_input = torch.cat([enc, context], dim=-1)
                     l_state = self.l_rnn(l_input, l_state, device=device)
-                
+
                 enc = enc + self.l_to_out(l_state, device=device)
 
                 # Early exit based on halt probability
@@ -776,7 +776,7 @@ def train(args, device, tokenizer):
             raise FileNotFoundError(f"Checkpoint to resume from not found at {args.resume_from_ckpt}")
 
         print(f"Resuming training from checkpoint: {args.resume_from_ckpt}")
-        
+
         # <<< FIX APPLIED HERE: Using weights_only=False as requested >>>
         checkpoint = torch.load(args.resume_from_ckpt, map_location=device, weights_only=False)
 
@@ -790,14 +790,63 @@ def train(args, device, tokenizer):
             model = ChronosCore(model_config).to(device)
         else:
             print("Warning: Config not found in checkpoint. Using current CLI args for model architecture.")
+            model_config = AttrDict(config) # Fallback
 
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint.get('completed_epoch', 0)
 
-        if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
-            print("Resuming learning rate scheduler state.")
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        ### --- MODIFICATION START: New Scheduler Resuming Logic --- ###
+        if scheduler:
+            checkpoint_has_scheduler = 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None
+
+            if checkpoint_has_scheduler and not args.override_scheduling:
+                # DEFAULT: Resume from checkpoint, warn if user tried to change LR.
+
+                loaded_config = checkpoint.get('config', {})
+                old_lr = loaded_config.get('starting_lr')
+                old_min_lr = loaded_config.get('min_lr')
+
+                # Use a small tolerance for float comparison
+                lr_mismatch = (old_lr is not None and not np.isclose(old_lr, args.starting_lr))
+                min_lr_mismatch = (old_min_lr is not None and not np.isclose(old_min_lr, args.min_lr))
+
+                if lr_mismatch or min_lr_mismatch:
+                    print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                    print("!!! WARNING: New LR flags detected but --override-scheduling was not set.             !!!")
+                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.      !!!")
+                    print(f"!!!   Loading old schedule (LR: {old_lr}, Min LR: {old_min_lr}).                      !!!")
+                    print("!!!   To use your new LR flags, add --override-scheduling to your command.            !!!")
+                    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+
+                print("Resuming learning rate scheduler state.")
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+            elif checkpoint_has_scheduler and args.override_scheduling:
+                # OVERRIDE: User wants to use the new LR flags.
+                print("INFO: --override-scheduling detected. Ignoring checkpoint's scheduler state.")
+                print(f"INFO: Initializing new schedule with Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
+                
+                # --- START: THE FIX ---
+                # Manually update the optimizer's LR and the scheduler's base_lrs
+                print(f"INFO: Forcing new starting_lr ({args.starting_lr:.2e}) into optimizer and scheduler.")
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = args.starting_lr
+                
+                scheduler.base_lrs = [args.starting_lr] * len(scheduler.base_lrs)
+                # --- END: THE FIX ---
+
+                ### --- ADDED FIX HERE: Reset scheduler step --- ###
+                # Set the step count to where it should be for the resumed epoch
+                # We subtract 1 because last_epoch is incremented *before* the first calculation
+                steps_per_epoch = len(dataloader) // args.accumulation_steps
+                scheduler.last_epoch = start_epoch * steps_per_epoch - 1
+                ### --- END FIX --- ###
+
+            elif not checkpoint_has_scheduler:
+                # NO SCHEDULER IN CKPT: Nothing to load, just use the new one.
+                print("Warning: No scheduler state found in checkpoint. Initializing new schedule.")
+        ### --- MODIFICATION END --- ###
 
         print(f"Successfully loaded model and optimizer. Resuming from epoch {start_epoch + 1}.")
 
@@ -817,16 +866,25 @@ def train(args, device, tokenizer):
 
             # Run the forward pass to get outputs and loss
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            
+
             ### MODIFICATION START ###
             # Calculate combined loss with ponder cost
             cross_entropy_loss = outputs["loss"]
             ponder_cost = outputs["ponder_cost"]
-            
+
             combined_loss = None
-            if cross_entropy_loss is not None and ponder_cost is not None:
+            # Check if loss or ponder_cost is NaN before combining
+            if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+               ponder_cost is not None and not torch.isnan(ponder_cost):
                 combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
+            elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                    print(f"\nWarning: Ponder cost is NaN at step {i}. Using only CrossEntropy loss for this step.")
+                    combined_loss = cross_entropy_loss # Fallback to CE loss if ponder is NaN
+            else:
+                    print(f"\nWarning: CrossEntropy loss is NaN at step {i}. Skipping backward pass for this step.")
+                    # combined_loss remains None
             ### MODIFICATION END ###
+
 
             if combined_loss is not None:
                 # Scale loss for gradient accumulation
@@ -835,8 +893,11 @@ def train(args, device, tokenizer):
                 # Calculate gradients for all parameters, including the non-leaf "topk_vals"
                 loss_to_backward.backward()
 
-                total_loss += cross_entropy_loss.item() * args.accumulation_steps
-                total_ponder_cost += ponder_cost.item() * args.accumulation_steps
+                # Accumulate only if losses were valid
+                if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                    total_loss += cross_entropy_loss.item() # No need to scale here, just for display average
+                if ponder_cost is not None and not torch.isnan(ponder_cost):
+                    total_ponder_cost += ponder_cost.item() # No need to scale here
 
                 # Perform weight update step after accumulating gradients
                 if (i + 1) % args.accumulation_steps == 0:
@@ -863,30 +924,45 @@ def train(args, device, tokenizer):
                     # Reset gradients for the next accumulation cycle
                     optimizer.zero_grad()
 
+            # Display averages based on the number of steps where loss was calculated
+            display_steps = i + 1
+            avg_loss = total_loss / display_steps if display_steps > 0 else 0.0
+            avg_ponder = total_ponder_cost / display_steps if display_steps > 0 else 0.0
             current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
             pbar.set_postfix({
-                "loss": f"{total_loss / (i + 1):.4f}", 
-                "ponder": f"{total_ponder_cost / (i + 1):.2f}",
+                "loss": f"{avg_loss:.4f}",
+                "ponder": f"{avg_ponder:.2f}",
                 "lr": f"{current_lr:.2e}"
             })
 
         # <<< FIX: Indented this block to save after each epoch >>>
         ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
         print(f"Epoch {epoch + 1} complete. Saving training checkpoint to {ckpt_path}")
+        # Make sure config saved in checkpoint reflects current args if scheduling was overridden
+        config_to_save = dict(model.config)
+        config_to_save['starting_lr'] = args.starting_lr
+        config_to_save['min_lr'] = args.min_lr
+        config_to_save['disable_lr_schedule'] = args.disable_lr_schedule
+
         torch.save({
             'completed_epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'config': dict(model.config),
+            'config': config_to_save, # Save potentially updated config
         }, ckpt_path)
 
     # Final save after all epochs are completed
     final_save_path = os.path.join(args.out_dir, MODEL_WEIGHTS_NAME)
     print(f"\nTraining finished. Saving final inference model to {final_save_path}")
+     # Make sure final config reflects current args if scheduling was overridden
+    final_config_to_save = dict(model.config)
+    final_config_to_save['starting_lr'] = args.starting_lr
+    final_config_to_save['min_lr'] = args.min_lr
+    final_config_to_save['disable_lr_schedule'] = args.disable_lr_schedule
     torch.save({
         'model_state_dict': model.state_dict(),
-        'config': dict(model.config)
+        'config': final_config_to_save
     }, final_save_path)
 
     tokenizer.save_pretrained(args.out_dir)
@@ -963,20 +1039,29 @@ def finetune(args, device, tokenizer):
         for i, batch in enumerate(pbar):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            
+
             ### MODIFICATION START ###
             cross_entropy_loss = outputs["loss"]
             ponder_cost = outputs["ponder_cost"]
             combined_loss = None
-            if cross_entropy_loss is not None and ponder_cost is not None:
+            if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+               ponder_cost is not None and not torch.isnan(ponder_cost):
                 combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
+            elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                # Ponder cost is NaN, use CE only
+                combined_loss = cross_entropy_loss
+            # If CE is NaN, combined_loss remains None
             ### MODIFICATION END ###
-            
+
+
             if combined_loss is not None:
                 loss_to_backward = combined_loss / args.accumulation_steps
                 loss_to_backward.backward()
-                total_loss += cross_entropy_loss.item() * args.accumulation_steps
-                total_ponder_cost += ponder_cost.item() * args.accumulation_steps
+
+                if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                    total_loss += cross_entropy_loss.item()
+                if ponder_cost is not None and not torch.isnan(ponder_cost):
+                    total_ponder_cost += ponder_cost.item()
 
                 if (i + 1) % args.accumulation_steps == 0:
                     # --- START: LTM UPDATE ---
@@ -997,10 +1082,13 @@ def finetune(args, device, tokenizer):
                         scheduler.step()
                     optimizer.zero_grad()
 
+            display_steps = i + 1
+            avg_loss = total_loss / display_steps if display_steps > 0 else 0.0
+            avg_ponder = total_ponder_cost / display_steps if display_steps > 0 else 0.0
             current_lr = scheduler.get_last_lr()[0] if scheduler else args.starting_lr
             pbar.set_postfix({
-                "loss": f"{total_loss / (i+1):.4f}", 
-                "ponder": f"{total_ponder_cost / (i + 1):.2f}",
+                "loss": f"{avg_loss:.4f}",
+                "ponder": f"{avg_ponder:.2f}",
                 "lr": f"{current_lr:.2e}"
             })
 
@@ -1127,7 +1215,7 @@ def chat(args, device, tokenizer):
     # Setup LTM scheduler if not in static mode and learning is enabled
     if not args.static_ltm_lr and (not is_quantized or args.enable_quantized_learning):
         print("INFO: Using Cosine Annealing schedule for LTM updates.")
-        print(f"             - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
+        print(f"               - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
         # Schedulers need an optimizer, so we create a dummy one for the LTM LR.
         # We will call scheduler.step() manually, but never optimizer.step().
         dummy_param = nn.Parameter(torch.tensor(0.0))
@@ -1250,10 +1338,17 @@ def chat(args, device, tokenizer):
                     ponder_loss_weight = update_model.config.get('ponder_loss_weight', 0.01) # Safe default
 
                     combined_loss = None
-                    if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and ponder_cost is not None:
+                    if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+                       ponder_cost is not None and not torch.isnan(ponder_cost):
                         print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: {ponder_cost.item():.2f}]", end="", flush=True)
                         combined_loss = cross_entropy_loss + ponder_loss_weight * ponder_cost
+                    elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                        # Ponder cost NaN, use CE only
+                        print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: NaN]", end="", flush=True)
+                        combined_loss = cross_entropy_loss
+                    # If CE is NaN, combined_loss remains None and backward pass is skipped
                     # --- MODIFICATION END ---
+
 
                     # Use the combined_loss for backpropagation
                     if combined_loss is not None:
@@ -1384,6 +1479,7 @@ def main():
     train_group.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value. Set to 0 to disable.")
     ### MODIFICATION START ###
     train_group.add_argument("--ponder-loss-weight", type=float, default=0.01, help="[HRM] Weight for the ponder cost auxiliary loss.")
+    train_group.add_argument("--override-scheduling", action="store_true", help="[Train] If resuming, ignore the scheduler state in the checkpoint and use the new LR args.")
     ### MODIFICATION END ###
 
 
