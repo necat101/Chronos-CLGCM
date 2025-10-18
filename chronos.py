@@ -6,6 +6,12 @@ import time
 import numpy as np
 from typing import Optional, Tuple
 
+# <<< MODIFIED: Set Tokenizers Parallelism Environment Variable >>>
+# Set this early, before tokenizers might be implicitly loaded by other imports
+# Setting to "true" forces parallelism despite potential fork issues (use with caution)
+# Setting to "false" explicitly disables parallelism in worker processes (safer, suppresses warning)
+os.environ["TOKENIZERS_PARALLELISM"] = "true" # Or "false" to be safer
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,10 +37,34 @@ except ImportError:
     _HAS_KEYBOARD = False
 
 # --- MODIFIED FOR CPU TRAINING ---
-print("Warning: bitsandbytes is disabled for CPU training. Falling back to standard AdamW optimizer.")
-ADAM_OPTIMIZER = torch.optim.AdamW
-_HAS_BNB = False
+# Check if CUDA is available, otherwise assume CPU training and disable bitsandbytes
+if torch.cuda.is_available():
+    try:
+        import bitsandbytes as bnb
+        ADAM_OPTIMIZER = bnb.optim.AdamW8bit
+        _HAS_BNB = True
+        print("INFO: CUDA detected. Using bitsandbytes 8-bit AdamW optimizer.")
+    except ImportError:
+        print("Warning: bitsandbytes not found, falling back to standard AdamW optimizer even though CUDA is available.")
+        ADAM_OPTIMIZER = torch.optim.AdamW
+        _HAS_BNB = False
+    
+    # --- MODIFICATION START: Import AMP components ---
+    try:
+        from torch.cuda.amp import GradScaler, autocast
+        _HAS_AMP = True
+        print("INFO: torch.cuda.amp available. AMP support is enabled.")
+    except ImportError:
+        _HAS_AMP = False
+        print("Warning: torch.cuda.amp not found. AMP support will be disabled.")
+    # --- MODIFICATION END ---
+else:
+    print("Warning: CUDA not detected. bitsandbytes disabled for CPU training. Falling back to standard AdamW optimizer.")
+    ADAM_OPTIMIZER = torch.optim.AdamW
+    _HAS_BNB = False
+    _HAS_AMP = False # MODIFICATION: AMP is not available without CUDA
 # --- END MODIFICATION ---
+
 
 # --- C++ Kernel Import ---
 try:
@@ -57,7 +87,7 @@ except ImportError:
     print("!!!                                                                         !!!")
     print("!!! If you have already run the setup, you may need to activate the         !!!")
     print("!!! virtual environment first:                                              !!!")
-    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                                  !!!")
+    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                                 !!!")
     print("!!!  - On Linux/macOS: source .venv/bin/activate                            !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1) # Exit the program because the kernel is essential
@@ -187,7 +217,8 @@ class JSONLDataset(Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
-def create_dataloader(path, tokenizer, max_length, batch_size, pad_token_id, kayla_mode=False):
+# <<< MODIFIED: Added num_workers parameter >>>
+def create_dataloader(path, tokenizer, max_length, batch_size, pad_token_id, kayla_mode=False, num_workers=0):
     """Creates a DataLoader for training or fine-tuning."""
     dataset = JSONLDataset(path, tokenizer, max_length, kayla_mode=kayla_mode)
 
@@ -210,7 +241,10 @@ def create_dataloader(path, tokenizer, max_length, batch_size, pad_token_id, kay
             "attention_mask": attention_mask_batch
         }
 
-    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True)
+    # <<< MODIFIED: Pass num_workers to DataLoader >>>
+    # pin_memory is often beneficial when using GPUs and workers
+    pin_memory = torch.cuda.is_available() and num_workers > 0
+    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn, shuffle=True, num_workers=num_workers, pin_memory=pin_memory)
 
 
 # --- Quantization & Model Serialization ---
@@ -558,7 +592,7 @@ class ChronosCore(nn.Module):
                 halt_probs.append(halt_prob)
 
                 # For inference, we can exit early for efficiency
-                if not self.training and (halt_prob.mean() > self.config.h_halt_thresh):
+                if not self.training and hasattr(self.config, 'h_halt_thresh') and (halt_prob.mean() > self.config.h_halt_thresh):
                     break
 
             # After the loop, calculate the final output and ponder cost using ACT logic
@@ -761,7 +795,19 @@ def train(args, device, tokenizer):
 
     model = ChronosCore(config).to(device)
     optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
-    dataloader = create_dataloader(args.train, tokenizer, args.max_length, args.batch_size, tokenizer.pad_token_id, kayla_mode=args.kayla)
+    # <<< MODIFIED: Pass num_workers >>>
+    dataloader = create_dataloader(
+        args.train, tokenizer, args.max_length, args.batch_size,
+        tokenizer.pad_token_id, kayla_mode=args.kayla, num_workers=args.num_workers
+    )
+    
+    # --- MODIFICATION START: Initialize AMP GradScaler ---
+    scaler = None
+    use_amp = args.amp and _HAS_AMP
+    if use_amp:
+        scaler = GradScaler()
+        print("INFO: Automatic Mixed Precision (AMP) ENABLED for training.")
+    # --- MODIFICATION END ---
 
     scheduler = None
     if not args.disable_lr_schedule:
@@ -777,7 +823,6 @@ def train(args, device, tokenizer):
 
         print(f"Resuming training from checkpoint: {args.resume_from_ckpt}")
 
-        # <<< FIX APPLIED HERE: Using weights_only=False as requested >>>
         checkpoint = torch.load(args.resume_from_ckpt, map_location=device, weights_only=False)
 
         if 'optimizer_state_dict' not in checkpoint:
@@ -796,6 +841,12 @@ def train(args, device, tokenizer):
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint.get('completed_epoch', 0)
 
+        # --- MODIFICATION START: Resume GradScaler state ---
+        if use_amp and 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+             print("Resuming GradScaler state.")
+             scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        # --- MODIFICATION END ---
+
         ### --- MODIFICATION START: New Scheduler Resuming Logic --- ###
         if scheduler:
             checkpoint_has_scheduler = 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None
@@ -813,10 +864,10 @@ def train(args, device, tokenizer):
 
                 if lr_mismatch or min_lr_mismatch:
                     print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                    print("!!! WARNING: New LR flags detected but --override-scheduling was not set.             !!!")
-                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.      !!!")
-                    print(f"!!!   Loading old schedule (LR: {old_lr}, Min LR: {old_min_lr}).                      !!!")
-                    print("!!!   To use your new LR flags, add --override-scheduling to your command.            !!!")
+                    print("!!! WARNING: New LR flags detected but --override-scheduling was not set.           !!!")
+                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.     !!!")
+                    print(f"!!!   Loading old schedule (LR: {old_lr}, Min LR: {old_min_lr}).              !!!")
+                    print("!!!   To use your new LR flags, add --override-scheduling to your command.          !!!")
                     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 
                 print("Resuming learning rate scheduler state.")
@@ -826,22 +877,21 @@ def train(args, device, tokenizer):
                 # OVERRIDE: User wants to use the new LR flags.
                 print("INFO: --override-scheduling detected. Ignoring checkpoint's scheduler state.")
                 print(f"INFO: Initializing new schedule with Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
-                
+
                 # --- START: THE FIX ---
                 # Manually update the optimizer's LR and the scheduler's base_lrs
                 print(f"INFO: Forcing new starting_lr ({args.starting_lr:.2e}) into optimizer and scheduler.")
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = args.starting_lr
-                
+
                 scheduler.base_lrs = [args.starting_lr] * len(scheduler.base_lrs)
                 # --- END: THE FIX ---
 
-                ### --- ADDED FIX HERE: Reset scheduler step --- ###
                 # Set the step count to where it should be for the resumed epoch
                 # We subtract 1 because last_epoch is incremented *before* the first calculation
                 steps_per_epoch = len(dataloader) // args.accumulation_steps
                 scheduler.last_epoch = start_epoch * steps_per_epoch - 1
-                ### --- END FIX --- ###
+
 
             elif not checkpoint_has_scheduler:
                 # NO SCHEDULER IN CKPT: Nothing to load, just use the new one.
@@ -864,34 +914,46 @@ def train(args, device, tokenizer):
         for i, batch in enumerate(pbar):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
 
-            # Run the forward pass to get outputs and loss
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-
-            ### MODIFICATION START ###
-            # Calculate combined loss with ponder cost
-            cross_entropy_loss = outputs["loss"]
-            ponder_cost = outputs["ponder_cost"]
-
-            combined_loss = None
-            # Check if loss or ponder_cost is NaN before combining
-            if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
-               ponder_cost is not None and not torch.isnan(ponder_cost):
-                combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
-            elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
-                    print(f"\nWarning: Ponder cost is NaN at step {i}. Using only CrossEntropy loss for this step.")
-                    combined_loss = cross_entropy_loss # Fallback to CE loss if ponder is NaN
+            # --- MODIFICATION START: Use AMP autocast ---
+            if use_amp:
+                with autocast():
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    cross_entropy_loss = outputs["loss"]
+                    ponder_cost = outputs["ponder_cost"]
+                    
+                    combined_loss = None
+                    if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+                       ponder_cost is not None and not torch.isnan(ponder_cost):
+                        combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
+                    elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                        print(f"\nWarning: Ponder cost is NaN at step {i}. Using only CrossEntropy loss for this step.")
+                        combined_loss = cross_entropy_loss
             else:
-                    print(f"\nWarning: CrossEntropy loss is NaN at step {i}. Skipping backward pass for this step.")
-                    # combined_loss remains None
-            ### MODIFICATION END ###
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                cross_entropy_loss = outputs["loss"]
+                ponder_cost = outputs["ponder_cost"]
 
+                combined_loss = None
+                if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+                   ponder_cost is not None and not torch.isnan(ponder_cost):
+                    combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
+                elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                    print(f"\nWarning: Ponder cost is NaN at step {i}. Using only CrossEntropy loss for this step.")
+                    combined_loss = cross_entropy_loss
+                else:
+                    print(f"\nWarning: CrossEntropy loss is NaN at step {i}. Skipping backward pass for this step.")
+            # --- MODIFICATION END ---
 
             if combined_loss is not None:
                 # Scale loss for gradient accumulation
                 loss_to_backward = combined_loss / args.accumulation_steps
 
-                # Calculate gradients for all parameters, including the non-leaf "topk_vals"
-                loss_to_backward.backward()
+                # --- MODIFICATION START: Use AMP scaler for backward pass ---
+                if use_amp:
+                    scaler.scale(loss_to_backward).backward()
+                else:
+                    loss_to_backward.backward()
+                # --- MODIFICATION END ---
 
                 # Accumulate only if losses were valid
                 if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
@@ -902,20 +964,35 @@ def train(args, device, tokenizer):
                 # Perform weight update step after accumulating gradients
                 if (i + 1) % args.accumulation_steps == 0:
                     # --- START: LTM UPDATE ---
-                    # This is the "surprise" update for the Long-Term Memory (LTM).
                     ltm_grads = outputs["topk_vals"].grad
                     if ltm_grads is not None:
+                        # --- MODIFICATION START: Manually unscale LTM grads if using AMP ---
+                        if use_amp:
+                            current_scale = scaler.get_scale()
+                            if current_scale > 0:
+                                ltm_grads = ltm_grads / current_scale
+                        # --- MODIFICATION END ---
+                        
                         ### MODIFICATION START: Specify source as Training Data ###
                         model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=args.ltm_lr, source=LTMModule.SRC_TRAINING_DATA)
                         ### MODIFICATION END ###
                     # --- END: LTM UPDATE ---
 
-                    # <<< NEW: GRADIENT CLIPPING >>>
-                    if args.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-                    # Now, step the main optimizer for all other model parameters
-                    optimizer.step()
+                    # --- MODIFICATION START: Use AMP scaler for optimizer step ---
+                    if use_amp:
+                        scaler.unscale_(optimizer) # Unscale gradients before clipping
+                        
+                        if args.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        
+                        scaler.step(optimizer) # Step optimizer (checks for NaNs)
+                        scaler.update() # Update scale
+                    else:
+                        if args.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        
+                        optimizer.step() # Standard optimizer step
+                    # --- MODIFICATION END ---
 
                     # Step the learning rate scheduler
                     if scheduler:
@@ -949,6 +1026,7 @@ def train(args, device, tokenizer):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'scaler_state_dict': scaler.state_dict() if use_amp else None, # MODIFICATION: Save scaler state
             'config': config_to_save, # Save potentially updated config
         }, ckpt_path)
 
@@ -1020,9 +1098,21 @@ def finetune(args, device, tokenizer):
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    dataloader = create_dataloader(args.train, tokenizer, model_config.max_length, args.batch_size, tokenizer.pad_token_id, kayla_mode=args.kayla)
+    # <<< MODIFIED: Pass num_workers >>>
+    dataloader = create_dataloader(
+        args.train, tokenizer, model_config.max_length, args.batch_size,
+        tokenizer.pad_token_id, kayla_mode=args.kayla, num_workers=args.num_workers
+    )
     optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
     os.makedirs(args.out_dir, exist_ok=True)
+    
+    # --- MODIFICATION START: Initialize AMP GradScaler ---
+    scaler = None
+    use_amp = args.amp and _HAS_AMP
+    if use_amp:
+        scaler = GradScaler()
+        print("INFO: Automatic Mixed Precision (AMP) ENABLED for fine-tuning.")
+    # --- MODIFICATION END ---
 
     scheduler = None
     if not args.disable_lr_schedule:
@@ -1038,25 +1128,43 @@ def finetune(args, device, tokenizer):
         total_ponder_cost = 0.0
         for i, batch in enumerate(pbar):
             input_ids, attention_mask, labels = batch["input_ids"].to(device), batch["attention_mask"].to(device), batch["labels"].to(device)
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
 
-            ### MODIFICATION START ###
-            cross_entropy_loss = outputs["loss"]
-            ponder_cost = outputs["ponder_cost"]
-            combined_loss = None
-            if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
-               ponder_cost is not None and not torch.isnan(ponder_cost):
-                combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
-            elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
-                # Ponder cost is NaN, use CE only
-                combined_loss = cross_entropy_loss
-            # If CE is NaN, combined_loss remains None
-            ### MODIFICATION END ###
+            # --- MODIFICATION START: Use AMP autocast ---
+            if use_amp:
+                with autocast():
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                    cross_entropy_loss = outputs["loss"]
+                    ponder_cost = outputs["ponder_cost"]
+                    
+                    combined_loss = None
+                    if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+                       ponder_cost is not None and not torch.isnan(ponder_cost):
+                        combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
+                    elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                        combined_loss = cross_entropy_loss
+            else:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                cross_entropy_loss = outputs["loss"]
+                ponder_cost = outputs["ponder_cost"]
+                
+                combined_loss = None
+                if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+                   ponder_cost is not None and not torch.isnan(ponder_cost):
+                    combined_loss = cross_entropy_loss + args.ponder_loss_weight * ponder_cost
+                elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                    combined_loss = cross_entropy_loss
+            # --- MODIFICATION END ---
 
 
             if combined_loss is not None:
                 loss_to_backward = combined_loss / args.accumulation_steps
-                loss_to_backward.backward()
+                
+                # --- MODIFICATION START: Use AMP scaler for backward pass ---
+                if use_amp:
+                    scaler.scale(loss_to_backward).backward()
+                else:
+                    loss_to_backward.backward()
+                # --- MODIFICATION END ---
 
                 if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
                     total_loss += cross_entropy_loss.item()
@@ -1067,17 +1175,35 @@ def finetune(args, device, tokenizer):
                     # --- START: LTM UPDATE ---
                     ltm_grads = outputs["topk_vals"].grad
                     if ltm_grads is not None:
+                        # --- MODIFICATION START: Manually unscale LTM grads if using AMP ---
+                        if use_amp:
+                            current_scale = scaler.get_scale()
+                            if current_scale > 0:
+                                ltm_grads = ltm_grads / current_scale
+                        # --- MODIFICATION END ---
+                        
                         # When using PEFT, the original model is stored in .base_model
                         ### MODIFICATION START: Specify source as Training Data ###
                         model.base_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=args.ltm_lr, source=LTMModule.SRC_TRAINING_DATA)
                         ### MODIFICATION END ###
                     # --- END: LTM UPDATE ---
 
-                    # <<< NEW: GRADIENT CLIPPING >>>
-                    if args.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                    # --- MODIFICATION START: Use AMP scaler for optimizer step ---
+                    if use_amp:
+                        scaler.unscale_(optimizer) # Unscale gradients before clipping
+                        
+                        if args.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        
+                        scaler.step(optimizer) # Step optimizer (checks for NaNs)
+                        scaler.update() # Update scale
+                    else:
+                        if args.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        
+                        optimizer.step() # Standard optimizer step
+                    # --- MODIFICATION END ---
 
-                    optimizer.step()
                     if scheduler:
                         scheduler.step()
                     optimizer.zero_grad()
@@ -1215,7 +1341,7 @@ def chat(args, device, tokenizer):
     # Setup LTM scheduler if not in static mode and learning is enabled
     if not args.static_ltm_lr and (not is_quantized or args.enable_quantized_learning):
         print("INFO: Using Cosine Annealing schedule for LTM updates.")
-        print(f"               - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
+        print(f"             - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
         # Schedulers need an optimizer, so we create a dummy one for the LTM LR.
         # We will call scheduler.step() manually, but never optimizer.step().
         dummy_param = nn.Parameter(torch.tensor(0.0))
@@ -1225,6 +1351,20 @@ def chat(args, device, tokenizer):
             T_max=args.ltm_schedule_steps,
             eta_min=args.ltm_schedule_min_lr
         )
+        
+    # --- MODIFICATION START: Initialize AMP scaler and dummy optimizer for chat learning ---
+    scaler = None
+    dummy_optimizer = None
+    use_amp = args.amp and _HAS_AMP and (not is_quantized or args.enable_quantized_learning)
+    
+    if use_amp:
+        scaler = GradScaler()
+        # Create a dummy optimizer for the scaler to track state (NaNs/Infs)
+        # This is necessary because chat learning doesn't have a persistent optimizer
+        dummy_param = nn.Parameter(torch.tensor(0.0)).to(device)
+        dummy_optimizer = torch.optim.SGD([dummy_param], lr=1.0)
+        print("INFO: Automatic Mixed Precision (AMP) ENABLED for online learning.")
+    # --- MODIFICATION END ---
 
     print("\nWelcome to Chronos Chat. Type 'exit' or 'quit' to end.")
     ### MODIFICATION START: Add help text for new filter command ###
@@ -1325,50 +1465,83 @@ def chat(args, device, tokenizer):
                     full_sequence = torch.cat([prompt_ids[0], torch.tensor(response_ids, device=target_device)], dim=0).unsqueeze(0)
                     labels = torch.cat([torch.full_like(prompt_ids[0], -100), torch.tensor(response_ids, device=target_device)], dim=0).unsqueeze(0)
 
+                    if dummy_optimizer: dummy_optimizer.zero_grad() # MODIFICATION: Zero dummy optimizer
                     update_model.zero_grad()
-                    outputs = update_model(input_ids=full_sequence, labels=labels)
+                    
+                    # --- MODIFICATION START: Use AMP for online learning forward pass ---
+                    if use_amp:
+                        with autocast():
+                            outputs = update_model(input_ids=full_sequence, labels=labels)
+                            cross_entropy_loss = outputs["loss"]
+                            ponder_cost = outputs["ponder_cost"]
+                            ponder_loss_weight = update_model.config.get('ponder_loss_weight', 0.01)
+                            
+                            combined_loss = None
+                            if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+                               ponder_cost is not None and not torch.isnan(ponder_cost):
+                                print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: {ponder_cost.item():.2f}]", end="", flush=True)
+                                combined_loss = cross_entropy_loss + ponder_loss_weight * ponder_cost
+                            elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                                print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: NaN]", end="", flush=True)
+                                combined_loss = cross_entropy_loss
+                    else:
+                        outputs = update_model(input_ids=full_sequence, labels=labels)
+                        cross_entropy_loss = outputs["loss"]
+                        ponder_cost = outputs["ponder_cost"]
+                        ponder_loss_weight = update_model.config.get('ponder_loss_weight', 0.01)
 
-                    # --- MODIFICATION START ---
-                    # The "surprise" metric should be based on the total training objective,
-                    # which now includes the ponder cost.
-                    cross_entropy_loss = outputs["loss"]
-                    ponder_cost = outputs["ponder_cost"]
-
-                    # Retrieve the ponder weight from the model's config to ensure consistency
-                    ponder_loss_weight = update_model.config.get('ponder_loss_weight', 0.01) # Safe default
-
-                    combined_loss = None
-                    if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
-                       ponder_cost is not None and not torch.isnan(ponder_cost):
-                        print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: {ponder_cost.item():.2f}]", end="", flush=True)
-                        combined_loss = cross_entropy_loss + ponder_loss_weight * ponder_cost
-                    elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
-                        # Ponder cost NaN, use CE only
-                        print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: NaN]", end="", flush=True)
-                        combined_loss = cross_entropy_loss
-                    # If CE is NaN, combined_loss remains None and backward pass is skipped
+                        combined_loss = None
+                        if cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss) and \
+                           ponder_cost is not None and not torch.isnan(ponder_cost):
+                            print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: {ponder_cost.item():.2f}]", end="", flush=True)
+                            combined_loss = cross_entropy_loss + ponder_loss_weight * ponder_cost
+                        elif cross_entropy_loss is not None and not torch.isnan(cross_entropy_loss):
+                            print(f"[CE Loss: {cross_entropy_loss.item():.3f}, Ponder Cost: NaN]", end="", flush=True)
+                            combined_loss = cross_entropy_loss
                     # --- MODIFICATION END ---
-
+                    
 
                     # Use the combined_loss for backpropagation
                     if combined_loss is not None:
-                        combined_loss.backward()
+                        # --- MODIFICATION START: Use AMP scaler for backward pass ---
+                        if use_amp:
+                            scaler.scale(combined_loss).backward()
+                        else:
+                            combined_loss.backward()
+                        # --- MODIFICATION END ---
+                        
                         ltm_grads = outputs["topk_vals"].grad
+                        
+                        # --- MODIFICATION START: Manually unscale LTM grads if using AMP ---
+                        if use_amp:
+                            current_scale = scaler.get_scale()
+                            if ltm_grads is not None and current_scale > 0:
+                                ltm_grads = ltm_grads / current_scale
+                            
+                            # Unscale the dummy optimizer (no-op, but necessary for state)
+                            scaler.unscale_(dummy_optimizer)
+                        # --- MODIFICATION END ---
+                        
+                        if ltm_grads is not None:
+                            # Determine the current LTM learning rate based on mode
+                            if ltm_scheduler:
+                                current_ltm_lr = ltm_scheduler.get_last_lr()[0]
+                                print(f"[LTM LR: {current_ltm_lr:.2e}]", end="", flush=True)
+                                # Step the scheduler for the next update
+                                ltm_scheduler.step()
+                            else: # Static mode
+                                current_ltm_lr = update_model.config.get('ltm_lr', 1e-2)
 
-                        # Determine the current LTM learning rate based on mode
-                        if ltm_scheduler:
-                            current_ltm_lr = ltm_scheduler.get_last_lr()[0]
-                            print(f"[LTM LR: {current_ltm_lr:.2e}]", end="", flush=True)
-                            # Step the scheduler for the next update
-                            ltm_scheduler.step()
-                        else: # Static mode
-                            current_ltm_lr = update_model.config.get('ltm_lr', 1e-2)
-
-                        # Call the modified inner_update function with the calculated LR
-                        ### MODIFICATION START: Update source as User Interaction ###
-                        update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=current_ltm_lr, source=LTMModule.SRC_USER_INTERACTION)
-                        ### MODIFICATION END ###
-                        ltm_has_been_updated = True # Mark that a change has occurred
+                            ### MODIFICATION START: Update source as User Interaction ###
+                            update_model.ltm.inner_update(outputs["topk_idx"], ltm_grads, current_lr=current_ltm_lr, source=LTMModule.SRC_USER_INTERACTION)
+                            ### MODIFICATION END ###
+                            ltm_has_been_updated = True # Mark that a change has occurred
+                        
+                        # --- MODIFICATION START: Step scaler using dummy optimizer ---
+                        if use_amp:
+                            scaler.step(dummy_optimizer)
+                            scaler.update()
+                        # --- MODIFICATION END ---
 
                         # Copy the updated LTM weights back to the live quantized model for immediate use
                         if is_quantized:
@@ -1480,6 +1653,9 @@ def main():
     ### MODIFICATION START ###
     train_group.add_argument("--ponder-loss-weight", type=float, default=0.01, help="[HRM] Weight for the ponder cost auxiliary loss.")
     train_group.add_argument("--override-scheduling", action="store_true", help="[Train] If resuming, ignore the scheduler state in the checkpoint and use the new LR args.")
+    # <<< MODIFIED: Added num_workers argument >>>
+    train_group.add_argument("--num_workers", type=int, default=0, help="Number of worker processes for data loading. Recommended: 2 or 4 for GPU training.")
+    train_group.add_argument("--amp", action="store_true", help="[Train/Finetune/Chat] Enable Automatic Mixed Precision (AMP) for training/learning.") # MODIFICATION: Added AMP flag
     ### MODIFICATION END ###
 
 
@@ -1506,6 +1682,16 @@ def main():
     set_threads(args.threads)
     pt_device = pick_device()
     print(f"Using PyTorch device: {pt_device}")
+    
+    # --- MODIFICATION START: Add warning if AMP is requested but not available ---
+    if args.amp and not _HAS_AMP:
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("!!! WARNING: --amp was specified, but torch.cuda.amp is not available.      !!!")
+        print("!!!          AMP will be DISABLED. This may be because CUDA is not          !!!")
+        print("!!!          installed or your PyTorch build does not include it.           !!!")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        args.amp = False # Force disable
+    # --- MODIFICATION END ---
 
     tokenizer = None
     if args.mode == "train":
