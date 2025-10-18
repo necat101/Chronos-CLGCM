@@ -174,7 +174,7 @@ The `chronos.py` script is the main entry point for most operations. The `expand
         --model-path "./my_model_merged-INT4"
     ```
 
-### Resuming Training with Modified Learning Rate (`chronos.py`)
+### Resuming Training with Modified Learning Rate
 
 If you need to resume training from a checkpoint but want to **change the learning rate schedule** (e.g., start with a different maximum LR or use a different minimum LR), use the `--override-scheduling` flag along with your new `--starting-lr` and `--min-lr` values.
 
