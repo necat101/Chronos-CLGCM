@@ -1,5 +1,4 @@
 -----
-
 # Chronos v0.5.2 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
@@ -40,6 +39,7 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   - 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config for easy sharing and use.
   - 💾 **Automatic Re-quantization**: After a learning session, Chronos can automatically re-quantize a model to persist the new knowledge.
   - 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones, now supporting changes in `max_length` and automatic length detection from datasets.
+  - ✨ **Flexible Training Initiation**: Supports starting training runs using weights from existing model directories (inference or expanded models), not just resuming full training checkpoints.
   - ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`).
   - 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX) or on GPUs via Vulkan for broad hardware compatibility.
   - 🔧 **Comprehensive Tooling**: Includes a single script (`chronos.py`) for training, LoRA fine-tuning, merging, quantization, and interactive chat, plus the model expansion script.
@@ -64,7 +64,7 @@ Follow these steps to get a local copy up and running.
 1.  **Clone the repository:**
 
     ```bash
-    git clone https://github.com/your-username/Chronos.git
+    git clone [https://github.com/your-username/Chronos.git](https://github.com/your-username/Chronos.git)
     cd Chronos
     ```
 
@@ -97,7 +97,7 @@ The `chronos.py` script is the main entry point for most operations. The `expand
 
 ### Basic Workflow (`chronos.py`)
 
-1.  **Training:** Train a new model from scratch. This creates a new, self-contained model directory at `--out-dir`. The `--max_h_steps` defines the upper limit for the model's reasoning depth.
+1.  **Training (From Scratch):** Train a new model. This creates a new, self-contained model directory at `--out-dir`.
 
     ```bash
     python chronos.py train \
@@ -109,34 +109,18 @@ The `chronos.py` script is the main entry point for most operations. The `expand
         --context_dim 512 \
         --max_h_steps 10 \
         --ponder-loss-weight 0.01 \
-        --grad-clip 1.0
+        --grad-clip 1.0 \
+        --amp # <-- Optionally enable AMP
     ```
 
     -----
 
     💡 **Accelerating Training with AMP (NVIDIA GPUs):**
-    If you are training on an NVIDIA GPU with CUDA support (Tensor Cores recommended, e.g., Volta, Turing, Ampere architecture or newer), you can enable **Automatic Mixed Precision (AMP)** using the `--amp` flag. AMP uses faster, lower-precision `float16` for many computations while maintaining model accuracy, significantly speeding up training and reducing VRAM usage.
-
-    ```bash
-    # Example training command with AMP enabled:
-    python chronos.py train \
-        --train "path/to/your_data.jsonl" \
-        --tokenizer-path "microsoft/phi-2" \
-        --out-dir "./my_chronos_model_amp" \
-        --epochs 5 \
-        --batch_size 4 `# You can often increase batch size with AMP` \
-        --context_dim 512 \
-        --max_h_steps 10 \
-        --ponder-loss-weight 0.01 \
-        --grad-clip 1.0 \
-        --amp # <-- Enable Mixed Precision
-    ```
-
-    Make sure your PyTorch installation includes CUDA support. If AMP is requested but CUDA is unavailable, it will be automatically disabled with a warning.
+    If you are training on an NVIDIA GPU with CUDA support (Tensor Cores recommended, e.g., Volta, Turing, Ampere architecture or newer), you can enable **Automatic Mixed Precision (AMP)** using the `--amp` flag. AMP uses faster, lower-precision `float16` for many computations while maintaining model accuracy, significantly speeding up training and reducing VRAM usage. Make sure your PyTorch installation includes CUDA support.
 
     -----
 
-2.  **Fine-Tuning (LoRA):** Adapt a pre-trained model using LoRA. This loads a full model directory and saves the adapter to a separate output directory. You can also use `--amp` here for faster fine-tuning on GPUs.
+2.  **Fine-Tuning (LoRA):** Adapt a pre-trained model using LoRA. This loads a full model directory and saves the adapter to a separate output directory.
 
     ```bash
     python chronos.py finetune \
@@ -144,7 +128,7 @@ The `chronos.py` script is the main entry point for most operations. The `expand
         --train "path/to/new_data.jsonl" \
         --out-dir "./my_lora_adapter" \
         --epochs 3 \
-        --amp # <-- Optionally enable AMP for fine-tuning
+        --amp # <-- Optionally enable AMP
     ```
 
 3.  **Merging a LoRA Adapter:** Merge the adapter back into the base model to create a new, standalone model directory.
@@ -156,7 +140,7 @@ The `chronos.py` script is the main entry point for most operations. The `expand
         --out-dir "./my_model_merged"
     ```
 
-4.  **Quantization:** Convert a full-precision model directory into a quantized model directory. **No architecture flags are needed\!**
+4.  **Quantization:** Convert a full-precision model directory into a quantized model directory.
 
     ```bash
     python chronos.py quantize \
@@ -167,14 +151,27 @@ The `chronos.py` script is the main entry point for most operations. The `expand
 
     > **Available `qtype`:** `INT4`, `Q4_0`, `Q8_0`, `Q2_K`.
 
-5.  **Inference (Chat Mode):** Run an interactive chat session by pointing to any model directory.
+5.  **Inference (Chat Mode):** Run an interactive chat session.
 
     ```bash
     python chronos.py chat \
         --model-path "./my_model_merged-INT4"
     ```
 
-### Resuming Training with Modified Learning Rate
+### Resuming Incomplete Training (`chronos.py`)
+
+If a training run was interrupted, you can resume it **exactly where it left off** using a training checkpoint (`chronos_epoch_*.pt` file) which contains the model weights, optimizer state, scheduler state, and epoch number.
+
+```bash
+python chronos.py train \
+    --train "path/to/your_data.jsonl" `# Optional if path saved in ckpt` \
+    --out-dir "./my_chronos_model" \
+    --resume-from-ckpt "./my_chronos_model/chronos_epoch_3.pt" \
+    --epochs 10 `# Set total desired epochs` \
+    --amp # <-- Remember AMP if resuming an AMP session
+````
+
+#### Resuming Training with Modified Learning Rate
 
 If you need to resume training from a checkpoint but want to **change the learning rate schedule** (e.g., start with a different maximum LR or use a different minimum LR), use the `--override-scheduling` flag along with your new `--starting-lr` and `--min-lr` values.
 
@@ -187,23 +184,18 @@ python chronos.py train \
     --starting-lr 1e-5 \
     --min-lr 1e-7 \
     --override-scheduling \
-    --amp # <-- Remember AMP if resuming an AMP session
+    --amp
 ```
 
 > **Warning:** Without `--override-scheduling`, any new LR flags will be **ignored** when resuming, and the schedule from the checkpoint will be used.
 
 ### Expanding a Trained Model (`expand_model.py`) 🌱
 
-You can efficiently create a larger model by **transplanting the weights** from a smaller, already-trained Chronos model directory. This initializes the larger model with the learned knowledge, potentially leading to faster convergence during subsequent training or fine-tuning. This script can now also expand the model's maximum sequence length (`max_length`).
+Create a larger model by **transplanting the weights** from a smaller, trained Chronos model directory. This initializes the larger model with the learned knowledge.
 
-1.  **Train a smaller base model** (e.g., with `--context_dim 512`, `--max_length 1024`) using `chronos.py`.
+1.  **Train a smaller base model** using `chronos.py`.
 
-2.  **Use `expand_model.py` to create a larger model directory**.
-
-      * Specify the path to the trained smaller model *directory* (`--old-model-path`).
-      * Specify the desired output *directory* for the new model (`--output-dir`).
-      * Provide any **new, larger architecture dimensions** (e.g., `--context_dim 1024`).
-      * Optionally, specify a **new maximum sequence length** (`--new-max-length`) OR let the script **automatically detect** it from a dataset (`--auto-max-length --dataset-for-length path/to/dataset.jsonl`).
+2.  **Use `expand_model.py`** to create the larger model directory, optionally changing dimensions or `max_length`.
 
     **Example:** Expanding dimensions and `max_length` (automatically detected):
 
@@ -218,60 +210,46 @@ You can efficiently create a larger model by **transplanting the weights** from 
         --dataset-for-length "./larger_dataset.jsonl"
     ```
 
-    **Example:** Expanding `max_length` only (manually set):
+### Continuing Training from an Expanded or Inference Model (`chronos.py`) ✨
 
-    ```bash
-    python expand_model.py \
-        --old-model-path "./small_model_dir" \
-        --output-dir "./long_context_model_dir" \
-        --new-max-length 4096
-    ```
+After expanding a model with `expand_model.py`, or if you simply want to **continue training using the weights from any existing Chronos model directory** (even a final inference model), you can use the `train` mode with the `--model-path` argument **instead of** `--resume-from-ckpt`.
 
-    The script copies matching weights, correctly handles positional embeddings for the new `max_length`, initializes new parameters randomly, and copies the tokenizer files to the output directory.
+This will load *only the model weights* from the specified directory and start a **completely new training session** (fresh optimizer, scheduler starting from epoch 1). This is useful for adapting a pre-trained or expanded model to a new dataset or continuing its training with different hyperparameters.
 
-3.  **Fine-tune or continue training the expanded model** using `chronos.py`, pointing to the new model directory (`./large_model_dir` or `./long_context_model_dir` in the examples). Remember to use `--amp` if desired for this phase.
+```bash
+# Example: Continue training the expanded model from the previous step
+python chronos.py train \
+    --train "./larger_dataset.jsonl" \
+    --model-path "./large_model_dir" `# Load weights from here` \
+    --tokenizer-path "./large_model_dir" `# Load tokenizer from here too` \
+    --out-dir "./large_model_continued_training" \
+    --epochs 5 \
+    --starting-lr 5e-5 `# Use a potentially smaller LR` \
+    --min-lr 1e-6 \
+    --amp # <-- Optionally enable AMP
+```
+
+> **Key Difference:**
+>
+>   * `--resume-from-ckpt`: Loads **full training state** (weights, optimizer, scheduler, epoch) from a `.pt` file to continue an interrupted run.
+>   * `--model-path` (in `train` mode): Loads **only model weights** from a directory to start a *new* training run, initializing optimizer/scheduler fresh.
 
 ### Chat Mode Features (`chronos.py`)
 
 #### Querying Structured Memory
 
-During a chat session, use the `/filter` command to constrain the model's memory retrieval:
-
-  - **Filter by time:**
-
-    ```
-    >>> /filter time=-3600
-    [INFO: Memory filtered to events after Sat Oct 18 03:02:16 2025]
-    ```
-
-    (Only use memories learned in the last hour)
-
-  - **Filter by source:**
-
-    ```
-    >>> /filter source=1
-    [INFO: Memory filtered to source ID: 1]
-    ```
-
-    (Only use memories learned from `user interaction` - Source ID 1. Source ID 2 is `training data`).
-
-  - **Reset filters:**
-
-    ```
-    >>> /filter reset
-    [INFO: Memory filters have been reset.]
-    ```
+Use `/filter time=-<seconds>` or `/filter source=<id>` (0=Unknown, 1=User, 2=Training) to constrain memory retrieval. Use `/filter reset` to clear filters.
 
 #### Enabling Online Learning in Chat
 
-Requires the quantized model (`--model-path`) and the original full-precision model (`--shadow-model-path`). You can also use `--amp` here if learning on a CUDA device.
+Requires the quantized model (`--model-path`) and the original full-precision model (`--shadow-model-path`).
 
 ```bash
 python chronos.py chat \
     --model-path "./my_model_merged-INT4" \
     --enable-quantized-learning \
     --shadow-model-path "./my_model_merged" \
-    --amp # <-- Optionally enable AMP for faster online learning calculations
+    --amp # <-- Optionally enable AMP for faster online learning
 ```
 
 -----
@@ -280,62 +258,60 @@ python chronos.py chat \
 
 ### `chronos.py` Arguments
 
-*(Added `--amp` flag under Training/Fine-Tuning)*
-
-| Argument                | Mode(s)           | Description                                                                     | Default           |
-| :---------------------- | :---------------- | :------------------------------------------------------------------------------ | :---------------- |
-| **Paths** |                   |                                                                                 |                   |
-| `--model-path`          | `finetune`, `merge`, `quantize`, `chat` | Path to the model directory for loading.                                | `None`            |
-| `--train`               | `train`, `finetune` | Path to the training `.json` or `.jsonl` file.                                  | `None`            |
+| Argument                | Mode(s)                             | Description                                                                     | Default           |
+| :---------------------- | :---------------------------------- | :------------------------------------------------------------------------------ | :---------------- |
+| **Paths** |                                     |                                                                                 |                   |
+| `--model-path`          | `train`, `finetune`, `merge`, `quantize`, `chat` | Path to model directory. **[Train]**: Loads weights only (starts fresh training). **[Other]**: Loads for the specified mode. | `None`            |
+| `--train`               | `train`, `finetune`                 | Path to the training `.json` or `.jsonl` file.                                  | `None`            |
 | `--out-dir`             | `train`, `finetune`, `merge`, `quantize` | Directory to save new models, checkpoints, or adapters.                         | `./chronos_model` |
-| `--tokenizer-path`      | `train`           | Path or HF name of the tokenizer for a new model.                               | `microsoft/phi-2` |
-| `--resume-from-ckpt`    | `train`           | Path to a specific training checkpoint `.pt` file to resume from.               | `None`            |
-| `--shadow-model-path`   | `chat`            | Path to full-precision model dir for online learning with quantized model.      | `None`            |
-| `--lora-adapter-path`   | `merge`           | Path to the trained LoRA adapter directory.                                     | `None`            |
-| **Training/Fine-Tuning**|                   |                                                                                 |                   |
-| `--epochs`              | `train`, `finetune` | Number of training epochs.                                                      | `3`               |
-| `--batch_size`          | `train`, `finetune` | Number of samples per forward pass.                                             | `4`               |
-| `--accumulation-steps`  | `train`, `finetune` | Number of steps to accumulate gradients over (simulates larger batch size).     | `1`               |
-| `--grad-clip`           | `train`, `finetune` | Gradient clipping value. Prevents gradient explosion (0 to disable).            | `1.0`             |
-| `--ponder-loss-weight`  | `train`, `finetune` | Weight for the Ponder Cost auxiliary loss.                                      | `0.01`            |
-| `--override-scheduling` | `train`           | If resuming, **ignore** checkpoint's schedule state and use new LR args.        | `False`           |
-| `--starting-lr`         | `train`, `finetune` | Max Learning Rate for the schedule, or fixed LR if schedule disabled.           | `1e-4`            |
-| `--min-lr`              | `train`, `finetune` | Minimum Learning Rate for cosine annealing schedule.                            | `1e-6`            |
-| `--disable-lr-schedule` | `train`, `finetune` | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.        | `False`           |
-| `--ltm_lr`              | `train`, `finetune`, `chat` | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat). | `0.01`            |
-| `--amp`                 | `train`, `finetune`, `chat` | **Enable Automatic Mixed Precision (requires CUDA).** | `False`           |
-| `--num_workers`         | `train`, `finetune` | Number of CPU workers for data loading.                                         | `0`               |
-| `--lora_r`              | `finetune`        | LoRA rank 'r'.                                                                  | `8`               |
-| `--lora_alpha`          | `finetune`        | LoRA alpha scaling factor.                                                      | `16`              |
-| `--finetune-unlock-percent` | `finetune`    | Target % of params to train (approx.). Overrides `--lora_r` if set.             | `None`            |
-| `--kayla`               | `train`, `finetune` | Enable Kayla-style instruction tuning format (with thought-process).            | `False`           |
-| **Quantization/Inference**|                   |                                                                                 |                   |
-| `--qtype`               | `quantize`, `train` | Quantization format (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Used by `quantize` or `--quantize-on-complete`. | `INT4`            |
-| `--quantize-on-complete`| `train`           | Automatically run quantization after training finishes.                         | `False`           |
-| `--device`              | `chat`            | Device for *quantized* inference (`cpu`, `vulkan`).                             | `cpu`             |
-| `--h-halt-thresh`       | `chat`            | Probability threshold for early exiting the HRM reasoning loop during inference. | `0.9`             |
-| `--max-new-tokens`      | `chat`            | Maximum number of tokens to generate in chat mode.                              | `512`             |
-| `--enable-quantized-learning`| `chat`       | Enable LTM updates for quantized models (requires `--shadow-model-path`).       | `False`           |
-| `--ltm-lora-path`       | `chat`            | Optional: Path to save/load LTM updates as a separate delta file in chat mode.  | `None`            |
-| `--static-ltm-lr`       | `chat`            | Disable cosine annealing for chat LTM updates, use fixed `--ltm_lr`.           | `False`           |
-| `--ltm-schedule-steps`  | `chat`            | Number of chat updates per LTM LR cosine cycle.                                 | `100`             |
-| `--ltm-schedule-min-lr` | `chat`            | Minimum LR for chat LTM cosine schedule.                                        | `1e-5`            |
-| **Architecture (Train)**|                   |                                                                                 |                   |
-| `--context_dim`         | `train`           | Core embedding dimension.                                                       | `512`             |
-| `--persistent_dim`      | `train`           | Dimension of the fixed Persistent Memory.                                       | `128`             |
-| `--ltm_slots`           | `train`           | Number of slots in the Long-Term Memory.                                        | `2048`            |
-| `--ltm_key_dim`         | `train`           | Dimension of LTM keys.                                                          | `128`             |
-| `--ltm_val_dim`         | `train`           | Dimension of LTM values.                                                        | `128`             |
-| `--h_hidden`            | `train`           | Hidden size of the High-Level (CEO) RNN.                                        | `512`             |
-| `--l_hidden`            | `train`           | Hidden size of the Low-Level (Worker) RNN.                                      | `512`             |
-| `--max_h_steps`         | `train`           | Maximum number of reasoning steps the H-module can take per token.              | `10`              |
-| `--max_l_steps`         | `train`           | Maximum number of iterations for L-module convergence per H-step.               | `10`              |
-| `--l_conv_atol`         | `train`           | Absolute tolerance for checking L-module state convergence.                     | `1e-5`            |
-| `--ltm_topk`            | `train`           | Number of LTM slots to retrieve per token.                                      | `4`               |
-| `--max_length`          | `train`           | Maximum sequence length for positional embeddings.                              | `1024`            |
-| `--auto-max-length`     | `train`           | Automatically scan `--train` dataset to set `max_length`.                       | `False`           |
-| **Other** |                   |                                                                                 |                   |
-| `--threads`             | `All`             | Number of CPU threads for PyTorch/OpenMP.                                       | `CPU_Count/2`     |
+| `--tokenizer-path`      | `train`                             | Path or HF name of the tokenizer for a new model (or if overriding model's).      | `microsoft/phi-2` |
+| `--resume-from-ckpt`    | `train`                             | Path to `.pt` checkpoint to **resume full training state** (optimizer, etc.).   | `None`            |
+| `--shadow-model-path`   | `chat`                              | Path to full-precision model dir for online learning with quantized model.      | `None`            |
+| `--lora-adapter-path`   | `merge`, `finetune`                 | Path to the trained LoRA adapter directory.                                     | `None`            |
+| **Training/Fine-Tuning**|                                     |                                                                                 |                   |
+| `--epochs`              | `train`, `finetune`                 | Number of training epochs.                                                      | `3`               |
+| `--batch_size`          | `train`, `finetune`                 | Number of samples per forward pass.                                             | `4`               |
+| `--accumulation-steps`  | `train`, `finetune`                 | Number of steps to accumulate gradients over (simulates larger batch size).     | `1`               |
+| `--grad-clip`           | `train`, `finetune`                 | Gradient clipping value. Prevents gradient explosion (0 to disable).            | `1.0`             |
+| `--ponder-loss-weight`  | `train`, `finetune`                 | Weight for the Ponder Cost auxiliary loss.                                      | `0.01`            |
+| `--override-scheduling` | `train`                             | **[If resuming]** Ignore checkpoint's schedule state and use new LR args.         | `False`           |
+| `--starting-lr`         | `train`, `finetune`                 | Max Learning Rate for the schedule, or fixed LR if schedule disabled.           | `1e-4`            |
+| `--min-lr`              | `train`, `finetune`                 | Minimum Learning Rate for cosine annealing schedule.                            | `1e-6`            |
+| `--disable-lr-schedule` | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.        | `False`           |
+| `--ltm_lr`              | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).  | `0.01`            |
+| `--amp`                 | `train`, `finetune`, `chat`         | **Enable Automatic Mixed Precision (requires CUDA).** | `False`           |
+| `--num_workers`         | `train`, `finetune`                 | Number of CPU workers for data loading.                                         | `0`               |
+| `--lora_r`              | `finetune`                          | LoRA rank 'r'.                                                                  | `8`               |
+| `--lora_alpha`          | `finetune`                          | LoRA alpha scaling factor.                                                      | `16`              |
+| `--finetune-unlock-percent` | `finetune`                      | Target % of params to train (approx.). Overrides `--lora_r` if set.             | `None`            |
+| `--kayla`               | `train`, `finetune`                 | Enable Kayla-style instruction tuning format (with thought-process).            | `False`           |
+| **Quantization/Inference**|                                     |                                                                                 |                   |
+| `--qtype`               | `quantize`, `train`                 | Quantization format (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). Used by `quantize` or `--quantize-on-complete`. | `INT4`            |
+| `--quantize-on-complete`| `train`                             | Automatically run quantization after training finishes.                         | `False`           |
+| `--device`              | `chat`                              | Device for *quantized* inference (`cpu`, `vulkan`).                             | `cpu`             |
+| `--h-halt-thresh`       | `chat`                              | Probability threshold for early exiting the HRM reasoning loop during inference.  | `0.9`             |
+| `--max-new-tokens`      | `chat`                              | Maximum number of tokens to generate in chat mode.                              | `512`             |
+| `--enable-quantized-learning`| `chat`                         | Enable LTM updates for quantized models (requires `--shadow-model-path`).       | `False`           |
+| `--ltm-lora-path`       | `chat`                              | Optional: Path to save/load LTM updates as a separate delta file in chat mode.  | `None`            |
+| `--static-ltm-lr`       | `chat`                              | Disable cosine annealing for chat LTM updates, use fixed `--ltm_lr`.            | `False`           |
+| `--ltm-schedule-steps`  | `chat`                              | Number of chat updates per LTM LR cosine cycle.                                 | `100`             |
+| `--ltm-schedule-min-lr` | `chat`                              | Minimum LR for chat LTM cosine schedule.                                        | `1e-5`            |
+| **Architecture (Train)**|                                     | *(Used only if starting train from scratch)* |                   |
+| `--context_dim`         | `train`                             | Core embedding dimension.                                                       | `512`             |
+| `--persistent_dim`      | `train`                             | Dimension of the fixed Persistent Memory.                                       | `128`             |
+| `--ltm_slots`           | `train`                             | Number of slots in the Long-Term Memory.                                        | `2048`            |
+| `--ltm_key_dim`         | `train`                             | Dimension of LTM keys.                                                          | `128`             |
+| `--ltm_val_dim`         | `train`                             | Dimension of LTM values.                                                        | `128`             |
+| `--h_hidden`            | `train`                             | Hidden size of the High-Level (CEO) RNN.                                        | `512`             |
+| `--l_hidden`            | `train`                             | Hidden size of the Low-Level (Worker) RNN.                                      | `512`             |
+| `--max_h_steps`         | `train`                             | Maximum number of reasoning steps the H-module can take per token.              | `10`              |
+| `--max_l_steps`         | `train`                             | Maximum number of iterations for L-module convergence per H-step.               | `10`              |
+| `--l_conv_atol`         | `train`                             | Absolute tolerance for checking L-module state convergence.                     | `1e-5`            |
+| `--ltm_topk`            | `train`                             | Number of LTM slots to retrieve per token.                                      | `4`               |
+| `--max_length`          | `train`                             | Maximum sequence length for positional embeddings.                              | `1024`            |
+| `--auto-max-length`     | `train`                             | Automatically scan `--train` dataset to set `max_length`.                       | `False`           |
+| **Other** |                                     |                                                                                 |                   |
+| `--threads`             | `All`                               | Number of CPU threads for PyTorch/OpenMP.                                       | `CPU_Count/2`     |
 
 ### `expand_model.py` Arguments
 
@@ -353,7 +329,7 @@ python chronos.py chat \
 | `--new-max-length`     | *Optional:* Manually specify the new maximum sequence length.                        | No       |         |
 | `--auto-max-length`    | *Optional:* Automatically determine `new-max-length` by scanning a dataset.          | No       | `False` |
 | `--dataset-for-length` | Path to dataset (.jsonl/.json) required if using `--auto-max-length`.                | If above |         |
-| `--kayla`              | Use Kayla formatting when scanning dataset with `--auto-max-length`.                   | No       | `False` |
+| `--kayla`              | Use Kayla formatting when scanning dataset with `--auto-max-length`.                 | No       | `False` |
 
 -----
 
@@ -381,16 +357,16 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ## Changelog
 
-
 ### v0.5.2 (alpha)
 
+  - **Added Flexible Training Initiation**: The `train` mode now supports a `--model-path` argument to load *only weights* from an existing model directory (e.g., an expanded model or inference checkpoint) and start a *new* training session (fresh optimizer/scheduler). This is distinct from `--resume-from-ckpt` which loads the full training state.
   - **Enhanced `expand_model.py` Script**:
       - Added ability to expand `max_length` by correctly handling positional embeddings.
       - Added `--new-max-length` flag for manual specification.
       - Added `--auto-max-length` and `--dataset-for-length` flags to automatically detect required `max_length` from a dataset.
       - Automatically copies tokenizer files to the expanded model directory.
-  - **Documentation**: Updated README with detailed usage for the enhanced `expand_model.py`.
-  - **Enhanced NVIDIA hardware acceleration**: Implemented "Automatic Mixed Precision" support to accelerate training speed on powerful Ampere NVIDIA GPUs or newer.
+  - **Added Automatic Mixed Precision (AMP)**: Implemented `--amp` flag for `train`, `finetune`, and `chat` (online learning) modes to accelerate computation and reduce memory usage on NVIDIA CUDA GPUs.
+  - **Documentation**: Updated README with detailed usage for the enhanced `expand_model.py`, AMP, and the new training initiation workflow using `--model-path`. Updated command reference table.
 
 ### v0.5.1 (alpha)
 
