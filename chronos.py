@@ -89,12 +89,12 @@ except ImportError:
     print("!!!                                                                         !!!")
     print("!!! To fix this, please run the appropriate setup script:                   !!!")
     print("!!!  - On Windows:   Run setup.bat                                          !!!")
-    print("!!!  - On Linux/macOS: Run bash setup.sh                                     !!!")
+    print("!!!  - On Linux/macOS: Run bash setup.sh                                      !!!")
     print("!!!                                                                         !!!")
     print("!!! If you have already run the setup, you may need to activate the         !!!")
     print("!!! virtual environment first:                                              !!!")
-    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                              !!!")
-    print("!!!  - On Linux/macOS: source .venv/bin/activate                             !!!")
+    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                               !!!")
+    print("!!!  - On Linux/macOS: source .venv/bin/activate                            !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1) # Exit the program because the kernel is essential
 
@@ -1037,14 +1037,15 @@ def train(args, device, tokenizer):
     current_vocab_size = None
     if tokenizer:
         current_vocab_size = len(tokenizer)
-        # If starting fresh, ensure config gets the vocab_size
-        if not args.resume_from_ckpt and 'vocab_size' not in config:
-            config['vocab_size'] = current_vocab_size
-    elif not args.resume_from_ckpt:
+        # If starting fresh AND not loading from a model_path, ensure config gets the vocab_size
+        if not args.resume_from_ckpt and not args.model_path and 'vocab_size' not in config:
+             config['vocab_size'] = current_vocab_size
+    elif not args.resume_from_ckpt and not args.model_path:
         # Should not happen if tokenizer loading in main is correct
         raise RuntimeError("Tokenizer not loaded, cannot determine vocab_size for new model.")
-    # If resuming, vocab_size *should* come from the checkpoint config,
-    # but we'll add a check later.
+    # If resuming or loading from model_path, vocab_size *should* come from the checkpoint config,
+    # but we'll add checks later.
+
 
     model = None # Initialize model variable
     optimizer = None # Initialize optimizer variable
@@ -1063,7 +1064,7 @@ def train(args, device, tokenizer):
             kayla_mode=args.kayla, num_workers=args.num_workers
         )
         if dataloader is None or len(dataloader) == 0:
-            raise ValueError("DataLoader creation failed or resulted in an empty loader.")
+             raise ValueError("DataLoader creation failed or resulted in an empty loader.")
         dataloader_len = len(dataloader)
         print(f"INFO: DataLoader created with {dataloader_len} batches.")
     except Exception as e:
@@ -1071,8 +1072,48 @@ def train(args, device, tokenizer):
         sys.exit(1)
 
 
-    # <<< Resume logic >>>
-    if args.resume_from_ckpt:
+    # --- MODIFICATION START: Handle starting from an existing model directory ---
+    if args.model_path and not args.resume_from_ckpt:
+        print(f"INFO: Starting training using initial weights from model directory: {args.model_path}")
+        try:
+            # Load the model and its config. This should be an inference checkpoint.
+            model, model_config = load_full_model_with_config(args.model_path, device)
+
+            # Check vocab size consistency
+            if model_config.vocab_size != current_vocab_size and current_vocab_size is not None:
+                print(f"Warning: Loaded model vocab_size ({model_config.vocab_size}) differs from tokenizer ({current_vocab_size}). Using model's value.")
+            elif 'vocab_size' not in model_config and current_vocab_size:
+                print(f"Warning: 'vocab_size' missing from loaded model config. Using tokenizer's value ({current_vocab_size}).")
+                model_config.vocab_size = current_vocab_size # Patch config
+                # Re-initialize parts affected by vocab_size if necessary (tok_emb, lm_head)
+                model.tok_emb = nn.Embedding(model_config.vocab_size, model_config.context_dim).to(device)
+                model.lm_head = nn.Linear(model_config.context_dim, model_config.vocab_size, bias=False).to(device)
+                model.tok_emb.weight = model.lm_head.weight # Re-tie weights
+            elif 'vocab_size' not in model_config:
+                 raise ValueError("Cannot determine vocab_size: Not found in loaded model config and tokenizer not available.")
+
+            # --- Initialize optimizer, scaler, scheduler FRESH ---
+            print("INFO: Initializing optimizer, scheduler, and scaler from scratch.")
+            optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
+            if use_amp:
+                scaler = GradScaler()
+                print("INFO: Automatic Mixed Precision (AMP) ENABLED for training.")
+            num_update_steps = (dataloader_len // args.accumulation_steps) * args.epochs if dataloader_len > 0 else 0
+            if not args.disable_lr_schedule and num_update_steps > 0:
+                print(f"INFO: Step-based Cosine Annealing LR scheduler ENABLED. Total update steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
+                scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+            # start_epoch remains 0
+
+        except FileNotFoundError:
+             print(f"ERROR: --model-path specified ({args.model_path}), but it does not seem to contain a valid model directory.")
+             sys.exit(1)
+        except Exception as e:
+            print(f"ERROR: Failed to load model from --model-path ({args.model_path}): {e}")
+            sys.exit(1)
+
+    # <<< Resume logic (now an elif) >>>
+    elif args.resume_from_ckpt:
+    # --- MODIFICATION END ---
         if not os.path.exists(args.resume_from_ckpt):
             raise FileNotFoundError(f"Checkpoint to resume from not found at {args.resume_from_ckpt}")
 
@@ -1165,7 +1206,7 @@ def train(args, device, tokenizer):
             else:
                  # No warning needed if overriding, expected to start fresh scaler anyway
                  if not args.override_scheduling:
-                    print("Warning: Scaler state not found in checkpoint. Initializing a fresh scaler.")
+                     print("Warning: Scaler state not found in checkpoint. Initializing a fresh scaler.")
         # --- End AMP Init/Resume ---
 
         # --- Initialize Scheduler (AFTER optimizer is potentially re-initialized) ---
@@ -1189,10 +1230,10 @@ def train(args, device, tokenizer):
 
                 if lr_mismatch or min_lr_mismatch:
                     print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-                    print("!!! WARNING: New LR flags detected but --override-scheduling was not set.             !!!")
-                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.             !!!")
-                    print(f"!!!   Loading old schedule (LR: {old_lr}, Min LR: {old_min_lr}).                       !!!")
-                    print("!!!   To use your new LR flags, add --override-scheduling to your command.            !!!")
+                    print("!!! WARNING: New LR flags detected but --override-scheduling was not set.           !!!")
+                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.           !!!")
+                    print(f"!!!   Loading old schedule (LR: {old_lr}, Min LR: {old_min_lr}).                  !!!")
+                    print("!!!   To use your new LR flags, add --override-scheduling to your command.          !!!")
                     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 
                 print("Resuming learning rate scheduler state.")
@@ -1222,26 +1263,29 @@ def train(args, device, tokenizer):
         print(f"Successfully loaded model state. Resuming from epoch {start_epoch + 1}.") # Adjusted message
 
 
-    else: # Not resuming, starting fresh
-        # Need to ensure vocab_size is in the config used to create the model
-        if 'vocab_size' not in config:
-            if current_vocab_size:
-                config['vocab_size'] = current_vocab_size
-            else:
+    # <<< Starting completely fresh (now the final else) >>>
+    else: # Not resuming, starting fresh AND no model_path specified
+         print("INFO: Starting training from scratch (no --resume-from-ckpt or --model-path provided).")
+         # Need to ensure vocab_size is in the config used to create the model
+         if 'vocab_size' not in config:
+             if current_vocab_size:
+                 config['vocab_size'] = current_vocab_size
+             else:
                  raise ValueError("Cannot determine vocab_size for new model.")
-        model = ChronosCore(config).to(device)
-        optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
-        model_config = AttrDict(config) # Use the CLI args config
+         model = ChronosCore(config).to(device)
+         optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
+         model_config = AttrDict(config) # Use the CLI args config
 
-        # --- Initialize AMP GradScaler ---
-        if use_amp:
-            scaler = GradScaler()
-            print("INFO: Automatic Mixed Precision (AMP) ENABLED for training.")
-        # --- Initialize Scheduler ---
-        num_update_steps = (dataloader_len // args.accumulation_steps) * args.epochs if dataloader_len > 0 else 0
-        if not args.disable_lr_schedule and num_update_steps > 0:
-            print(f"INFO: Step-based Cosine Annealing LR scheduler ENABLED. Total update steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
-            scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+         # --- Initialize AMP GradScaler ---
+         if use_amp:
+             scaler = GradScaler()
+             print("INFO: Automatic Mixed Precision (AMP) ENABLED for training.")
+         # --- Initialize Scheduler ---
+         num_update_steps = (dataloader_len // args.accumulation_steps) * args.epochs if dataloader_len > 0 else 0
+         if not args.disable_lr_schedule and num_update_steps > 0:
+             print(f"INFO: Step-based Cosine Annealing LR scheduler ENABLED. Total update steps: {num_update_steps}, Max LR: {args.starting_lr}, Min LR: {args.min_lr}")
+             scheduler = CosineAnnealingLR(optimizer, T_max=num_update_steps, eta_min=args.min_lr)
+
 
     # --- Start Training Loop ---
     model.train()
@@ -2133,7 +2177,7 @@ def main():
     path_group = parser.add_argument_group('Paths and Data')
     path_group.add_argument("--train", type=str, default=None, help="[Train/Finetune] Path to training JSON or JSONL file.")
     # <<< REVERTED CHANGE: Made --model-path NOT required for train mode >>>
-    path_group.add_argument("--model-path", type=str, default=None, help="Path to the model directory (required for all modes except 'train' unless resuming).")
+    path_group.add_argument("--model-path", type=str, default=None, help="Path to the model directory (required for all modes except 'train' unless resuming or starting from scratch).") # MODIFIED help
     path_group.add_argument("--out-dir", type=str, default="./chronos_model", help="[Train/Finetune/Merge/Quantize] Directory to save the new model/adapter.")
     path_group.add_argument("--lora-adapter-path", type=str, default=None, help="[Merge/Finetune] Path to the LoRA adapter directory.") # Corrected help text
     path_group.add_argument("--tokenizer-path", type=str, default="microsoft/phi-2", help="[Train] Path or HF name of the tokenizer to use for a new model.")
@@ -2142,7 +2186,7 @@ def main():
 
 
     # --- Model Architecture Arguments (for Training) ---
-    arch_group = parser.add_argument_group('Architecture (for --mode train)')
+    arch_group = parser.add_argument_group('Architecture (for --mode train, used if not resuming/loading)') # MODIFIED help
     arch_group.add_argument("--context_dim", type=int, default=512)
     arch_group.add_argument("--persistent_dim", type=int, default=128)
     arch_group.add_argument("--ltm_slots", type=int, default=2048)
@@ -2205,26 +2249,25 @@ def main():
 
     # --- Argument Validation ---
     # <<< REVERTED CHANGE: Removed model_path requirement for train mode >>>
+    # Train mode needs --train unless resuming. It *might* use --model-path to load initial weights.
     if args.mode == 'train' and not args.train and not args.resume_from_ckpt:
-         parser.error("`--train` is required for train mode unless resuming with `--resume-from-ckpt`.")
+        parser.error("`--train` is required for train mode unless resuming with `--resume-from-ckpt`.")
     if args.mode == 'finetune' and not args.train:
-         parser.error("`--train` is required for finetune mode.")
+        parser.error("`--train` is required for finetune mode.")
     # <<< REVERTED CHANGE: Added back model_path requirement checks for other modes >>>
     if args.mode == 'finetune' and not args.model_path:
-         parser.error("`--model-path` (base model) is required for finetune mode.")
+        parser.error("`--model-path` (base model) is required for finetune mode.")
     if args.mode == 'merge-lora' and not args.model_path:
-         parser.error("`--model-path` (base model) is required for merge-lora mode.")
+        parser.error("`--model-path` (base model) is required for merge-lora mode.")
     if args.mode == 'merge-lora' and not args.lora_adapter_path:
-         parser.error("`--lora-adapter-path` is required for merge-lora mode.")
-    if args.mode == 'quantize' and not args.model_path:
-        # Quantize might be called internally without model_path, so this check is relaxed
-        # Check only if it's the primary mode being run
-        # We handle the model/tokenizer loading inside the quantize function anyway
-        pass
+        parser.error("`--lora-adapter-path` is required for merge-lora mode.")
+    # Quantize can be called internally, so check model_path only if not resuming train
+    if args.mode == 'quantize' and not args.model_path and not args.quantize_on_complete:
+        parser.error("`--model-path` is required for quantize mode unless used with --quantize-on-complete.")
     if args.mode == 'chat' and not args.model_path:
-         parser.error("`--model-path` is required for chat mode.")
+        parser.error("`--model-path` is required for chat mode.")
     if args.enable_quantized_learning and not args.shadow_model_path:
-         parser.error("--enable-quantized-learning requires --shadow-model-path to be set.")
+        parser.error("--enable-quantized-learning requires --shadow-model-path to be set.")
 
     set_threads(args.threads)
     pt_device = pick_device()
@@ -2264,11 +2307,16 @@ def main():
                 else:
                     # If not found near checkpoint and not specified, raise error
                     parser.error("Resuming training requires --tokenizer-path, or tokenizer files next to the checkpoint.")
-        elif not args.tokenizer_path:
+        # MODIFICATION: If starting from --model-path, load tokenizer from there unless --tokenizer-path is given
+        elif args.model_path and not args.tokenizer_path:
+             print(f"INFO: Starting training from model path, loading tokenizer from: {args.model_path}")
+             tokenizer_load_path = args.model_path
+        elif not args.tokenizer_path and not args.model_path: # Starting fresh requires tokenizer path
             parser.error("--tokenizer-path is required when starting training from scratch.")
-        else: # Starting new training, use specified path
-            print(f"Loading tokenizer '{args.tokenizer_path}' for new model training...")
-            tokenizer_load_path = args.tokenizer_path
+        else: # Starting new training (or from model_path with explicit tokenizer), use specified path
+            print(f"Loading tokenizer '{args.tokenizer_path or tokenizer_load_path}' for training...")
+            tokenizer_load_path = args.tokenizer_path or tokenizer_load_path # Prioritize CLI arg
+
 
         try:
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_load_path, trust_remote_code=True)
@@ -2305,25 +2353,16 @@ def main():
         else:
             print("Warning: Tokenizer missing both pad and eos tokens. Adding a '[PAD]' token.")
             tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-            # Only resize embeddings if *starting* training, not resuming
-            if args.mode == "train" and not args.resume_from_ckpt:
+            # Only resize embeddings if *starting* training, not resuming or loading
+            if args.mode == "train" and not args.resume_from_ckpt and not args.model_path:
                 # We need to know the vocab size *before* creating the model
                 # This ensures the Embedding layer has the right size initially
                 args.vocab_size = len(tokenizer)
                 print(f"Updated args.vocab_size to {args.vocab_size} due to added pad token.")
 
 
-    # --- Set Vocab Size if Training New Model ---
-    # Moved this logic into the train function where it's needed before model init
-    # if args.mode == "train" and not args.resume_from_ckpt:
-    #     if not hasattr(args, 'vocab_size'):
-    #         if tokenizer is None:
-    #             parser.error("Tokenizer could not be loaded, cannot determine vocab_size for new model.")
-    #         args.vocab_size = len(tokenizer)
-
-
     # --- Auto Max Length Scanning ---
-    if args.auto_max_length:
+    if args.auto_max_length and (args.mode == 'train' or args.mode == 'finetune'): # Only scan if training/finetuning
         train_file_path = args.train
         # Added check if resuming and train path not given
         if not train_file_path and args.resume_from_ckpt:
@@ -2337,6 +2376,9 @@ def main():
 
         if not train_file_path or not os.path.exists(train_file_path):
             parser.error("--auto-max-length requires a valid --train file path (either directly or potentially via resumed config).")
+        if tokenizer is None:
+             parser.error("--auto-max-length requires the tokenizer to be loaded first.")
+
 
         print("INFO: --auto-max-length enabled. Scanning dataset to find the maximum sequence length...")
         max_found_length = 0
