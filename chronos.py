@@ -120,12 +120,12 @@ except ImportError:
     print("!!!                                                                         !!!")
     print("!!! To fix this, please run the appropriate setup script:                   !!!")
     print("!!!  - On Windows:   Run setup.bat                                          !!!")
-    print("!!!  - On Linux/macOS: Run bash setup.sh                                    !!!")
+    print("!!!  - On Linux/macOS: Run bash setup.sh                                      !!!")
     print("!!!                                                                         !!!")
     print("!!! If you have already run the setup, you may need to activate the         !!!")
     print("!!! virtual environment first:                                              !!!")
     print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                              !!!")
-    print("!!!  - On Linux/macOS: source .venv/bin/activate                            !!!")
+    print("!!!  - On Linux/macOS: source .venv/bin/activate                              !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     sys.exit(1) # Exit the program because the kernel is essential
 
@@ -296,92 +296,171 @@ def create_dataloader_for_chunked(path, max_length, batch_size, num_workers=0):
     # or rely on the inherent order/distribution for large datasets.
     # Simple line-by-line iteration per worker is used here.
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_simple,
-                        num_workers=num_workers, pin_memory=pin_memory,
-                        persistent_workers=persistent_workers)
+                      num_workers=num_workers, pin_memory=pin_memory,
+                      persistent_workers=persistent_workers)
 # <<< END: Iterable Dataset/Loader for Pre-Chunked JSONL Data >>>
 
-# <<< START: New Map-Style Dataset/Loader for Pre-Chunked PT Tensors >>>
+# <<< START: Modified Map-Style Dataset/Loader for Consolidated PT Tensors >>>
 class PTChunkedDataset(Dataset):
     """
     A map-style Dataset for loading pre-tokenized, chunked, masked, and padded
-    data directly from individual .pt files listed in a manifest.jsonl.
-    Significantly reduces RAM usage during startup compared to loading all text.
+    data directly from individual chunk entries listed in a manifest.jsonl,
+    where multiple chunks are consolidated into single .pt files.
+    Reduces RAM usage during startup compared to loading all text.
 
-    Expects a directory containing .pt files and a manifest.jsonl.
-    Each .pt file should contain a dictionary with 'input_ids', 'labels',
-    and 'attention_mask' as torch.tensors, all of the *same* pre-defined length.
+    Expects a directory containing consolidated .pt files (each a list of dicts)
+    and a manifest.jsonl. Each line in manifest.jsonl should contain
+    'file_path' (relative) and 'index_in_file' (int).
+    Each chunk dict within the .pt files should have 'input_ids', 'labels',
+    and 'attention_mask' as torch.tensors of the *same* pre-defined length.
+    Implements caching to reduce redundant file reads.
     """
     def __init__(self, directory_path: str, max_length: int):
         super().__init__()
         self.directory_path = directory_path
         self.max_length = max_length # For potential validation
-        self.chunk_paths = []
+        # <<< MODIFIED: Store (filepath, index) tuples >>>
+        self.chunk_pointers = []
+        # <<< MODIFIED: Add caching attributes >>>
+        self.last_loaded_path = None
+        self.last_loaded_data = None # This will hold the list loaded from a .pt file
 
         manifest_file = os.path.join(directory_path, "manifest.jsonl")
         if not os.path.exists(manifest_file):
             raise FileNotFoundError(f"Manifest file not found: {manifest_file}")
 
-        print(f"Loading chunk paths from manifest: {manifest_file}")
+        print(f"Loading chunk pointers from manifest: {manifest_file}")
         try:
             with open(manifest_file, "r", encoding="utf-8") as f_manifest:
-                for line in f_manifest:
+                for line_num, line in enumerate(f_manifest): # Added line_num for better warnings
                     line = line.strip()
                     if not line: continue
                     try:
                         entry = json.loads(line)
                         relative_path = entry.get("file_path")
-                        if relative_path:
+                        # <<< MODIFIED: Get index_in_file >>>
+                        index_in_file = entry.get("index_in_file")
+
+                        # <<< MODIFIED: Validate entry >>>
+                        if relative_path and isinstance(relative_path, str) and \
+                           index_in_file is not None and isinstance(index_in_file, int):
                             full_path = os.path.join(self.directory_path, relative_path)
-                            self.chunk_paths.append(full_path)
+                            self.chunk_pointers.append((full_path, index_in_file))
                         else:
-                             print(f"Warning: Manifest line missing 'file_path': {line}")
+                            print(f"Warning: Manifest line ~{line_num+1} missing or invalid 'file_path' (str) or 'index_in_file' (int): {line}")
                     except json.JSONDecodeError:
-                        print(f"Warning: Skipping invalid JSON in manifest: {line[:100]}...")
-            if not self.chunk_paths:
-                raise ValueError(f"No valid chunk file paths found in manifest: {manifest_file}")
-            print(f"Found {len(self.chunk_paths)} chunk files.")
+                        print(f"Warning: Skipping invalid JSON in manifest line ~{line_num+1}: {line[:100]}...")
+            if not self.chunk_pointers:
+                raise ValueError(f"No valid chunk pointers found in manifest: {manifest_file}")
+            print(f"Found {len(self.chunk_pointers)} total logical chunks.")
         except Exception as e:
             print(f"Error reading manifest file {manifest_file}: {e}")
             raise e
 
     def __len__(self):
-        return len(self.chunk_paths)
+        # <<< MODIFIED: Length is the total number of pointers >>>
+        return len(self.chunk_pointers)
 
     def __getitem__(self, idx):
-        chunk_path = self.chunk_paths[idx]
+        # <<< MODIFIED: Retrieve path and index >>>
         try:
-            # Load tensors directly from the .pt file
-            data = torch.load(chunk_path, map_location='cpu') # Load to CPU initially
+            chunk_path, index_in_file = self.chunk_pointers[idx]
+        except IndexError:
+            # This shouldn't happen with standard DataLoader usage but is a safeguard
+            print(f"Error: Index {idx} out of bounds for chunk pointers (len: {len(self.chunk_pointers)}).")
+            return None # Indicate failure
 
-            # Optional: Add validation here if needed
+        try:
+            # <<< MODIFIED: Implement Caching >>>
+            if chunk_path == self.last_loaded_path:
+                # Cache Hit: Use the already loaded list
+                if self.last_loaded_data is None:
+                    # Should not happen if last_loaded_path is set, but handle defensively
+                    print(f"Warning: Cache inconsistency for file {chunk_path}. Reloading.")
+                    self.last_loaded_data = torch.load(chunk_path, map_location='cpu')
+                    if not isinstance(self.last_loaded_data, list):
+                         raise TypeError(f"Loaded data from {chunk_path} is not a list.")
+                # Retrieve the specific chunk dictionary from the cached list
+                data = self.last_loaded_data[index_in_file]
+
+            else:
+                # Cache Miss: Load the new consolidated file
+                # print(f"Cache miss. Loading file: {chunk_path}") # Optional: for debugging
+                loaded_list = torch.load(chunk_path, map_location='cpu') # Load to CPU initially
+                if not isinstance(loaded_list, list):
+                    raise TypeError(f"Loaded data from {chunk_path} is not a list.")
+
+                # Update cache
+                self.last_loaded_path = chunk_path
+                self.last_loaded_data = loaded_list
+
+                # Retrieve the specific chunk dictionary
+                data = self.last_loaded_data[index_in_file]
+
+            # --- Validation (Optional but recommended) ---
+            if not isinstance(data, dict):
+                 raise TypeError(f"Chunk at index {index_in_file} in {chunk_path} is not a dictionary.")
             if not all(k in data for k in ["input_ids", "labels", "attention_mask"]):
-                print(f"Warning: Chunk file {chunk_path} missing required keys. Skipping.")
-                return None # Indicate failure to collate_fn
-            if data["input_ids"].shape[0] != self.max_length:
-                 print(f"Warning: Chunk file {chunk_path} has unexpected length {data['input_ids'].shape[0]}. Expected {self.max_length}. Skipping.")
+                print(f"Warning: Chunk dict at index {index_in_file} in {chunk_path} missing required keys. Skipping.")
+                return None # Indicate failure
+            if not all(isinstance(data[k], torch.Tensor) for k in ["input_ids", "labels", "attention_mask"]):
+                 print(f"Warning: Data in chunk dict at index {index_in_file} in {chunk_path} are not tensors. Skipping.")
                  return None
+            if data["input_ids"].shape[0] != self.max_length:
+                 print(f"Warning: Chunk tensor 'input_ids' at index {index_in_file} in {chunk_path} has unexpected length {data['input_ids'].shape[0]}. Expected {self.max_length}. Skipping.")
+                 return None
+            # --- End Validation ---
 
             return data
+
+        except FileNotFoundError:
+             print(f"Error: Consolidated chunk file not found: {chunk_path}")
+             self.last_loaded_path = None # Invalidate cache if file not found
+             self.last_loaded_data = None
+             return None
+        except IndexError:
+             print(f"Error: index_in_file {index_in_file} out of bounds for loaded list from {chunk_path} (len: {len(self.last_loaded_data) if self.last_loaded_data else 'N/A'}). Check manifest/chunking script.")
+             # Consider invalidating cache here too if the file structure seems wrong
+             # self.last_loaded_path = None
+             # self.last_loaded_data = None
+             return None
+        except TypeError as e:
+             print(f"Error: Type error processing chunk at index {index_in_file} in {chunk_path}: {e}")
+             return None
         except Exception as e:
-            print(f"Error loading or validating chunk file {chunk_path}: {e}")
-            return None # Indicate failure
+             # Catch other potential errors during loading or processing
+             print(f"Error loading or processing chunk from {chunk_path} at index {index_in_file}: {e}")
+             # Optionally invalidate cache on unexpected errors
+             # self.last_loaded_path = None
+             # self.last_loaded_data = None
+             return None
+
 
 def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_workers=0):
     """
-    Creates a DataLoader for the pre-chunked .pt dataset using PTChunkedDataset.
-    Handles shuffling and batching of pre-loaded tensors.
+    Creates a DataLoader for the pre-chunked consolidated .pt dataset using PTChunkedDataset.
+    Handles shuffling and batching of pre-loaded tensors. Caching is handled within the Dataset.
     """
-    dataset = PTChunkedDataset(directory_path, max_length=max_length)
+    dataset = PTChunkedDataset(directory_path, max_length=max_length) # Uses the MODIFIED dataset
 
     def collate_fn_pt(batch):
-        # Filter out None items potentially returned by dataset __getitem__
+        # Filter out None items potentially returned by dataset __getitem__ on error
         batch = [item for item in batch if item is not None]
-        if not batch: return None # Return None if batch becomes empty
+        if not batch: return None # Return None if batch becomes empty after filtering
 
         # Items are dictionaries with tensors of the same length
-        input_ids_batch = torch.stack([item['input_ids'] for item in batch])
-        labels_batch = torch.stack([item['labels'] for item in batch])
-        attention_mask_batch = torch.stack([item['attention_mask'] for item in batch])
+        try:
+            input_ids_batch = torch.stack([item['input_ids'] for item in batch])
+            labels_batch = torch.stack([item['labels'] for item in batch])
+            attention_mask_batch = torch.stack([item['attention_mask'] for item in batch])
+        except Exception as e:
+            print(f"Error during collate_fn_pt: {e}. One of the items might be malformed.")
+            # Decide how to handle this - skip batch or raise error?
+            # Returning None might be safer if errors are expected, but hides issues.
+            # Raising the error stops training but makes the problem explicit.
+            # Let's return None for now to avoid crashing training on rare errors.
+            return None
+
 
         return {
             "input_ids": input_ids_batch,
@@ -394,10 +473,10 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
 
     # Map-style dataset allows shuffling
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_pt, shuffle=True,
-                        num_workers=num_workers, pin_memory=pin_memory,
-                        persistent_workers=persistent_workers)
+                      num_workers=num_workers, pin_memory=pin_memory,
+                      persistent_workers=persistent_workers)
 
-# <<< END: New Map-Style Dataset/Loader for Pre-Chunked PT Tensors >>>
+# <<< END: Modified Map-Style Dataset/Loader for Consolidated PT Tensors >>>
 
 # <<< START: Original Dataset/Loader (Renamed) - NO CHANGES NEEDED HERE >>>
 class OriginalJSONLDataset(Dataset):
@@ -570,7 +649,7 @@ def create_dataloader_original(path, tokenizer, max_length, batch_size, pad_toke
     pin_memory = torch.cuda.is_available() and num_workers > 0
     persistent_workers = num_workers > 0
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_original, shuffle=True,
-                        num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
+                      num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
 # <<< END: Original Dataset/Loader (Renamed) >>>
 
 
@@ -1656,7 +1735,7 @@ def train(args, device, tokenizer):
                 if lr_mismatch or min_lr_mismatch:
                     print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                     print("!!! WARNING: New LR flags detected but --override-scheduling was not set.             !!!")
-                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.                    !!!")
+                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.                  !!!")
                     print(f"!!!   Loading old schedule state (LR: {old_lr}, Min LR: {old_min_lr}).                      !!!")
                     print("!!!   To use your new LR flags, add --override-scheduling to your command.            !!!")
                     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
@@ -3017,8 +3096,8 @@ def main():
     # --- Execute Selected Mode ---
     if args.mode == "train":
         if tokenizer is None and not args.pre_pt_dataset: # Need tokenizer unless loading PT files
-             print("Error: Tokenizer failed to load, cannot start training.")
-             sys.exit(1)
+            print("Error: Tokenizer failed to load, cannot start training.")
+            sys.exit(1)
         train(args, pt_device, tokenizer)
     elif args.mode == "finetune":
         if tokenizer is None and not args.pre_pt_dataset: # Need tokenizer unless loading PT files
