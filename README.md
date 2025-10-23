@@ -1,7 +1,3 @@
-# Chronos v0.6 (alpha): A Hybrid Memory-Reasoning Architecture
-
-A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
-
 -----
 
 ### 📢 **Major Update in v0.6: Efficient Large Dataset Handling**
