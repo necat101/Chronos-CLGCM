@@ -7,6 +7,7 @@ import numpy as np
 from typing import Optional, Tuple
 from tqdm import tqdm
 import traceback # Added for better error reporting
+import signal # <<< MODIFIED: Import signal >>>
 
 # <<< MODIFIED: Set Tokenizers Parallelism Environment Variable >>>
 # Set this early, before tokenizers might be implicitly loaded by other imports
@@ -31,12 +32,7 @@ except ImportError:
     print("Warning: 'peft' library not found. LoRA fine-tuning and merging will be unavailable.")
     _HAS_PEFT = False
 
-try:
-    import keyboard
-    _HAS_KEYBOARD = True
-except ImportError:
-    print("Warning: 'keyboard' library not found. The Ctrl+X interrupt feature will be disabled in chat mode.")
-    _HAS_KEYBOARD = False
+# <<< MODIFIED: Removed keyboard import >>>
 
 # --- Optimizer Selection (Handles CUDA, bitsandbytes, and CPU fallback) ---
 _HAS_BNB = False # Default assumption
@@ -379,7 +375,7 @@ class PTChunkedDataset(Dataset):
                     print(f"Warning: Cache inconsistency for file {chunk_path}. Reloading.")
                     self.last_loaded_data = torch.load(chunk_path, map_location='cpu')
                     if not isinstance(self.last_loaded_data, list):
-                         raise TypeError(f"Loaded data from {chunk_path} is not a list.")
+                            raise TypeError(f"Loaded data from {chunk_path} is not a list.")
                 # Retrieve the specific chunk dictionary from the cached list
                 data = self.last_loaded_data[index_in_file]
 
@@ -1638,7 +1634,7 @@ def train(args, device, tokenizer):
             if use_pre_pt:
                  print("INFO: Loading pre-chunked .pt tensors (map-style, resuming).")
                  dataloader = create_dataloader_pt_chunked(
-                     train_path_for_loader, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
+                    train_path_for_loader, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
                  )
                  dataloader_len = len(dataloader)
                  print(f"INFO: DataLoader created with {dataloader_len} batches.")
@@ -1735,8 +1731,8 @@ def train(args, device, tokenizer):
                 if lr_mismatch or min_lr_mismatch:
                     print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                     print("!!! WARNING: New LR flags detected but --override-scheduling was not set.             !!!")
-                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.                  !!!")
-                    print(f"!!!   Loading old schedule state (LR: {old_lr}, Min LR: {old_min_lr}).                      !!!")
+                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.                    !!!")
+                    print(f"!!!   Loading old schedule state (LR: {old_lr}, Min LR: {old_min_lr}).                     !!!")
                     print("!!!   To use your new LR flags, add --override-scheduling to your command.            !!!")
                     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 
@@ -2373,10 +2369,36 @@ def quantize(args, device, model=None, tokenizer=None, out_dir=None):
     export_and_quantize_model(out_dir, model, tokenizer, qtype=args.qtype)
 
 
-# <<< CHAT Function >>>
-# ... (chat remains unchanged) ...
+# <<< MODIFIED: Signal handling setup >>>
+_interrupt_flag = False
+_original_sigint_handler = None
+
+def _handle_interrupt(sig, frame):
+    """Sets the interrupt flag when SIGINT (Ctrl+C) is received."""
+    global _interrupt_flag
+    if not _interrupt_flag: # Prevent multiple prints if Ctrl+C is held
+        print("\n[Interrupt received. Finishing current generation... Press Ctrl+C again to force exit.]", flush=True)
+        _interrupt_flag = True
+    else:
+        # If interrupted again, restore original handler and exit
+        print("\n[Forcing exit...]", flush=True)
+        if _original_sigint_handler:
+            signal.signal(signal.SIGINT, _original_sigint_handler)
+        sys.exit(1)
+
+# <<< CHAT Function (Modified) >>>
 def chat(args, device, tokenizer):
     print("Running in CHAT mode...")
+
+    # <<< MODIFIED: Setup signal handler >>>
+    global _interrupt_flag, _original_sigint_handler
+    _interrupt_flag = False # Reset flag at start
+    _original_sigint_handler = signal.getsignal(signal.SIGINT)
+    try:
+        signal.signal(signal.SIGINT, _handle_interrupt)
+    except ValueError as e: # Handle potential issues registering handler (e.g., non-main thread)
+        print(f"Warning: Could not set SIGINT handler: {e}. Ctrl+C interrupt may not work gracefully.")
+        _original_sigint_handler = None # Ensure we don't try to restore a non-existent handler
 
     model = None
     shadow_model = None
@@ -2505,15 +2527,22 @@ def chat(args, device, tokenizer):
     print("Use '/filter time=-<seconds>' or '/filter source=<id>' to constrain memory.")
     print("Example: /filter time=-3600  (memories from the last hour)")
     print("Use '/filter reset' to clear memory filters.")
-    if _HAS_KEYBOARD:
-        print("Press Ctrl+X to stop generation at any time.")
+    # <<< MODIFIED: Updated interrupt message >>>
+    print("Press Ctrl+C to stop generation at any time.")
     print("="*50)
 
     try:
         min_ts_filter = 0.0
         source_id_filter = None
         while True:
-            prompt = input(">>> ")
+            # <<< MODIFIED: Reset interrupt flag before getting input >>>
+            _interrupt_flag = False
+            try:
+                prompt = input(">>> ")
+            except EOFError: # Handle case where input stream ends unexpectedly
+                print("\n[EOF detected. Exiting chat.]")
+                break
+
             if prompt.lower() in ["exit", "quit"]:
                 break
 
@@ -2572,7 +2601,9 @@ def chat(args, device, tokenizer):
             # Generation loop uses no_grad
             with torch.no_grad():
                 for i in range(args.max_new_tokens):
-                    if _HAS_KEYBOARD and keyboard.is_pressed('ctrl+x'):
+                    # <<< MODIFIED: Check signal interrupt flag >>>
+                    if _interrupt_flag:
+                        _interrupt_flag = False # Reset flag for next turn
                         print("\n[Generation interrupted by user.]", end="", flush=True)
                         break
 
@@ -2746,6 +2777,10 @@ def chat(args, device, tokenizer):
         print("\n\n[Ctrl+C detected. Exiting chat.]")
 
     finally:
+        # <<< MODIFIED: Restore original signal handler >>>
+        if _original_sigint_handler:
+            signal.signal(signal.SIGINT, _original_sigint_handler)
+
         # --- SAVE ON EXIT LOGIC ---
         updatable_model = shadow_model if is_quantized and args.enable_quantized_learning else model
 
