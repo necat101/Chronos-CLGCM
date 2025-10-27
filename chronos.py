@@ -8,21 +8,32 @@ from typing import Optional, Tuple
 from tqdm import tqdm
 import traceback # Added for better error reporting
 import signal # <<< MODIFIED: Import signal >>>
+import math # For ceil in dataset chunking (though that script is separate)
 
 # <<< MODIFIED: Set Tokenizers Parallelism Environment Variable >>>
 # Set this early, before tokenizers might be implicitly loaded by other imports
 # Setting to "true" forces parallelism despite potential fork issues (use with caution)
 # Setting to "false" explicitly disables parallelism in worker processes (safer, suppresses warning)
-os.environ["TOKENIZERS_PARALLELISM"] = "false" # Set to false for safety
+os.environ["TOKENIZERS_PARALLELISM"] = "true" # Set to false for safety
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# <<< MODIFIED: Import IterableDataset >>>
+# <<< MODIFIED: Import IterableDataset and Dataset >>>
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 from transformers import AutoTokenizer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.serialization import safe_globals # May not be needed if not using legacy save/load
+
+# <<< NEW: Import Hugging Face datasets library >>>
+try:
+    from datasets import load_dataset
+    _HAS_HF_DATASETS = True
+except ImportError:
+    print("Warning: 'datasets' library not found. Loading datasets from Hugging Face Hub or local files (e.g., CSV) using --hf_dataset will be unavailable.")
+    print("         Please install it: pip install datasets")
+    _HAS_HF_DATASETS = False
+
 
 # --- Optional Imports ---
 try:
@@ -112,18 +123,17 @@ try:
         _HAS_VULKAN = False
 except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print("!!! ERROR: The compiled C++ kernel 'chronos_matmul' was not found.           !!!")
+    print("!!! WARNING: The compiled C++ kernel 'chronos_matmul' was not found.        !!!")
+    print("!!!          Quantization and quantized inference will be unavailable.      !!!")
     print("!!!                                                                         !!!")
-    print("!!! To fix this, please run the appropriate setup script:                   !!!")
+    print("!!! To enable these features, please run the appropriate setup script:      !!!")
     print("!!!  - On Windows:   Run setup.bat                                          !!!")
-    print("!!!  - On Linux/macOS: Run bash setup.sh                                      !!!")
+    print("!!!  - On Linux/macOS: Run bash setup.sh                                    !!!")
     print("!!!                                                                         !!!")
-    print("!!! If you have already run the setup, you may need to activate the         !!!")
-    print("!!! virtual environment first:                                              !!!")
-    print("!!!  - On Windows:   .\\.venv\\Scripts\\Activate                              !!!")
-    print("!!!  - On Linux/macOS: source .venv/bin/activate                              !!!")
+    print("!!! Make sure you have CMake and a C++ compiler installed.                  !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    sys.exit(1) # Exit the program because the kernel is essential
+    _HAS_KERNEL = False
+    _HAS_VULKAN = False
 
 
 # --- CONSTANTS ---
@@ -395,16 +405,16 @@ class PTChunkedDataset(Dataset):
 
             # --- Validation (Optional but recommended) ---
             if not isinstance(data, dict):
-                 raise TypeError(f"Chunk at index {index_in_file} in {chunk_path} is not a dictionary.")
+                raise TypeError(f"Chunk at index {index_in_file} in {chunk_path} is not a dictionary.")
             if not all(k in data for k in ["input_ids", "labels", "attention_mask"]):
                 print(f"Warning: Chunk dict at index {index_in_file} in {chunk_path} missing required keys. Skipping.")
                 return None # Indicate failure
             if not all(isinstance(data[k], torch.Tensor) for k in ["input_ids", "labels", "attention_mask"]):
-                 print(f"Warning: Data in chunk dict at index {index_in_file} in {chunk_path} are not tensors. Skipping.")
-                 return None
+                print(f"Warning: Data in chunk dict at index {index_in_file} in {chunk_path} are not tensors. Skipping.")
+                return None
             if data["input_ids"].shape[0] != self.max_length:
-                 print(f"Warning: Chunk tensor 'input_ids' at index {index_in_file} in {chunk_path} has unexpected length {data['input_ids'].shape[0]}. Expected {self.max_length}. Skipping.")
-                 return None
+                print(f"Warning: Chunk tensor 'input_ids' at index {index_in_file} in {chunk_path} has unexpected length {data['input_ids'].shape[0]}. Expected {self.max_length}. Skipping.")
+                return None
             # --- End Validation ---
 
             return data
@@ -474,73 +484,118 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
 
 # <<< END: Modified Map-Style Dataset/Loader for Consolidated PT Tensors >>>
 
-# <<< START: Original Dataset/Loader (Renamed) - NO CHANGES NEEDED HERE >>>
+
+# <<< START: Utility function for processing text based on args (shared by JSONL and HF dataset) >>>
+def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode: bool = False,
+                        text_column: Optional[str] = None,
+                        prompt_column: Optional[str] = None, completion_column: Optional[str] = None):
+    """
+    Processes a dictionary containing text into tokenized input_ids and labels
+    based on the specified mode (Kayla, instruction tuning, or text completion).
+    Returns a dictionary {"input_ids": tensor, "labels": tensor} or None on error.
+    """
+    input_ids = []
+    labels = []
+
+    try:
+        if text_column:
+            # --- Text Completion Mode (e.g., pre-training) ---
+            text = text_dict.get(text_column, "")
+            if not isinstance(text, str): text = str(text) # Attempt conversion
+            if not text: return None # Skip empty text
+
+            input_ids = tokenizer.encode(text, add_special_tokens=True) + [tokenizer.eos_token_id]
+            labels = list(input_ids) # Predict every token
+
+        elif prompt_column and completion_column:
+            # --- Instruction Tuning Mode (Standard or Kayla) ---
+            if kayla_mode:
+                # --- Kayla Format ---
+                instruction = text_dict.get(prompt_column, "") # Use prompt_column for instruction
+                completion = text_dict.get(completion_column, "") # Use completion_column for output
+                # Assumes 'feelings' and 'thought-process' are also present in text_dict if needed
+                feelings = text_dict.get('feelings', '')
+                thought = text_dict.get('thought-process', '')
+
+                if not isinstance(instruction, str): instruction = str(instruction)
+                if not isinstance(completion, str): completion = str(completion)
+                if not isinstance(feelings, str): feelings = str(feelings)
+                if not isinstance(thought, str): thought = str(thought)
+
+
+                instruction_text = f"### Instruction:\n{instruction}\n\n"
+                feelings_text = f"### Feelings:\n{feelings}\n\n" if feelings else ""
+                prompt_context_text = instruction_text + feelings_text
+                thought_text = f"### Thought Process:\n{thought}\n\n"
+                output_text = f"### Response:\n{completion}"
+
+                prompt_context_tokens = tokenizer.encode(prompt_context_text, add_special_tokens=True)
+                thought_tokens = tokenizer.encode(thought_text, add_special_tokens=False)
+                output_tokens = tokenizer.encode(output_text, add_special_tokens=False)
+
+                input_ids = prompt_context_tokens + thought_tokens + output_tokens + [tokenizer.eos_token_id]
+                labels = ([-100] * len(prompt_context_tokens)) + thought_tokens + output_tokens + [tokenizer.eos_token_id]
+
+            else:
+                # --- Standard Format ---
+                prompt_text = text_dict.get(prompt_column, "")
+                completion_text = text_dict.get(completion_column, "")
+                if not isinstance(prompt_text, str): prompt_text = str(prompt_text)
+                if not isinstance(completion_text, str): completion_text = str(completion_text)
+
+                # Format like Alpaca
+                prompt_formatted = f"### Instruction:\n{prompt_text}\n\n### Response:\n"
+
+                prompt_tokens = tokenizer.encode(prompt_formatted, add_special_tokens=True)
+                completion_tokens = tokenizer.encode(completion_text, add_special_tokens=False)
+
+                input_ids = prompt_tokens + completion_tokens + [tokenizer.eos_token_id]
+                labels = ([-100] * len(prompt_tokens)) + completion_tokens + [tokenizer.eos_token_id]
+
+        else:
+            # Invalid configuration or missing required columns
+            # Try a default 'text' column if nothing else specified
+            text = text_dict.get('text', "")
+            if isinstance(text, str) and text:
+                print("Warning: No text/prompt/completion columns specified. Falling back to 'text' column for text completion.")
+                input_ids = tokenizer.encode(text, add_special_tokens=True) + [tokenizer.eos_token_id]
+                labels = list(input_ids)
+            else:
+                 print(f"Warning: Skipping data entry due to missing or invalid text columns: {list(text_dict.keys())}")
+                 return None # Skip this sample
+
+        # --- Truncation ---
+        if len(input_ids) > max_length:
+            input_ids = input_ids[:max_length-1] + [tokenizer.eos_token_id]
+            labels = labels[:max_length-1] + [tokenizer.eos_token_id]
+
+        # Padding is handled by the collate function
+        return {"input_ids": torch.tensor(input_ids, dtype=torch.long), "labels": torch.tensor(labels, dtype=torch.long)}
+
+    except Exception as e:
+        obj_repr = str(text_dict)
+        print(f"Warning: Skipping invalid data entry: {obj_repr[:150] + ('...' if len(obj_repr) > 150 else '')}. Error: {e}")
+        traceback.print_exc(limit=1)
+        return None
+
+# <<< END: Utility function for processing text >>>
+
+
+# <<< START: Original Dataset/Loader (Renamed) - Modified to use process_text_sample >>>
 class OriginalJSONLDataset(Dataset):
     """
     Handles both .jsonl (one JSON object per line) and .json (a list of objects) files.
-    Also supports standard and "Kayla" instruction formats.
+    Also supports standard and "Kayla" instruction formats using standard keys like
+    'instruction', 'output', 'Instruction', 'thought-process', 'feelings'.
     Tokenizes data on the fly. Loads everything into RAM.
     """
     def __init__(self, path: str, tokenizer, max_length: int, kayla_mode: bool = False):
-        super().__init__() # Add this if not present in your original code
+        super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = []
         self.kayla_mode = kayla_mode
         self._load(path)
-
-    def _process_object(self, obj):
-        """Processes a single JSON object into tokenized input_ids and labels."""
-        try:
-            if self.kayla_mode:
-                # --- Context part (masked out in labels) ---
-                instruction_text = f"### Instruction:\n{obj.get('Instruction', '')}\n\n"
-
-                feelings_text = ""
-                # Check for the feelings key and ensure it has content to include it
-                if obj.get('feelings'):
-                    feelings_text = f"### Feelings:\n{obj.get('feelings')}\n\n"
-
-                # The full prompt context is instruction + feelings
-                prompt_context_text = instruction_text + feelings_text
-
-                # --- Generation part (predicted by the model) ---
-                thought_text = f"### Thought Process:\n{obj.get('thought-process', '')}\n\n"
-                output_text = f"### Response:\n{obj.get('output', '')}" # No trailing newlines for response
-
-                # Tokenize the different parts
-                prompt_context_tokens = self.tokenizer.encode(prompt_context_text, add_special_tokens=True) # Add special tokens ONLY here
-                thought_tokens = self.tokenizer.encode(thought_text, add_special_tokens=False)
-                output_tokens = self.tokenizer.encode(output_text, add_special_tokens=False)
-
-                # Combine into final input_ids and labels
-                input_ids = prompt_context_tokens + thought_tokens + output_tokens + [self.tokenizer.eos_token_id]
-                # Labels: Mask prompt context, keep thought and output
-                labels = ([-100] * len(prompt_context_tokens)) + thought_tokens + output_tokens + [self.tokenizer.eos_token_id]
-            else: # Standard format
-                prompt = f"### Instruction:\n{obj.get('instruction', '')}\n\n### Response:\n"
-                completion = obj.get('output', '') or obj.get('response', '')
-
-                prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=True) # Add special tokens ONLY here
-                completion_tokens = self.tokenizer.encode(completion, add_special_tokens=False)
-
-                input_ids = prompt_tokens + completion_tokens + [self.tokenizer.eos_token_id]
-                labels = ([-100] * len(prompt_tokens)) + completion_tokens + [self.tokenizer.eos_token_id]
-
-            # Truncate if necessary AFTER combining all parts
-            if len(input_ids) > self.max_length:
-                # Truncate from the right, ensuring EOS is kept if possible
-                input_ids = input_ids[:self.max_length-1] + [self.tokenizer.eos_token_id]
-                labels = labels[:self.max_length-1] + [self.tokenizer.eos_token_id]
-            # Padding is handled by the collate function
-
-            return {"input_ids": torch.tensor(input_ids, dtype=torch.long), "labels": torch.tensor(labels, dtype=torch.long)}
-        except (KeyError, AttributeError, TypeError, ValueError) as e:
-            # Added more robust error logging
-            obj_repr = str(obj)
-            print(f"Warning: Skipping invalid data entry: {obj_repr[:150] + ('...' if len(obj_repr) > 150 else '')}. Error: {e}")
-            return None
-
 
     def _load(self, path):
         if not os.path.exists(path):
@@ -560,7 +615,12 @@ class OriginalJSONLDataset(Dataset):
                 if isinstance(data, list):
                     print("Detected JSON file (list of objects). Processing...")
                     for obj in tqdm(data, desc="Tokenizing samples"):
-                        processed = self._process_object(obj)
+                        # <<< MODIFIED: Use shared processing function >>>
+                        processed = process_text_sample(
+                            self.tokenizer, obj, self.max_length, self.kayla_mode,
+                            prompt_column='instruction', # Default keys for JSONL
+                            completion_column='output'
+                        )
                         if processed:
                             self.samples.append(processed)
                         else:
@@ -585,17 +645,25 @@ class OriginalJSONLDataset(Dataset):
                 if not line: continue
                 try:
                     obj = json.loads(line)
-                    processed = self._process_object(obj)
+                    # <<< MODIFIED: Use shared processing function >>>
+                    processed = process_text_sample(
+                        self.tokenizer, obj, self.max_length, self.kayla_mode,
+                        prompt_column='instruction', # Default keys for JSONL
+                        completion_column='output'
+                    )
                     if processed:
                         self.samples.append(processed)
                     else:
                         skipped_count += 1
                 except json.JSONDecodeError:
-                    print(f"Warning: Skipping invalid JSON on line {line_num}: {line[:100]}...")
+                    # Reduce verbosity
+                    if skipped_count % 1000 == 0:
+                        print(f"\nWarning: Skipping invalid JSON on line ~{line_num}: {line[:100]}...")
                     skipped_count += 1
                     continue
                 except Exception as e:
-                    print(f"Warning: Error processing line {line_num}: {e}. Line: {line[:100]}...")
+                    if skipped_count % 1000 == 0:
+                        print(f"\nWarning: Error processing line ~{line_num}: {e}. Line: {line[:100]}...")
                     skipped_count += 1
                     continue
 
@@ -608,22 +676,80 @@ class OriginalJSONLDataset(Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
-def create_dataloader_original(path, tokenizer, max_length, batch_size, pad_token_id, kayla_mode=False, num_workers=0):
-    """Creates a DataLoader for training or fine-tuning from original format, handling tokenization and padding."""
-    dataset = OriginalJSONLDataset(path, tokenizer, max_length, kayla_mode=kayla_mode) # Use original dataset class
-    if len(dataset) == 0:
-        raise ValueError(f"Dataset loaded from {path} is empty or invalid after processing.")
+# <<< NEW: Hugging Face Map-Style Dataset Class >>>
+class HuggingFaceMapStyleDataset(Dataset):
+    """
+    Wraps a Hugging Face dataset (already loaded) for use with Chronos.
+    Handles tokenization and formatting on the fly based on specified columns.
+    """
+    def __init__(self, hf_dataset, tokenizer, max_length: int, kayla_mode: bool = False,
+                 text_column: Optional[str] = None,
+                 prompt_column: Optional[str] = None, completion_column: Optional[str] = None):
+        super().__init__()
+        self.hf_dataset = hf_dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.kayla_mode = kayla_mode
+        self.text_column = text_column
+        self.prompt_column = prompt_column
+        self.completion_column = completion_column
 
-    def collate_fn_original(batch):
-        # Filter out None items potentially returned by dataset __getitem__ if _process_object failed
+        # --- Validate column existence ---
+        ds_columns = hf_dataset.column_names
+        if self.text_column and self.text_column not in ds_columns:
+            raise ValueError(f"Specified text_column '{self.text_column}' not found in dataset columns: {ds_columns}")
+        if self.prompt_column and self.prompt_column not in ds_columns:
+            raise ValueError(f"Specified prompt_column '{self.prompt_column}' not found in dataset columns: {ds_columns}")
+        if self.completion_column and self.completion_column not in ds_columns:
+             raise ValueError(f"Specified completion_column '{self.completion_column}' not found in dataset columns: {ds_columns}")
+        if not self.text_column and not (self.prompt_column and self.completion_column):
+            if 'text' in ds_columns:
+                print(f"Warning: No specific columns provided, defaulting to using 'text' column for text completion.")
+                self.text_column = 'text' # Default fallback
+            else:
+                raise ValueError(f"Must specify either --text_column OR (--prompt_column AND --completion_column). Available columns: {ds_columns}")
+
+
+    def __len__(self):
+        return len(self.hf_dataset)
+
+    def __getitem__(self, idx):
+        # Fetch the raw data entry from the Hugging Face dataset
+        raw_item = self.hf_dataset[idx]
+        if not isinstance(raw_item, dict):
+            print(f"Warning: Unexpected data type from HF dataset at index {idx}: {type(raw_item)}. Skipping.")
+            return None # Should return None to be filtered by collate_fn
+
+        # Process the text using the shared utility function
+        processed = process_text_sample(
+            self.tokenizer, raw_item, self.max_length, self.kayla_mode,
+            self.text_column, self.prompt_column, self.completion_column
+        )
+        return processed # process_text_sample returns None on error
+
+
+# <<< Modified original dataloader creator function to handle ANY map-style dataset >>>
+def create_map_style_dataloader(
+    dataset: Dataset, # Accepts OriginalJSONLDataset or HuggingFaceMapStyleDataset
+    batch_size: int,
+    pad_token_id: int,
+    num_workers: int = 0,
+    shuffle: bool = True
+):
+    """
+    Creates a DataLoader for map-style datasets (like OriginalJSONLDataset or HuggingFaceMapStyleDataset),
+    handling dynamic padding.
+    """
+    if len(dataset) == 0:
+        raise ValueError("Dataset provided to create_map_style_dataloader is empty or invalid.")
+
+    def collate_fn_dynamic_padding(batch):
+        # Filter out None items potentially returned by dataset __getitem__ if processing failed
         batch = [item for item in batch if item is not None]
         if not batch: return None # Return None if batch becomes empty
 
         # Find max length *in this batch* for dynamic padding
         max_len_batch = max(len(item['input_ids']) for item in batch)
-        # Ensure max_len_batch doesn't exceed the model's max_length capability
-        # Note: dataset already truncated items longer than max_length
-        # max_len_batch = min(max_len_batch, max_length) # Should not be necessary if dataset truncates
 
         input_ids_batch = torch.full((len(batch), max_len_batch), pad_token_id, dtype=torch.long)
         labels_batch = torch.full((len(batch), max_len_batch), -100, dtype=torch.long) # Use -100 for padding labels
@@ -644,13 +770,14 @@ def create_dataloader_original(path, tokenizer, max_length, batch_size, pad_toke
 
     pin_memory = torch.cuda.is_available() and num_workers > 0
     persistent_workers = num_workers > 0
-    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_original, shuffle=True,
+    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_dynamic_padding, shuffle=shuffle,
                       num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
-# <<< END: Original Dataset/Loader (Renamed) >>>
+
+# <<< END: Dataloader modifications >>>
 
 
 # --- Quantization & Model Serialization ---
-# ... (Quantization code remains unchanged) ...
+# ... (Quantization code remains unchanged - assuming chronos_matmul is available) ...
 def get_q_block_size(qtype: str) -> int:
     """Returns the block size for a given quantization type."""
     if qtype in ["INT4", "Q4_0", "Q8_0"]:
@@ -1052,6 +1179,7 @@ class ChronosCore(nn.Module):
         tok_embs = self.tok_emb(input_ids)
         # Handle potential sequence length exceeding max_length for position embeddings
         pos_indices = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        # <<< FIX: Use model's configured max_length >>>
         pos_indices = pos_indices % self.config.max_length # Use modulo for positions beyond max_length
         pos_embs = self.pos_emb(pos_indices)
 
@@ -1222,6 +1350,9 @@ class QuantizedChronos:
     # ... (QuantizedChronos remains unchanged) ...
     """The quantized Chronos model for CPU/Vulkan inference."""
     def __init__(self, config: dict, q_data: dict):
+        if not _HAS_KERNEL:
+            raise ImportError("Cannot initialize QuantizedChronos: C++ kernel not found.")
+
         self.config = AttrDict(config)
         self.qtype = None # Will be determined from the first quantized layer
 
@@ -1371,6 +1502,9 @@ class QuantizedChronos:
 
 def load_quantized(model_path: str):
     """Loads a quantized model directory, automatically finding the .npz and tokenizer."""
+    if not _HAS_KERNEL:
+        raise ImportError("Cannot load quantized model: C++ kernel not found.")
+
     print(f"Loading quantized model from directory: {model_path}")
 
     # Find the .npz file in the directory
@@ -1449,30 +1583,24 @@ def load_full_model_with_config(model_path: str, device):
     return model, config # Return model and AttrDict config
 
 
-def train(args, device, tokenizer):
+def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass dataloader in
     print("Running in TRAIN mode...")
     config = vars(args) # Start with CLI args
-    # Ensure train data path is saved in config for potential resume with auto-max-length
-    config['train_data_path'] = args.train
+    # Ensure train data path or HF dataset name is saved in config
+    if args.hf_dataset:
+        config['hf_dataset'] = args.hf_dataset
+        config['hf_dataset_config'] = args.hf_dataset_config
+        config['hf_dataset_split'] = args.hf_dataset_split
+    else:
+        config['train_data_path'] = args.train
     config['model_type'] = 'chronos' # Ensure model_type is set
     # <<< MODIFIED: Save dataset type flags in config >>>
     config['pre_chunked_dataset'] = args.pre_chunked_dataset
     config['pre_pt_dataset'] = args.pre_pt_dataset
+    config['is_hf_dataset'] = bool(args.hf_dataset) # Save flag for HF dataset usage
 
-    # --- Determine vocab_size ---
-    current_vocab_size = None
-    if tokenizer:
-        current_vocab_size = len(tokenizer)
-        # If starting fresh AND not loading from a model_path, ensure config gets the vocab_size
-        if not args.resume_from_ckpt and not args.model_path and 'vocab_size' not in config:
-            config['vocab_size'] = current_vocab_size
-        # Special case: If vocab_size was set in args due to adding pad token, use that
-        elif 'vocab_size' in config and config['vocab_size'] != current_vocab_size and not args.resume_from_ckpt and not args.model_path:
-            print(f"INFO: Using vocab_size {config['vocab_size']} from args (likely due to added pad token).")
-        # For resume/load, vocab_size from checkpoint takes precedence later.
-    elif not args.resume_from_ckpt and not args.model_path:
-        # Should not happen if tokenizer loading in main is correct
-        raise RuntimeError("Tokenizer not loaded, cannot determine vocab_size for new model.")
+    # --- Determine vocab_size (already handled during tokenizer load) ---
+    current_vocab_size = len(tokenizer) if tokenizer else None
 
     model = None # Initialize model variable
     optimizer = None # Initialize optimizer variable
@@ -1482,10 +1610,7 @@ def train(args, device, tokenizer):
     scheduler = None # Initialize scheduler
     use_amp = args.amp and _HAS_AMP # Determine AMP usage early
 
-    # --- Dataloader creation moved inside resume/load checks ---
-    dataloader = None
-    dataloader_len = 0 # Length is unknown for iterable dataset
-
+    # --- Dataloader creation moved to main() ---
 
     # --- Handle starting from an existing model directory ---
     if args.model_path and not args.resume_from_ckpt:
@@ -1507,46 +1632,20 @@ def train(args, device, tokenizer):
             elif 'vocab_size' not in model_config:
                 raise ValueError("Cannot determine vocab_size: Not found in loaded model config and tokenizer not available.")
 
-            # <<< Create Dataloader AFTER model is loaded/configured >>>
-            try:
-                # Use max_length from the loaded model config if not overridden by args
-                max_len_for_loader = args.max_length if args.max_length is not None else model_config.max_length
-                if max_len_for_loader is None: raise ValueError("max_length not found in args or loaded config.")
-
-                # <<< MODIFIED: Conditional Dataloader Creation >>>
-                if args.pre_pt_dataset:
-                    print("INFO: Loading pre-chunked .pt tensors (map-style).")
-                    dataloader = create_dataloader_pt_chunked(
-                        args.train, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
-                    )
-                    dataloader_len = len(dataloader) # Map-style dataset has length
-                    print(f"INFO: DataLoader created with {dataloader_len} batches.")
-                elif args.pre_chunked_dataset:
-                    print("INFO: Loading pre-chunked JSONL dataset (iterable).")
-                    dataloader = create_dataloader_for_chunked(
-                        args.train, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
-                    )
-                    # Estimate length for scheduler
-                    try:
-                        with open(args.train, 'r') as f:
-                            estimated_lines = sum(1 for _ in f)
-                            dataloader_len = estimated_lines // args.batch_size # Rough estimate
-                            print(f"INFO: Estimated DataLoader length (for scheduler): {dataloader_len} batches.")
-                    except:
-                            print("Warning: Could not estimate dataset length for scheduler. Using placeholder T_max=100000.")
-                            dataloader_len = 100000 # Placeholder large number
-                else:
-                    print("INFO: Loading and tokenizing dataset on the fly (map-style).")
-                    dataloader = create_dataloader_original(
-                        args.train, tokenizer, max_len_for_loader, args.batch_size,
-                        tokenizer.pad_token_id, kayla_mode=args.kayla, num_workers=args.num_workers
-                    )
-                    if dataloader is None: raise ValueError("DataLoader creation failed.")
-                    dataloader_len = len(dataloader) # Map-style dataset has length
-                    print(f"INFO: DataLoader created with {dataloader_len} batches.")
-
-            except Exception as e:
-                print(f"ERROR creating DataLoader: {e}"); traceback.print_exc(); sys.exit(1)
+            # <<< Ensure max_length from CLI is used if provided, otherwise from loaded config >>>
+            if args.max_length and args.max_length != model_config.max_length:
+                 print(f"INFO: Overriding loaded model max_length ({model_config.max_length}) with CLI value ({args.max_length}).")
+                 model_config.max_length = args.max_length
+                 # Re-init pos_emb if necessary
+                 model.pos_emb = nn.Embedding(model_config.max_length, model_config.context_dim).to(device)
+            elif 'max_length' not in model_config and args.max_length:
+                 print(f"INFO: max_length missing from loaded config. Using CLI value ({args.max_length}).")
+                 model_config.max_length = args.max_length
+                 model.pos_emb = nn.Embedding(model_config.max_length, model_config.context_dim).to(device)
+            elif 'max_length' not in model_config:
+                 print(f"Warning: max_length missing from loaded config and CLI. Using default 1024.")
+                 model_config.max_length = 1024
+                 model.pos_emb = nn.Embedding(model_config.max_length, model_config.context_dim).to(device)
 
 
             # --- Initialize optimizer, scaler, scheduler FRESH ---
@@ -1600,12 +1699,23 @@ def train(args, device, tokenizer):
             elif current_vocab_size is not None and model_config.vocab_size != current_vocab_size:
                 print(f"Warning: Checkpoint vocab_size ({model_config.vocab_size}) differs from loaded tokenizer ({current_vocab_size}). Using checkpoint value.")
 
+            # <<< Ensure max_length consistency, prioritize CLI arg >>>
+            if args.max_length and args.max_length != model_config.max_length:
+                 print(f"INFO: Overriding checkpoint max_length ({model_config.max_length}) with CLI value ({args.max_length}).")
+                 model_config.max_length = args.max_length
+            elif 'max_length' not in model_config and args.max_length:
+                 print(f"INFO: max_length missing from checkpoint config. Using CLI value ({args.max_length}).")
+                 model_config.max_length = args.max_length
+            elif 'max_length' not in model_config:
+                 print(f"Warning: max_length missing from checkpoint config and CLI. Using default 1024.")
+                 model_config.max_length = 1024
+
             # Ensure model_type is present for HuggingFace compatibility
             if 'model_type' not in model_config:
                 model_config['model_type'] = 'chronos'
 
             print("INFO: Re-initializing model architecture from checkpoint config.")
-            model = ChronosCore(model_config).to(device) # Create model AFTER potentially fixing vocab_size
+            model = ChronosCore(model_config).to(device) # Create model AFTER potentially fixing vocab_size/max_length
         else:
             print("Warning: Config not found in checkpoint. Using current CLI args for model architecture.")
             cli_config = config # Use the initial config from vars(args)
@@ -1613,59 +1723,13 @@ def train(args, device, tokenizer):
                 cli_config['vocab_size'] = current_vocab_size
             elif 'vocab_size' not in cli_config:
                 raise ValueError("Cannot determine vocab_size: Not found in checkpoint or CLI args, and tokenizer not loaded.")
+            # <<< Ensure max_length is set in cli_config >>>
+            if 'max_length' not in cli_config and args.max_length:
+                cli_config['max_length'] = args.max_length
+            elif 'max_length' not in cli_config:
+                cli_config['max_length'] = 1024 # Default
             model_config = AttrDict(cli_config) # Fallback, might cause issues if arch changed
             model = ChronosCore(model_config).to(device)
-
-
-        # <<< Create Dataloader AFTER model config is determined >>>
-        # Determine train path from config if not given via CLI
-        train_path_for_loader = args.train if args.train else model_config.get('train_data_path')
-        if not train_path_for_loader:
-            raise ValueError("Training data path not found in CLI args or checkpoint config during resume.")
-        try:
-            # Use max_length from args if provided, else from checkpoint config
-            max_len_for_loader = args.max_length if args.max_length is not None else model_config.get('max_length')
-            if max_len_for_loader is None: raise ValueError("max_length not found in args or checkpoint config during resume.")
-
-            # <<< MODIFIED: Determine dataset type based on flags or saved config >>>
-            use_pre_pt = args.pre_pt_dataset or model_config.get('pre_pt_dataset', False)
-            use_pre_jsonl = args.pre_chunked_dataset or model_config.get('pre_chunked_dataset', False)
-
-            if use_pre_pt:
-                 print("INFO: Loading pre-chunked .pt tensors (map-style, resuming).")
-                 dataloader = create_dataloader_pt_chunked(
-                    train_path_for_loader, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
-                 )
-                 dataloader_len = len(dataloader)
-                 print(f"INFO: DataLoader created with {dataloader_len} batches.")
-            elif use_pre_jsonl:
-                print("INFO: Loading pre-chunked JSONL dataset (iterable, resuming).")
-                dataloader = create_dataloader_for_chunked(
-                    train_path_for_loader, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
-                )
-                # Estimate length for scheduler
-                try:
-                    with open(train_path_for_loader, 'r') as f:
-                        estimated_lines = sum(1 for _ in f)
-                        dataloader_len = estimated_lines // args.batch_size # Rough estimate
-                        print(f"INFO: Estimated DataLoader length (for scheduler): {dataloader_len} batches.")
-                except:
-                        print("Warning: Could not estimate dataset length for scheduler. Using placeholder T_max=100000.")
-                        dataloader_len = 100000 # Placeholder
-            else:
-                print("INFO: Loading and tokenizing dataset on the fly (map-style, resuming).")
-                # Determine kayla mode based on flag or potentially from config
-                use_kayla = args.kayla or model_config.get('kayla', False)
-                dataloader = create_dataloader_original(
-                    train_path_for_loader, tokenizer, max_len_for_loader, args.batch_size,
-                    tokenizer.pad_token_id, kayla_mode=use_kayla, num_workers=args.num_workers
-                )
-                if dataloader is None: raise ValueError("DataLoader creation failed.")
-                dataloader_len = len(dataloader)
-                print(f"INFO: DataLoader created with {dataloader_len} batches.")
-
-        except Exception as e:
-            print(f"ERROR creating DataLoader during resume: {e}"); traceback.print_exc(); sys.exit(1)
 
 
         # --- Optimizer Initialization/Loading Logic ---
@@ -1731,9 +1795,9 @@ def train(args, device, tokenizer):
                 if lr_mismatch or min_lr_mismatch:
                     print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                     print("!!! WARNING: New LR flags detected but --override-scheduling was not set.             !!!")
-                    print(f"!!!   Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.                    !!!")
-                    print(f"!!!   Loading old schedule state (LR: {old_lr}, Min LR: {old_min_lr}).                     !!!")
-                    print("!!!   To use your new LR flags, add --override-scheduling to your command.            !!!")
+                    print(f"!!!  Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.                  !!!")
+                    print(f"!!!  Loading old schedule state (LR: {old_lr}, Min LR: {old_min_lr}).                       !!!")
+                    print("!!!  To use your new LR flags, add --override-scheduling to your command.           !!!")
                     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 
                 print("Resuming learning rate scheduler state.")
@@ -1777,52 +1841,12 @@ def train(args, device, tokenizer):
             if args.max_length:
                 config['max_length'] = args.max_length
             else:
+                # Should have defaulted or been set by auto-scan by now
                 raise ValueError("max_length not determined for new model (use --max_length or --auto-max-length).")
 
         model = ChronosCore(config).to(device)
         optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
         model_config = AttrDict(config) # Use the potentially updated CLI args config
-
-        # <<< Create Dataloader AFTER model is created >>>
-        try:
-            # Use max_length from args
-            max_len_for_loader = args.max_length
-            if max_len_for_loader is None: raise ValueError("max_length not set for dataloader.")
-
-            # <<< MODIFIED: Conditional Dataloader Creation >>>
-            if args.pre_pt_dataset:
-                print("INFO: Loading pre-chunked .pt tensors (map-style).")
-                dataloader = create_dataloader_pt_chunked(
-                    args.train, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
-                )
-                dataloader_len = len(dataloader)
-                print(f"INFO: DataLoader created with {dataloader_len} batches.")
-            elif args.pre_chunked_dataset:
-                print("INFO: Loading pre-chunked JSONL dataset (iterable).")
-                dataloader = create_dataloader_for_chunked(
-                    args.train, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
-                )
-                # Estimate length for scheduler
-                try:
-                    with open(args.train, 'r') as f:
-                        estimated_lines = sum(1 for _ in f)
-                        dataloader_len = estimated_lines // args.batch_size # Rough estimate
-                        print(f"INFO: Estimated DataLoader length (for scheduler): {dataloader_len} batches.")
-                except:
-                        print("Warning: Could not estimate dataset length for scheduler. Using placeholder T_max=100000.")
-                        dataloader_len = 100000 # Placeholder
-            else:
-                print("INFO: Loading and tokenizing dataset on the fly (map-style).")
-                dataloader = create_dataloader_original(
-                    args.train, tokenizer, max_len_for_loader, args.batch_size,
-                    tokenizer.pad_token_id, kayla_mode=args.kayla, num_workers=args.num_workers
-                )
-                if dataloader is None: raise ValueError("DataLoader creation failed.")
-                dataloader_len = len(dataloader)
-                print(f"INFO: DataLoader created with {dataloader_len} batches.")
-        except Exception as e:
-            print(f"ERROR creating DataLoader: {e}"); traceback.print_exc(); sys.exit(1)
-
 
         # --- Initialize AMP GradScaler ---
         if use_amp:
@@ -1993,14 +2017,25 @@ def train(args, device, tokenizer):
         config_to_save['starting_lr'] = args.starting_lr # Use current CLI args for these
         config_to_save['min_lr'] = args.min_lr
         config_to_save['disable_lr_schedule'] = args.disable_lr_schedule
-        config_to_save['train_data_path'] = args.train # Save train path used
+        # Save data source info
+        if args.hf_dataset:
+            config_to_save['hf_dataset'] = args.hf_dataset
+            config_to_save['hf_dataset_config'] = args.hf_dataset_config
+            config_to_save['hf_dataset_split'] = args.hf_dataset_split
+        else:
+            config_to_save['train_data_path'] = args.train # Save train path used
         # <<< MODIFIED: Save dataset type flags >>>
         config_to_save['pre_chunked_dataset'] = args.pre_chunked_dataset
         config_to_save['pre_pt_dataset'] = args.pre_pt_dataset
+        config_to_save['is_hf_dataset'] = bool(args.hf_dataset)
         config_to_save['kayla'] = args.kayla # Save kayla mode used
         # Ensure vocab_size is saved (should be in model.config by now)
         if 'vocab_size' not in config_to_save:
             print(f"CRITICAL WARNING: vocab_size missing from model config before saving epoch {epoch+1} checkpoint!")
+        # <<< Ensure max_length is saved >>>
+        if 'max_length' not in config_to_save:
+             print(f"CRITICAL WARNING: max_length missing from model config before saving epoch {epoch+1} checkpoint!")
+
 
         # Prepare state dicts for saving
         scaler_state = scaler.state_dict() if use_amp and scaler is not None else None
@@ -2024,13 +2059,23 @@ def train(args, device, tokenizer):
     final_config_to_save['starting_lr'] = args.starting_lr
     final_config_to_save['min_lr'] = args.min_lr
     final_config_to_save['disable_lr_schedule'] = args.disable_lr_schedule
-    final_config_to_save['train_data_path'] = args.train
+    # Save data source info
+    if args.hf_dataset:
+        final_config_to_save['hf_dataset'] = args.hf_dataset
+        final_config_to_save['hf_dataset_config'] = args.hf_dataset_config
+        final_config_to_save['hf_dataset_split'] = args.hf_dataset_split
+    else:
+        final_config_to_save['train_data_path'] = args.train
     # <<< MODIFIED: Save dataset type flags >>>
     final_config_to_save['pre_chunked_dataset'] = args.pre_chunked_dataset
     final_config_to_save['pre_pt_dataset'] = args.pre_pt_dataset
+    final_config_to_save['is_hf_dataset'] = bool(args.hf_dataset)
     final_config_to_save['kayla'] = args.kayla
     if 'vocab_size' not in final_config_to_save:
         print(f"CRITICAL WARNING: vocab_size missing from model config before saving final model!")
+    if 'max_length' not in final_config_to_save:
+        print(f"CRITICAL WARNING: max_length missing from model config before saving final model!")
+
 
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -2038,8 +2083,9 @@ def train(args, device, tokenizer):
     }, final_save_path)
 
     try:
-        tokenizer.save_pretrained(args.out_dir)
-        print(f"Tokenizer files saved to {args.out_dir}")
+        if tokenizer:
+            tokenizer.save_pretrained(args.out_dir)
+            print(f"Tokenizer files saved to {args.out_dir}")
     except Exception as e:
         print(f"Warning: Failed to save tokenizer files on completion. Error: {e}")
 
@@ -2051,13 +2097,24 @@ def train(args, device, tokenizer):
         quantize(args, device, model, tokenizer, quantize_out_dir)
 
 
-# <<< FINETUNE Function >>>
-def finetune(args, device, tokenizer):
+# <<< FINETUNE Function (modified to accept dataloader) >>>
+def finetune(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass dataloader in
     if not _HAS_PEFT: raise ImportError("Please install 'peft' for fine-tuning.")
     print("Running in FINETUNE mode with LoRA...")
 
     # Load the base model and its config from the specified directory
     model, model_config = load_full_model_with_config(args.model_path, device)
+
+    # <<< Ensure max_length from CLI is used if provided >>>
+    if args.max_length and args.max_length != model_config.max_length:
+         print(f"INFO: Overriding loaded model max_length ({model_config.max_length}) with CLI value ({args.max_length}) for finetuning.")
+         model_config.max_length = args.max_length
+         model.pos_emb = nn.Embedding(model_config.max_length, model_config.context_dim).to(device)
+    elif 'max_length' not in model_config:
+         print(f"Warning: max_length missing from loaded config. Using default 1024 for finetuning.")
+         model_config.max_length = 1024 # Or use args.max_length if provided
+         model.pos_emb = nn.Embedding(model_config.max_length, model_config.context_dim).to(device)
+
 
     lora_r = args.lora_r
     if args.finetune_unlock_percent is not None: # Check if flag was actually used
@@ -2092,49 +2149,6 @@ def finetune(args, device, tokenizer):
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-
-    # <<< Use conditional dataloader logic >>>
-    dataloader_len = 0 # Initialize, length might be unknown
-    try:
-        # Use max_length from the loaded base model config
-        if 'max_length' not in model_config: raise ValueError("Base model config missing max_length for dataloader.")
-        max_len_for_loader = model_config.max_length
-
-        # <<< MODIFIED: Conditional Dataloader Creation >>>
-        if args.pre_pt_dataset:
-            print("INFO: Loading pre-chunked .pt tensors for finetuning (map-style).")
-            dataloader = create_dataloader_pt_chunked(
-                args.train, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
-            )
-            dataloader_len = len(dataloader)
-            print(f"INFO: DataLoader created with {dataloader_len} batches.")
-        elif args.pre_chunked_dataset:
-            print("INFO: Loading pre-chunked JSONL dataset for finetuning (iterable).")
-            dataloader = create_dataloader_for_chunked(
-                args.train, max_length=max_len_for_loader, batch_size=args.batch_size, num_workers=args.num_workers
-            )
-            # Estimate length for scheduler
-            try:
-                with open(args.train, 'r') as f:
-                    estimated_lines = sum(1 for _ in f)
-                    dataloader_len = estimated_lines // args.batch_size # Rough estimate
-                    print(f"INFO: Estimated DataLoader length (for scheduler): {dataloader_len} batches.")
-            except:
-                    print("Warning: Could not estimate dataset length for scheduler. Using placeholder T_max=100000.")
-                    dataloader_len = 100000 # Placeholder
-        else:
-            print("INFO: Loading and tokenizing dataset on the fly for finetuning (map-style).")
-            dataloader = create_dataloader_original(
-                args.train, tokenizer, max_len_for_loader, args.batch_size,
-                tokenizer.pad_token_id, kayla_mode=args.kayla, num_workers=args.num_workers
-            )
-            if dataloader is None: raise ValueError("DataLoader creation failed.")
-            dataloader_len = len(dataloader)
-            print(f"INFO: DataLoader created with {dataloader_len} batches.")
-
-    except Exception as e:
-        print(f"ERROR creating DataLoader for finetuning: {e}"); traceback.print_exc(); sys.exit(1)
-
 
     optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr) # Only trainable params will have grads
     os.makedirs(args.out_dir, exist_ok=True)
@@ -2270,8 +2284,9 @@ def finetune(args, device, tokenizer):
     # Note: Only the adapter (+ saved modules like LTM) is saved here.
     # Save tokenizer too for completeness
     try:
-        tokenizer.save_pretrained(args.out_dir)
-        print(f"Tokenizer files saved to {args.out_dir}")
+        if tokenizer:
+            tokenizer.save_pretrained(args.out_dir)
+            print(f"Tokenizer files saved to {args.out_dir}")
     except Exception as e:
         print(f"Warning: Failed to save tokenizer with adapter. Error: {e}")
 
@@ -2336,6 +2351,10 @@ def merge_lora(args, device, tokenizer):
 # <<< QUANTIZE Function >>>
 # ... (quantize remains unchanged) ...
 def quantize(args, device, model=None, tokenizer=None, out_dir=None):
+    if not _HAS_KERNEL:
+        print("ERROR: Cannot quantize model - C++ kernel not found or failed to import.")
+        return
+
     print(f"Running in QUANTIZE mode with {args.qtype} precision...")
 
     # Allow passing in an already-loaded model (e.g., from train --quantize-on-complete)
@@ -2420,7 +2439,7 @@ def chat(args, device, tokenizer):
 
     if npz_files:
         if not _HAS_KERNEL:
-            print("ERROR: Cannot run quantized chat without the C++ kernel.")
+            print("ERROR: Cannot run quantized chat without the C++ kernel (not found or failed to import).")
             return
         model, config = load_quantized(args.model_path)
         is_quantized = True
@@ -2447,6 +2466,13 @@ def chat(args, device, tokenizer):
                 # Basic config check
                 if shadow_config.context_dim != config.context_dim or shadow_config.ltm_slots != config.ltm_slots:
                     print("Warning: Shadow model config differs significantly from quantized config. Learning might be unstable.")
+                # Ensure shadow model max_length matches quantized model
+                if shadow_config.max_length != config.max_length:
+                     print(f"Warning: Shadow model max_length ({shadow_config.max_length}) differs from quantized ({config.max_length}). Syncing shadow.")
+                     shadow_config.max_length = config.max_length
+                     shadow_model.config.max_length = config.max_length
+                     shadow_model.pos_emb = nn.Embedding(config.max_length, shadow_model.config.context_dim).to(device)
+
             except Exception as e:
                 print(f"Error loading shadow model from {args.shadow_model_path}: {e}")
                 traceback.print_exc()
@@ -2498,7 +2524,7 @@ def chat(args, device, tokenizer):
     # Setup LTM scheduler if not in static mode and learning is enabled
     if not args.static_ltm_lr and (not is_quantized or args.enable_quantized_learning):
         print("INFO: Using Cosine Annealing schedule for LTM updates.")
-        print(f"         - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
+        print(f"       - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
         # Schedulers need an optimizer, so we create a dummy one for the LTM LR.
         dummy_param = nn.Parameter(torch.tensor(0.0)) # Needs to be Parameter
         # Use the main LTM LR as the MAX LR for the schedule
@@ -2866,13 +2892,24 @@ def main():
 
     # --- Data and Path Arguments (Universal) ---
     path_group = parser.add_argument_group('Paths and Data')
-    path_group.add_argument("--train", type=str, default=None, help="[Train/Finetune] Path to training JSON/JSONL file, or directory for pre-chunked .pt tensors.")
+    # <<< MODIFIED: --train now uses nargs='?' to be optional without a value >>>
+    path_group.add_argument("--train", type=str, nargs='?', default=None, const=True, help="[Train/Finetune] Path to local training data: JSON/JSONL file, or directory for pre-chunked .pt tensors. If used without a path, requires --hf_dataset.")
+    # <<< NEW: Hugging Face dataset arguments >>>
+    path_group.add_argument("--hf_dataset", type=str, default=None, help="[Train/Finetune] Name or path to a Hugging Face dataset (e.g., 'wikitext', 'c4', 'path/to/my_csv/').")
+    path_group.add_argument("--hf_dataset_config", type=str, default=None, help="[Train/Finetune] Optional configuration name for the HF dataset (e.g., 'wikitext-103-raw-v1' for wikitext).")
+    path_group.add_argument("--hf_dataset_split", type=str, default="train", help="[Train/Finetune] Dataset split to use (e.g., 'train', 'validation', 'train[:10%%]').")
+    # <<< NEW: Column name arguments for HF datasets >>>
+    path_group.add_argument("--text_column", type=str, default=None, help="[Train/Finetune] Column name for text completion data in HF dataset (mutually exclusive with prompt/completion). Defaults to 'text' if available.")
+    path_group.add_argument("--prompt_column", type=str, default=None, help="[Train/Finetune] Column name for prompt/instruction in HF dataset.")
+    path_group.add_argument("--completion_column", type=str, default=None, help="[Train/Finetune] Column name for completion/response in HF dataset.")
+    # --- Existing path arguments ---
     path_group.add_argument("--model-path", type=str, default=None, help="Path to the model directory (required for all modes except 'train' unless resuming or starting from scratch).")
     path_group.add_argument("--out-dir", type=str, default="./chronos_model", help="[Train/Finetune/Merge/Quantize] Directory to save the new model/adapter.")
     path_group.add_argument("--lora-adapter-path", type=str, default=None, help="[Merge/Finetune] Path to the LoRA adapter directory.")
-    path_group.add_argument("--tokenizer-path", type=str, default=None, help="Path or HF name of the tokenizer (used if not loading from model-path, defaults to microsoft/phi-2).") # Allow None default
+    path_group.add_argument("--tokenizer-path", type=str, default=None, help="Path or HF name of the tokenizer (used if not loading from model-path, defaults to openai-community/gpt2).") # Allow None default
     path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="[Train] Path to a specific training checkpoint .pt file to resume from.")
     path_group.add_argument("--shadow-model-path", type=str, default=None, help="[Chat] Path to the original full-precision model dir, required for online learning with a quantized model.")
+
 
     # <<< MODIFIED: Added --pre_pt_dataset flag >>>
     data_fmt_group = parser.add_mutually_exclusive_group()
@@ -2882,19 +2919,20 @@ def main():
 
     # --- Model Architecture Arguments (for Training) ---
     arch_group = parser.add_argument_group('Architecture (for --mode train, used if not resuming/loading)')
-    arch_group.add_argument("--context_dim", type=int, default=2560) # Default for Phi-2
-    arch_group.add_argument("--persistent_dim", type=int, default=256) # Adjusted
-    arch_group.add_argument("--ltm_slots", type=int, default=2048)
-    arch_group.add_argument("--ltm_key_dim", type=int, default=256) # Adjusted
-    arch_group.add_argument("--ltm_val_dim", type=int, default=256) # Adjusted
-    arch_group.add_argument("--h_hidden", type=int, default=2560) # Match context_dim
-    arch_group.add_argument("--l_hidden", type=int, default=2560) # Match context_dim
-    arch_group.add_argument("--max_h_steps", type=int, default=10, help="[HRM] Maximum number of high-level refinement steps.")
-    arch_group.add_argument("--max_l_steps", type=int, default=10, help="[HRM] Maximum number of low-level iterations before forcing completion.")
-    arch_group.add_argument("--l_conv_atol", type=float, default=1e-5, help="[HRM] Absolute tolerance for checking L-module state convergence.")
-    arch_group.add_argument("--ltm_topk", type=int, default=4, help="Number of LTM slots to retrieve per token.")
-    arch_group.add_argument("--max_length", type=int, default=None, help="Max sequence length. Required for --pre_chunked_dataset or --pre_pt_dataset, otherwise default 1024 or auto-detected.")
-    arch_group.add_argument("--auto-max-length", action="store_true", help="Automatically scan the dataset to find the longest sequence and set it as max_length (ignored if using pre-chunked formats).")
+    # <<< MODIFIED: Changed some defaults >>>
+    arch_group.add_argument("--context_dim", type=int, default=768) # Default for GPT-2 small
+    arch_group.add_argument("--persistent_dim", type=int, default=128)
+    arch_group.add_argument("--ltm_slots", type=int, default=1024)
+    arch_group.add_argument("--ltm_key_dim", type=int, default=128)
+    arch_group.add_argument("--ltm_val_dim", type=int, default=128)
+    arch_group.add_argument("--h_hidden", type=int, default=768) # Match context_dim
+    arch_group.add_argument("--l_hidden", type=int, default=768) # Match context_dim
+    arch_group.add_argument("--max_h_steps", type=int, default=5, help="[HRM] Maximum number of high-level refinement steps.")
+    arch_group.add_argument("--max_l_steps", type=int, default=5, help="[HRM] Maximum number of low-level iterations before forcing completion.")
+    arch_group.add_argument("--l_conv_atol", type=float, default=1e-4, help="[HRM] Absolute tolerance for checking L-module state convergence.")
+    arch_group.add_argument("--ltm_topk", type=int, default=2, help="Number of LTM slots to retrieve per token.")
+    arch_group.add_argument("--max_length", type=int, default=1024, help="Max sequence length. Required if using --pre_chunked_dataset, --pre_pt_dataset. Defaults to 1024 if not loading a model config or using --auto-max-length.") # <<< Modified default and help text
+    arch_group.add_argument("--auto-max-length", action="store_true", help="Automatically scan the dataset (--train or --hf_dataset) to find the longest sequence and set it as max_length.")
 
     # --- Training Arguments ---
     train_group = parser.add_argument_group('Training and Finetuning')
@@ -2905,7 +2943,7 @@ def main():
     train_group.add_argument("--min-lr", type=float, default=1e-6, help="Min LR for cosine annealing.")
     train_group.add_argument("--disable-lr-schedule", action="store_true", help="Use a fixed LR instead of cosine annealing.")
     train_group.add_argument("--ltm_lr", type=float, default=1e-2, help="[Static] LR for LTM updates, or [Scheduled] MAX LR for the LTM cosine schedule.")
-    train_group.add_argument("--kayla", action="store_true", help="Enable Kayla-style instruction tuning (with thought-process). Ignored if using pre-chunked formats.")
+    train_group.add_argument("--kayla", action="store_true", help="Enable Kayla-style instruction tuning (with thought-process). Ignored if using pre-chunked formats or --text_column.")
     train_group.add_argument("--lora_r", type=int, default=8, help="[Finetune] LoRA rank.")
     train_group.add_argument("--lora_alpha", type=int, default=16, help="[Finetune] LoRA alpha.")
     train_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="[Finetune] Target percentage of params to train (e.g., 1.5 for 1.5%). Overrides --lora_r.")
@@ -2936,10 +2974,33 @@ def main():
     args = parser.parse_args()
 
     # --- Argument Validation ---
-    if args.mode == 'train' and not args.train and not args.resume_from_ckpt:
-        parser.error("`--train` is required for train mode unless resuming with `--resume-from-ckpt`.")
-    if args.mode == 'finetune' and not args.train:
-        parser.error("`--train` is required for finetune mode.")
+    # <<< MODIFIED: Data source validation >>>
+    if args.mode in ['train', 'finetune']:
+        # Check if NO data source is provided (unless resuming train)
+        if not args.hf_dataset and args.train is None and not (args.mode == 'train' and args.resume_from_ckpt):
+            parser.error("Either `--train path/to/local/data` or `--hf_dataset name/or/path` must be specified for train/finetune mode (unless resuming train from ckpt).")
+        # Check if BOTH --train path AND --hf_dataset are given
+        if args.hf_dataset and args.train is not None and args.train is not True: # Check if --train has a path argument
+             parser.error("Cannot specify both `--train path/to/local/data` and `--hf_dataset` simultaneously.")
+        # Ensure --train wasn't used as just a flag without --hf_dataset
+        if args.train is True and not args.hf_dataset:
+            parser.error("The `--train` flag was used without a path, but no `--hf_dataset` was provided.")
+
+
+        if args.hf_dataset and args.pre_chunked_dataset:
+            parser.error("--hf_dataset cannot be used with --pre_chunked_dataset.")
+        if args.hf_dataset and args.pre_pt_dataset:
+            parser.error("--hf_dataset cannot be used with --pre_pt_dataset.")
+        # Removed the auto_max_length warning here, handled later.
+        if args.hf_dataset and not _HAS_HF_DATASETS:
+            parser.error("--hf_dataset specified, but the 'datasets' library is not installed. Please run: pip install datasets")
+        if args.hf_dataset:
+            if args.text_column and (args.prompt_column or args.completion_column):
+                parser.error("--text_column is mutually exclusive with --prompt_column and --completion_column.")
+            if (args.prompt_column and not args.completion_column) or (not args.prompt_column and args.completion_column):
+                parser.error("Both --prompt_column and --completion_column must be specified together for instruction tuning.")
+
+    # --- Existing validation ---
     if args.mode == 'finetune' and not args.model_path:
         parser.error("`--model-path` (base model) is required for finetune mode.")
     if args.mode == 'merge-lora' and not args.model_path:
@@ -2947,7 +3008,6 @@ def main():
     if args.mode == 'merge-lora' and not args.lora_adapter_path:
         parser.error("`--lora-adapter-path` is required for merge-lora mode.")
     if args.mode == 'quantize' and not args.model_path and not args.quantize_on_complete:
-        # Quantize might be called internally, check if model_path wasn't passed via CLI specifically
         is_standalone_quantize = True
         for i, arg in enumerate(sys.argv):
             if arg == 'train' and '--quantize-on-complete' in sys.argv:
@@ -2959,20 +3019,13 @@ def main():
         parser.error("`--model-path` is required for chat mode.")
     if args.enable_quantized_learning and not args.shadow_model_path:
         parser.error("--enable-quantized-learning requires --shadow-model-path to be set.")
-    # <<< MODIFIED: Validation for new dataset types >>>
     if (args.pre_chunked_dataset or args.pre_pt_dataset) and not args.max_length:
-         parser.error("--max_length must be specified when using --pre_chunked_dataset or --pre_pt_dataset.")
+        parser.error("--max_length must be specified when using --pre_chunked_dataset or --pre_pt_dataset.")
     if (args.pre_chunked_dataset or args.pre_pt_dataset) and args.auto_max_length:
         print("Warning: --auto-max-length is ignored when using pre-chunked dataset formats.")
+        args.auto_max_length = False # Disable it
     if (args.pre_chunked_dataset or args.pre_pt_dataset) and args.kayla:
-         print("Warning: --kayla flag is ignored when using pre-chunked dataset formats.")
-    if not args.pre_chunked_dataset and not args.pre_pt_dataset and not args.max_length and not args.auto_max_length:
-        if args.mode in ['train', 'finetune']:
-            print("INFO: Neither --max_length nor --auto-max-length specified. Will attempt auto-detection or use default 1024.")
-            args.auto_max_length = True # Default to auto if nothing else specified
-    elif not args.pre_chunked_dataset and not args.pre_pt_dataset and args.max_length:
-        args.auto_max_length = False # Explicit length overrides auto
-
+        print("Warning: --kayla flag is ignored when using pre-chunked dataset formats.")
 
     set_threads(args.threads)
     pt_device = pick_device()
@@ -2982,7 +3035,7 @@ def main():
     if args.amp and not _HAS_AMP:
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         print("!!! WARNING: --amp was specified, but torch amp support is not available.   !!!")
-        print("!!!   AMP will be DISABLED. Check CUDA and PyTorch install.               !!!")
+        print("!!!  AMP will be DISABLED. Check CUDA and PyTorch install.                !!!")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         args.amp = False # Force disable
     elif args.amp and pt_device == torch.device('cpu'):
@@ -2992,7 +3045,7 @@ def main():
     # --- Tokenizer Loading ---
     tokenizer = None
     tokenizer_load_path = None
-    default_tokenizer = "microsoft/phi-2"
+    default_tokenizer = "openai-community/gpt2" # <<< Changed default
 
     # 1. Prioritize --tokenizer-path if given
     if args.tokenizer_path:
@@ -3006,7 +3059,8 @@ def main():
             # Fall through to try model_path or default
 
     # 2. If no tokenizer yet, try --model-path (if applicable for the mode)
-    if tokenizer is None and args.model_path and args.mode != 'train': # Only try model_path if not fresh train
+    #    Load tokenizer from model_path UNLESS starting a fresh train run
+    if tokenizer is None and args.model_path and not (args.mode == 'train' and not args.resume_from_ckpt and not args.model_path):
         print(f"Attempting to load tokenizer from model directory: {args.model_path}")
         try:
             tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -3049,66 +3103,105 @@ def main():
                 print(f"Updated args.vocab_size to {args.vocab_size} due to added pad token.")
 
 
-    # --- Auto Max Length Scanning (Only if not pre-chunked and requested/defaulted) ---
-    # <<< MODIFIED: Skip scanning if using pre-chunked formats >>>
-    if args.auto_max_length and not args.pre_chunked_dataset and not args.pre_pt_dataset and args.mode in ['train', 'finetune']:
-        train_file_path = args.train
-        if not train_file_path and args.resume_from_ckpt:
-            # Try loading from checkpoint config if resuming and path not given
-            print("INFO: --auto-max-length used with --resume-from-ckpt. Trying to load train path from config...")
-            try:
-                ckpt = torch.load(args.resume_from_ckpt, map_location='cpu', weights_only=False) # Need config
-                ckpt_conf = ckpt.get('config', {})
-                train_file_path = ckpt_conf.get('train_data_path')
-            except Exception as e: print(f"Warning: Could not load train path from checkpoint config: {e}")
+    # --- Temporary HF Dataset Loading (for auto-max-length) ---
+    # <<< NEW: Load HF dataset here if needed for scanning >>>
+    hf_raw_dataset_for_scan = None
+    if args.auto_max_length and args.hf_dataset and args.mode in ['train', 'finetune']:
+        if tokenizer is None:
+             parser.error("--auto-max-length requires the tokenizer to be loaded first.")
+        if not _HAS_HF_DATASETS:
+             parser.error("--auto-max-length requested for HF dataset, but 'datasets' library is not installed.")
+        print(f"Loading Hugging Face dataset ({args.hf_dataset}) temporarily for length scan...")
+        try:
+            hf_raw_dataset_for_scan = load_dataset(args.hf_dataset, name=args.hf_dataset_config, split=args.hf_dataset_split)
+            print("Dataset loaded for scan.")
+        except Exception as e:
+            print(f"ERROR: Failed to load HF dataset '{args.hf_dataset}' for length scan: {e}")
+            sys.exit(1)
 
-        if not train_file_path or not os.path.exists(train_file_path):
-            parser.error("--auto-max-length requires a valid --train file path.")
+
+    # --- Auto Max Length Scanning (Handles Local Files and HF Datasets) ---
+    # <<< MODIFIED: Reworked this section >>>
+    if args.auto_max_length and args.mode in ['train', 'finetune'] and not args.pre_chunked_dataset and not args.pre_pt_dataset:
         if tokenizer is None:
             parser.error("--auto-max-length requires the tokenizer to be loaded first.")
 
-        print("INFO: --auto-max-length enabled. Scanning dataset to find the maximum sequence length...")
         max_found_length = 0
+        skipped_scan_count = 0
+        scan_desc = "Scanning Dataset"
 
-        with open(train_file_path, 'r', encoding='utf-8') as f:
-            # Helper to get text consistently
-            def get_text_from_obj(obj, kayla_mode):
+        if args.hf_dataset:
+            # --- Scan HF Dataset ---
+            if hf_raw_dataset_for_scan is None:
+                 # Should have been loaded above, but double-check
+                 print("ERROR: HF dataset required for scan was not loaded.")
+                 sys.exit(1)
+            print("INFO: --auto-max-length enabled. Scanning HF dataset...")
+            scan_desc = f"Scanning HF: {args.hf_dataset}"
+            for sample in tqdm(hf_raw_dataset_for_scan, desc=scan_desc):
+                processed = process_text_sample(
+                    tokenizer, sample, 999999, args.kayla, # Use large max_length for scanning
+                    args.text_column, args.prompt_column, args.completion_column
+                )
+                if processed:
+                    length = len(processed['input_ids'])
+                    if length > max_found_length: max_found_length = length
+                else: skipped_scan_count += 1
+
+        else: # --- Scan Local JSON/JSONL File ---
+            train_file_path = args.train # Should have a path if not HF
+            if not train_file_path and args.resume_from_ckpt:
+                # Try loading from checkpoint config if resuming and path not given
+                print("INFO: --auto-max-length used with --resume-from-ckpt. Trying to load train path from config...")
                 try:
-                    if kayla_mode:
-                        feelings_part = f"### Feelings:\n{obj.get('feelings')}\n\n" if obj.get('feelings') else ""
-                        return (f"### Instruction:\n{obj.get('Instruction', '')}\n\n"
-                                f"{feelings_part}"
-                                f"### Thought Process:\n{obj.get('thought-process', '')}\n\n"
-                                f"### Response:\n{obj.get('output', '')}")
-                    else:
-                        return f"### Instruction:\n{obj.get('instruction', '')}\n\n### Response:\n{obj.get('output', '') or obj.get('response', '')}"
-                except: return ""
+                    ckpt = torch.load(args.resume_from_ckpt, map_location='cpu', weights_only=False) # Need config
+                    ckpt_conf = ckpt.get('config', {})
+                    train_file_path = ckpt_conf.get('train_data_path')
+                except Exception as e: print(f"Warning: Could not load train path from checkpoint config: {e}")
 
-            try: # Try JSON list
-                f.seek(0)
-                data = json.load(f)
-                if isinstance(data, list):
-                    for obj in tqdm(data, desc="Scanning JSON"):
-                        text = get_text_from_obj(obj, args.kayla)
-                        if tokenizer:
-                            length = len(tokenizer.encode(text, add_special_tokens=True)) + 1 # Include special tokens + EOS
-                            if length > max_found_length: max_found_length = length
-                        else: break # Stop if no tokenizer
-            except: # Try JSONL
-                f.seek(0)
-                line_num_scan = 0
-                for line in tqdm(f, desc="Scanning JSONL"):
-                    line_num_scan += 1
-                    try:
-                        obj = json.loads(line)
-                        text = get_text_from_obj(obj, args.kayla)
-                        if tokenizer:
-                            length = len(tokenizer.encode(text, add_special_tokens=True)) + 1
-                            if length > max_found_length: max_found_length = length
-                        else: break
-                    except Exception as scan_e:
-                        print(f"Warning: Skipping line {line_num_scan} during scan: {scan_e}")
-                        continue
+            if not train_file_path or not os.path.exists(train_file_path):
+                parser.error("--auto-max-length requires a valid --train file path (and cannot be used with --hf_dataset).")
+
+            print(f"INFO: --auto-max-length enabled. Scanning local file: {train_file_path}...")
+            scan_desc = f"Scanning Local: {os.path.basename(train_file_path)}"
+            with open(train_file_path, 'r', encoding='utf-8') as f:
+                try: # Try JSON list
+                    f.seek(0)
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for obj in tqdm(data, desc=scan_desc):
+                            processed = process_text_sample(
+                                tokenizer, obj, 999999, args.kayla,
+                                prompt_column='instruction', completion_column='output' # Default keys for JSON/JSONL
+                            )
+                            if processed:
+                                length = len(processed['input_ids'])
+                                if length > max_found_length: max_found_length = length
+                            else: skipped_scan_count += 1
+                except: # Try JSONL
+                    f.seek(0)
+                    line_num_scan = 0
+                    for line in tqdm(f, desc=scan_desc):
+                        line_num_scan += 1
+                        try:
+                            obj = json.loads(line)
+                            processed = process_text_sample(
+                                tokenizer, obj, 999999, args.kayla,
+                                prompt_column='instruction', completion_column='output'
+                            )
+                            if processed:
+                                length = len(processed['input_ids'])
+                                if length > max_found_length: max_found_length = length
+                            else: skipped_scan_count += 1
+                        except Exception as scan_e:
+                            if skipped_scan_count % 1000 == 0:
+                                print(f"\nWarning: Skipping line ~{line_num_scan} during scan: {scan_e}")
+                            skipped_scan_count += 1
+                            continue
+
+        # --- Post-scan processing ---
+        if skipped_scan_count > 0:
+            print(f"Warning: Skipped {skipped_scan_count} invalid entries during length scan.")
 
         if max_found_length > 0:
             # Add a small buffer and round up to a multiple of 8 for efficiency
@@ -3120,30 +3213,100 @@ def main():
                 tokenizer.model_max_length = target_max_length
                 print(f"Updated tokenizer.model_max_length to {target_max_length}")
         else:
-            print("⚠️ WARNING: Auto-scan did not find valid entries or failed. Using default max_length (1024).")
-            args.max_length = args.max_length or 1024 # Set to default if scan failed and no explicit value
+            print(f"⚠️ WARNING: Auto-scan did not find valid entries or failed. Using default max_length ({args.max_length}).")
+            # Keep the default argparse value if scan failed
+
     elif not args.max_length and args.mode in ['train', 'finetune'] and not args.pre_chunked_dataset and not args.pre_pt_dataset:
         # Case where auto not enabled, not pre-chunked, and no length given
-        print("Warning: No --max_length specified and --auto-max-length disabled. Using default 1024.")
-        args.max_length = 1024
+        # Should default to 1024 based on argparse default
+        print(f"Warning: No --max_length specified. Using default {args.max_length}.")
+
+
+    # --- Dataloader Creation (moved here for train/finetune) ---
+    dataloader = None
+    dataloader_len = 0 # Length might be unknown
+    if args.mode in ["train", "finetune"]:
+        if tokenizer is None and not args.pre_pt_dataset and not args.hf_dataset: # Need tokenizer unless loading PT files or HF dataset
+            print("Error: Tokenizer failed to load, cannot create dataloader.")
+            sys.exit(1)
+        if args.max_length is None: # Should be set by now unless resuming/loading model
+            if not args.resume_from_ckpt and not args.model_path:
+                print("Error: max_length could not be determined. Please specify --max_length or use --auto-max-length.")
+                sys.exit(1)
+            # If resuming/loading, max_length will be taken from config later
+
+        try:
+            if args.hf_dataset:
+                # Use the dataset loaded earlier if scan happened, otherwise load now
+                hf_raw_dataset = hf_raw_dataset_for_scan
+                if hf_raw_dataset is None:
+                     print(f"Loading Hugging Face dataset: {args.hf_dataset} (Config: {args.hf_dataset_config}, Split: {args.hf_dataset_split})")
+                     hf_raw_dataset = load_dataset(args.hf_dataset, name=args.hf_dataset_config, split=args.hf_dataset_split)
+
+                print(f"Dataset loaded: {hf_raw_dataset}")
+                # <<< Ensure tokenizer is available for HF dataset >>>
+                if tokenizer is None:
+                     print("Error: Tokenizer is required for Hugging Face dataset processing but failed to load.")
+                     sys.exit(1)
+                hf_dataset = HuggingFaceMapStyleDataset(
+                    hf_raw_dataset, tokenizer, args.max_length, args.kayla,
+                    args.text_column, args.prompt_column, args.completion_column
+                )
+                dataloader = create_map_style_dataloader(
+                    hf_dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, shuffle=True
+                )
+                dataloader_len = len(dataloader)
+                print(f"INFO: HF DataLoader created with {dataloader_len} batches.")
+
+            elif args.pre_pt_dataset:
+                print("INFO: Loading pre-chunked .pt tensors (map-style).")
+                dataloader = create_dataloader_pt_chunked(
+                    args.train, max_length=args.max_length, batch_size=args.batch_size, num_workers=args.num_workers
+                )
+                dataloader_len = len(dataloader)
+                print(f"INFO: DataLoader created with {dataloader_len} batches.")
+            elif args.pre_chunked_dataset:
+                print("INFO: Loading pre-chunked JSONL dataset (iterable).")
+                dataloader = create_dataloader_for_chunked(
+                    args.train, max_length=args.max_length, batch_size=args.batch_size, num_workers=args.num_workers
+                )
+                # Estimate length for scheduler
+                try:
+                    with open(args.train, 'r') as f:
+                        estimated_lines = sum(1 for _ in f)
+                    dataloader_len = estimated_lines // args.batch_size # Rough estimate
+                    print(f"INFO: Estimated DataLoader length (for scheduler): {dataloader_len} batches.")
+                except:
+                    print("Warning: Could not estimate dataset length for scheduler. Using placeholder T_max=100000.")
+                    dataloader_len = 100000 # Placeholder
+            else: # Original JSON/JSONL loading (requires --train path)
+                if not args.train or not isinstance(args.train, str):
+                    parser.error("A local dataset path via --train is required when not using --hf_dataset or pre-chunked formats.")
+                print("INFO: Loading and tokenizing JSON/JSONL dataset on the fly (map-style).")
+                if tokenizer is None:
+                     print("Error: Tokenizer is required for JSON/JSONL processing but failed to load.")
+                     sys.exit(1)
+                original_dataset = OriginalJSONLDataset(
+                    args.train, tokenizer, args.max_length, kayla_mode=args.kayla
+                )
+                dataloader = create_map_style_dataloader(
+                    original_dataset, args.batch_size, tokenizer.pad_token_id, args.num_workers, shuffle=True
+                )
+                dataloader_len = len(dataloader)
+                print(f"INFO: DataLoader created with {dataloader_len} batches.")
+
+        except Exception as e:
+            print(f"ERROR creating DataLoader: {e}"); traceback.print_exc(); sys.exit(1)
 
 
     # --- Execute Selected Mode ---
     if args.mode == "train":
-        if tokenizer is None and not args.pre_pt_dataset: # Need tokenizer unless loading PT files
-            print("Error: Tokenizer failed to load, cannot start training.")
-            sys.exit(1)
-        train(args, pt_device, tokenizer)
+        train(args, pt_device, tokenizer, dataloader, dataloader_len) # Pass dataloader
     elif args.mode == "finetune":
-        if tokenizer is None and not args.pre_pt_dataset: # Need tokenizer unless loading PT files
-            print("Error: Tokenizer failed to load, cannot start finetuning.")
-            sys.exit(1)
-        finetune(args, pt_device, tokenizer)
+        finetune(args, pt_device, tokenizer, dataloader, dataloader_len) # Pass dataloader
     elif args.mode == "merge-lora":
-        # Tokenizer might be optional for merge itself, but needed for saving output dir
-        merge_lora(args, pt_device, tokenizer) # Pass potentially None tokenizer
+        merge_lora(args, pt_device, tokenizer)
     elif args.mode == "quantize":
-        # Quantize handles internal loading if tokenizer is None here
         quantize(args, pt_device, tokenizer=tokenizer)
     elif args.mode == "chat":
         if tokenizer is None:
