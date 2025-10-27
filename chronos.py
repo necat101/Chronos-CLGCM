@@ -14,7 +14,7 @@ import math # For ceil in dataset chunking (though that script is separate)
 # Set this early, before tokenizers might be implicitly loaded by other imports
 # Setting to "true" forces parallelism despite potential fork issues (use with caution)
 # Setting to "false" explicitly disables parallelism in worker processes (safer, suppresses warning)
-os.environ["TOKENIZERS_PARALLELISM"] = "true" # Set to false for safety
+os.environ["TOKENIZERS_PARALLELISM"] = "true" 
 
 import torch
 import torch.nn as nn
@@ -24,6 +24,10 @@ from torch.utils.data import Dataset, DataLoader, IterableDataset
 from transformers import AutoTokenizer
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.serialization import safe_globals # May not be needed if not using legacy save/load
+# <<< NEW: Import gradient checkpointing >>>
+from torch.utils.checkpoint import checkpoint
+# <<< END >>>
+
 
 # <<< NEW: Import Hugging Face datasets library >>>
 try:
@@ -123,14 +127,14 @@ try:
         _HAS_VULKAN = False
 except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print("!!! WARNING: The compiled C++ kernel 'chronos_matmul' was not found.        !!!")
-    print("!!!          Quantization and quantized inference will be unavailable.      !!!")
-    print("!!!                                                                         !!!")
-    print("!!! To enable these features, please run the appropriate setup script:      !!!")
-    print("!!!  - On Windows:   Run setup.bat                                          !!!")
+    print("!!! WARNING: The compiled C++ kernel 'chronos_matmul' was not found.       !!!")
+    print("!!!          Quantization and quantized inference will be unavailable.     !!!")
+    print("!!!                                                                       !!!")
+    print("!!! To enable these features, please run the appropriate setup script:    !!!")
+    print("!!!  - On Windows:   Run setup.bat                                        !!!")
     print("!!!  - On Linux/macOS: Run bash setup.sh                                    !!!")
-    print("!!!                                                                         !!!")
-    print("!!! Make sure you have CMake and a C++ compiler installed.                  !!!")
+    print("!!!                                                                       !!!")
+    print("!!! Make sure you have CMake and a C++ compiler installed.                 !!!")
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     _HAS_KERNEL = False
     _HAS_VULKAN = False
@@ -156,7 +160,7 @@ def pick_device():
         return torch.device("cuda")
     # Commenting out MPS check for stability, can be re-enabled if needed
     # if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    #     return torch.device("mps")
+    #      return torch.device("mps")
     return torch.device("cpu")
 
 def set_threads(n: int):
@@ -487,8 +491,8 @@ def create_dataloader_pt_chunked(directory_path, max_length, batch_size, num_wor
 
 # <<< START: Utility function for processing text based on args (shared by JSONL and HF dataset) >>>
 def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode: bool = False,
-                        text_column: Optional[str] = None,
-                        prompt_column: Optional[str] = None, completion_column: Optional[str] = None):
+                         text_column: Optional[str] = None,
+                         prompt_column: Optional[str] = None, completion_column: Optional[str] = None):
     """
     Processes a dictionary containing text into tokenized input_ids and labels
     based on the specified mode (Kayla, instruction tuning, or text completion).
@@ -1122,7 +1126,7 @@ class ChronosCore(nn.Module):
         required_keys = ['vocab_size', 'context_dim', 'max_length', 'persistent_dim',
                          'ltm_slots', 'ltm_key_dim', 'ltm_val_dim', 'ltm_lr',
                          'ltm_topk', 'h_hidden', 'l_hidden', 'max_h_steps',
-                         'max_l_steps', 'l_conv_atol']
+                         'max_l_steps', 'l_conv_atol'] # <<< REMOVED gradient_checkpointing from required
         for key in required_keys:
             # Allow max_length to be None initially, it might be set later
             if key not in self.config and key != 'max_length':
@@ -1132,6 +1136,10 @@ class ChronosCore(nn.Module):
                 print("Warning: max_length not found in config during model init. Using default 1024 for pos_emb.")
                 self.config['max_length'] = 1024 # Set a default if missing
 
+        # <<< NEW: Add gradient_checkpointing to config with a default >>>
+        if 'gradient_checkpointing' not in self.config:
+             self.config['gradient_checkpointing'] = False # Default to False if not provided
+        # <<< END >>>
 
         self.tok_emb = nn.Embedding(self.config.vocab_size, self.config.context_dim)
         # Use the potentially defaulted max_length for pos_emb
@@ -1172,15 +1180,83 @@ class ChronosCore(nn.Module):
     def _get_prompt_embedding(self, prompt_embedding):
         return prompt_embedding
 
+    # <<< NEW: Helper method for the Adaptive HRM Loop >>>
+    def _adaptive_hrm_step(self, enc, h_state, l_state):
+        """ Performs the Adaptive HRM computation for a single token's encoding. """
+        step_outputs = []
+        halt_probs = []
+        current_enc = enc # Start with the initial encoding for this token
+
+        for h_step in range(self.config.max_h_steps):
+            h_state = self.h_rnn(current_enc, h_state)
+            context = self.h_to_context(h_state)
+            l_input = torch.cat([current_enc, context], dim=-1)
+
+            # L-module converges to equilibrium
+            l_state_prev = torch.zeros_like(l_state) # Initialize for the first check
+            for _ in range(self.config.max_l_steps):
+                l_state_prev = l_state.clone() # Must clone to prevent reference issues
+                l_state = self.l_rnn(l_input, l_state)
+                # Check for convergence
+                if torch.allclose(l_state, l_state_prev, atol=self.config.l_conv_atol):
+                    break
+
+            # The output for this H-step is the converged L-state applied as a residual
+            step_update = self.l_to_out(l_state)
+            current_enc = current_enc + step_update
+
+            # Calculate halt probability for this step
+            halt_logit = self.h_halt_proj(h_state).squeeze(-1) # Shape: (B,)
+            halt_prob = torch.sigmoid(halt_logit)
+
+            step_outputs.append(current_enc)
+            halt_probs.append(halt_prob)
+
+            # For inference, we can exit early for efficiency
+            halt_thresh = getattr(self.config, 'h_halt_thresh', 0.9)
+            if not self.training and (halt_prob.mean() > halt_thresh): # Check mean halt prob across batch
+                break
+
+        # After the loop, calculate the final output and ponder cost using ACT logic
+        if not step_outputs:
+            print(f"Warning: No HRM steps executed. Using initial encoding.")
+            final_enc_out = enc
+            ponder_cost_out = torch.tensor(0.0, device=enc.device) # No ponder cost if no steps
+        else:
+            step_outputs_t = torch.stack(step_outputs, dim=0) # Shape: (H, B, D)
+            halt_probs_t = torch.stack(halt_probs, dim=0)     # Shape: (H, B)
+            num_steps_taken = halt_probs_t.shape[0]
+
+            # Calculate probabilities for weighting
+            unhalt_probs = 1.0 - halt_probs_t
+            unhalt_probs_shifted = torch.cat([torch.ones_like(unhalt_probs[:1]), unhalt_probs[:-1]], dim=0)
+            cum_unhalt_probs = torch.cumprod(unhalt_probs_shifted, dim=0)
+            weights = halt_probs_t * cum_unhalt_probs
+            remainder = cum_unhalt_probs[-1] * (1.0 - halt_probs_t[-1])
+
+            # Normalize weights
+            total_prob_sum = weights.sum(dim=0) + remainder + 1e-8 # Add epsilon
+            weights_normalized = weights / total_prob_sum.unsqueeze(0)
+            remainder_normalized = remainder / total_prob_sum
+
+            # Weighted average + remainder
+            final_enc_out = (weights_normalized.unsqueeze(-1) * step_outputs_t).sum(dim=0) + \
+                            remainder_normalized.unsqueeze(-1) * step_outputs_t[-1]
+
+            # Ponder cost
+            ponder_cost_out = num_steps_taken + remainder # Shape: [B]
+
+        # Return the final encoding, updated states, and ponder cost
+        return final_enc_out, h_state, l_state, ponder_cost_out
+    # <<< END Helper Method >>>
+
     def forward(self, input_ids: torch.LongTensor, attention_mask: Optional[torch.LongTensor] = None, labels: Optional[torch.LongTensor] = None, min_timestamp: float = 0.0, source_filter: Optional[int] = None, **kwargs):
         B, T = input_ids.shape
         device = input_ids.device
 
         tok_embs = self.tok_emb(input_ids)
-        # Handle potential sequence length exceeding max_length for position embeddings
         pos_indices = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
-        # <<< FIX: Use model's configured max_length >>>
-        pos_indices = pos_indices % self.config.max_length # Use modulo for positions beyond max_length
+        pos_indices = pos_indices % self.config.max_length # Use modulo
         pos_embs = self.pos_emb(pos_indices)
 
         x = tok_embs + pos_embs
@@ -1192,6 +1268,7 @@ class ChronosCore(nn.Module):
         final_token_embeddings = []
         all_ponder_costs = []
 
+        # <<< MODIFICATION: Initialize states outside the loop >>>
         h_state = torch.zeros(B, self.config.h_hidden, device=device)
         l_state = torch.zeros(B, self.config.l_hidden, device=device)
 
@@ -1201,7 +1278,6 @@ class ChronosCore(nn.Module):
             p_read = self.persistent.unsqueeze(0).expand(B, -1)
             query = self.qproj(token_emb)
 
-            # Pass filters to retrieve_topk
             topk_vals, topk_idx = self.ltm.retrieve_topk(
                 query,
                 topk=self.config.ltm_topk,
@@ -1209,19 +1285,11 @@ class ChronosCore(nn.Module):
                 source_filter=source_filter
             )
 
-            # NOTE: This UserWarning is expected and necessary.
-            # We must retain the grad on a non-leaf tensor (the retrieved values)
-            # to calculate the "surprise" gradient for the LTM update.
+            # Retain grad for LTM update
             if self.training or torch.is_grad_enabled():
-                # Only retain grad if the retrieved values are not just zeros (e.g., from failed filter)
-                # and if the tensor actually requires grad (might be detached if loaded)
                 if topk_vals.requires_grad:
-                    # Check if tensor has grad_fn before calling retain_grad
                     if topk_vals.grad_fn is not None:
                         topk_vals.retain_grad()
-                    # else: # Optional: print warning if it doesn't have grad_fn
-                    #     print(f"Warning: LTM topk_vals at step {t} does not have grad_fn, cannot retain grad.")
-
 
             all_topk_vals.append(topk_vals)
             all_topk_idx.append(topk_idx)
@@ -1231,89 +1299,31 @@ class ChronosCore(nn.Module):
             mac_input = torch.cat([token_emb, p_read, ltm_summary_flat], dim=-1)
             enc = F.gelu(self.in_proj(mac_input))
 
-            # Adaptive HRM Loop
-            step_outputs = []
-            halt_probs = []
-
-            # The initial 'enc' is passed to the first H-step
-            current_enc = enc
-
-            for h_step in range(self.config.max_h_steps):
-                h_state = self.h_rnn(current_enc, h_state)
-                context = self.h_to_context(h_state)
-                l_input = torch.cat([current_enc, context], dim=-1)
-
-                # L-module converges to equilibrium
-                l_state_prev = torch.zeros_like(l_state) # Initialize for the first check
-                for _ in range(self.config.max_l_steps):
-                    l_state_prev = l_state.clone() # Must clone to prevent reference issues
-                    l_state = self.l_rnn(l_input, l_state)
-                    # Check for convergence
-                    if torch.allclose(l_state, l_state_prev, atol=self.config.l_conv_atol):
-                        break
-
-                # The output for this H-step is the converged L-state applied as a residual
-                step_update = self.l_to_out(l_state)
-                current_enc = current_enc + step_update
-
-                # Calculate halt probability for this step
-                halt_logit = self.h_halt_proj(h_state).squeeze(-1) # Shape: (B,)
-                halt_prob = torch.sigmoid(halt_logit)
-
-                step_outputs.append(current_enc)
-                halt_probs.append(halt_prob)
-
-                # For inference, we can exit early for efficiency
-                # Use getattr for safe access to h_halt_thresh, provide default if missing
-                halt_thresh = getattr(self.config, 'h_halt_thresh', 0.9)
-                if not self.training and (halt_prob.mean() > halt_thresh): # Check mean halt prob across batch
-                    break
-
-            # After the loop, calculate the final output and ponder cost using ACT logic
-            # Ensure step_outputs is not empty before stacking
-            if not step_outputs:
-                # This might happen if max_h_steps is 0 or if something went wrong
-                print(f"Warning: No HRM steps executed for token {t}. Using initial encoding.")
-                final_enc = enc
-                ponder_cost = torch.tensor(0.0, device=device) # No ponder cost if no steps
+            # <<< MODIFICATION: Conditional Gradient Checkpointing >>>
+            # Apply checkpointing only during training and if enabled in config
+            if self.config.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                # Pass the helper method, inputs, and ensure states are updated
+                # use_reentrant=False is generally recommended for performance
+                final_enc, h_state, l_state, ponder_cost = checkpoint(
+                    self._adaptive_hrm_step, enc, h_state, l_state, use_reentrant=False
+                )
             else:
-                step_outputs_t = torch.stack(step_outputs, dim=0) # Shape: (H, B, D)
-                halt_probs_t = torch.stack(halt_probs, dim=0)     # Shape: (H, B)
-                num_steps_taken = halt_probs_t.shape[0]
-
-                # Calculate probabilities for weighting
-                unhalt_probs = 1.0 - halt_probs_t
-                # Cumulative product of unhalting probabilities up to the previous step
-                unhalt_probs_shifted = torch.cat([torch.ones_like(unhalt_probs[:1]), unhalt_probs[:-1]], dim=0)
-                cum_unhalt_probs = torch.cumprod(unhalt_probs_shifted, dim=0)
-
-                # Weight for each step is p_h * product_{i<h}(1-p_i)
-                weights = halt_probs_t * cum_unhalt_probs
-
-                # Remainder is the probability of not having halted after all steps
-                remainder = cum_unhalt_probs[-1] * (1.0 - halt_probs_t[-1])
-
-                # Normalize weights to ensure they sum to 1
-                total_prob_sum = weights.sum(dim=0) + remainder + 1e-8 # Add epsilon for stability
-                weights_normalized = weights / total_prob_sum.unsqueeze(0)
-                remainder_normalized = remainder / total_prob_sum
-
-
-                # Weighted average of step outputs + remainder contribution from last step
-                final_enc = (weights_normalized.unsqueeze(-1) * step_outputs_t).sum(dim=0) + \
-                            remainder_normalized.unsqueeze(-1) * step_outputs_t[-1]
-
-
-                # Ponder cost: number of steps executed + probability of not halting (remainder)
-                ponder_cost = num_steps_taken + remainder # Shape: [B]
+                # Call the helper method directly if not checkpointing
+                final_enc, h_state, l_state, ponder_cost = self._adaptive_hrm_step(
+                    enc, h_state, l_state
+                )
+            # <<< END MODIFICATION >>>
 
             all_ponder_costs.append(ponder_cost)
             final_token_embeddings.append(final_enc)
+
+            # <<< NOTE: h_state and l_state are now updated correctly for the next iteration >>>
 
         final_embeddings = torch.stack(final_token_embeddings, dim=1)
         final_embeddings = self.out_norm(final_embeddings)
         logits = self.lm_head(final_embeddings)
 
+        # ... (Loss calculation remains the same) ...
         loss = None
         ponder_cost_out = None
         if labels is not None:
@@ -1324,17 +1334,14 @@ class ChronosCore(nn.Module):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
-            # Average the ponder cost across the sequence length and batch
+            # Average the ponder cost
             if all_ponder_costs:
-                # Stack costs: Shape [T, B] -> Mean over T first, then mean over B
-                # Ensure ponder_cost items are tensors before stacking
                 valid_ponder_costs = [pc if isinstance(pc, torch.Tensor) else torch.tensor(pc, device=device) for pc in all_ponder_costs]
                 if valid_ponder_costs: # Check if list is not empty
                     stacked_costs = torch.stack(valid_ponder_costs, dim=1) # Stack along sequence dim -> [B, T]
                     ponder_cost_out = stacked_costs.mean() # Mean over all elements
                 else:
                     ponder_cost_out = torch.tensor(0.0, device=device)
-
             else: # Handle edge case T=0 or no valid HRM steps
                 ponder_cost_out = torch.tensor(0.0, device=device)
 
@@ -1598,6 +1605,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
     config['pre_chunked_dataset'] = args.pre_chunked_dataset
     config['pre_pt_dataset'] = args.pre_pt_dataset
     config['is_hf_dataset'] = bool(args.hf_dataset) # Save flag for HF dataset usage
+    # <<< NEW: Add gradient checkpointing flag to initial config >>>
+    config['gradient_checkpointing'] = args.gradient_checkpointing
 
     # --- Determine vocab_size (already handled during tokenizer load) ---
     current_vocab_size = len(tokenizer) if tokenizer else None
@@ -1646,6 +1655,16 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
                  print(f"Warning: max_length missing from loaded config and CLI. Using default 1024.")
                  model_config.max_length = 1024
                  model.pos_emb = nn.Embedding(model_config.max_length, model_config.context_dim).to(device)
+
+            # <<< NEW: Ensure gradient_checkpointing flag from CLI is used >>>
+            if args.gradient_checkpointing != model_config.get('gradient_checkpointing', False):
+                 print(f"INFO: Overriding loaded model gradient_checkpointing ({model_config.get('gradient_checkpointing', False)}) with CLI value ({args.gradient_checkpointing}).")
+                 model_config.gradient_checkpointing = args.gradient_checkpointing
+            elif 'gradient_checkpointing' not in model_config:
+                 model_config.gradient_checkpointing = args.gradient_checkpointing # Add if missing
+
+            # Update the model's config in case it was modified
+            model.config = model_config
 
 
             # --- Initialize optimizer, scaler, scheduler FRESH ---
@@ -1710,12 +1729,20 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
                  print(f"Warning: max_length missing from checkpoint config and CLI. Using default 1024.")
                  model_config.max_length = 1024
 
+            # <<< Ensure gradient_checkpointing consistency, prioritize CLI arg >>>
+            if args.gradient_checkpointing != model_config.get('gradient_checkpointing', False):
+                 print(f"INFO: Overriding checkpoint gradient_checkpointing ({model_config.get('gradient_checkpointing', False)}) with CLI value ({args.gradient_checkpointing}).")
+                 model_config.gradient_checkpointing = args.gradient_checkpointing
+            elif 'gradient_checkpointing' not in model_config:
+                 model_config.gradient_checkpointing = args.gradient_checkpointing # Add if missing
+
+
             # Ensure model_type is present for HuggingFace compatibility
             if 'model_type' not in model_config:
                 model_config['model_type'] = 'chronos'
 
             print("INFO: Re-initializing model architecture from checkpoint config.")
-            model = ChronosCore(model_config).to(device) # Create model AFTER potentially fixing vocab_size/max_length
+            model = ChronosCore(model_config).to(device) # Create model AFTER potentially fixing vocab_size/max_length/grad_ckpt
         else:
             print("Warning: Config not found in checkpoint. Using current CLI args for model architecture.")
             cli_config = config # Use the initial config from vars(args)
@@ -1728,6 +1755,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
                 cli_config['max_length'] = args.max_length
             elif 'max_length' not in cli_config:
                 cli_config['max_length'] = 1024 # Default
+            # <<< Ensure gradient_checkpointing is set in cli_config >>>
+            cli_config['gradient_checkpointing'] = args.gradient_checkpointing
+
             model_config = AttrDict(cli_config) # Fallback, might cause issues if arch changed
             model = ChronosCore(model_config).to(device)
 
@@ -1796,7 +1826,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
                     print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
                     print("!!! WARNING: New LR flags detected but --override-scheduling was not set.             !!!")
                     print(f"!!!  Your new LR ({args.starting_lr}) / Min LR ({args.min_lr}) WILL BE IGNORED.                  !!!")
-                    print(f"!!!  Loading old schedule state (LR: {old_lr}, Min LR: {old_min_lr}).                       !!!")
+                    print(f"!!!  Loading old schedule state (LR: {old_lr}, Min LR: {old_min_lr}).                      !!!")
                     print("!!!  To use your new LR flags, add --override-scheduling to your command.           !!!")
                     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
 
@@ -1843,6 +1873,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
             else:
                 # Should have defaulted or been set by auto-scan by now
                 raise ValueError("max_length not determined for new model (use --max_length or --auto-max-length).")
+
+        # <<< NEW: gradient_checkpointing is already in config from vars(args) >>>
 
         model = ChronosCore(config).to(device)
         optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
@@ -2029,6 +2061,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
         config_to_save['pre_pt_dataset'] = args.pre_pt_dataset
         config_to_save['is_hf_dataset'] = bool(args.hf_dataset)
         config_to_save['kayla'] = args.kayla # Save kayla mode used
+        # <<< NEW: Save gradient checkpointing flag >>>
+        config_to_save['gradient_checkpointing'] = args.gradient_checkpointing
         # Ensure vocab_size is saved (should be in model.config by now)
         if 'vocab_size' not in config_to_save:
             print(f"CRITICAL WARNING: vocab_size missing from model config before saving epoch {epoch+1} checkpoint!")
@@ -2071,6 +2105,8 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
     final_config_to_save['pre_pt_dataset'] = args.pre_pt_dataset
     final_config_to_save['is_hf_dataset'] = bool(args.hf_dataset)
     final_config_to_save['kayla'] = args.kayla
+    # <<< NEW: Save gradient checkpointing flag >>>
+    final_config_to_save['gradient_checkpointing'] = args.gradient_checkpointing
     if 'vocab_size' not in final_config_to_save:
         print(f"CRITICAL WARNING: vocab_size missing from model config before saving final model!")
     if 'max_length' not in final_config_to_save:
@@ -2114,6 +2150,15 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass da
          print(f"Warning: max_length missing from loaded config. Using default 1024 for finetuning.")
          model_config.max_length = 1024 # Or use args.max_length if provided
          model.pos_emb = nn.Embedding(model_config.max_length, model_config.context_dim).to(device)
+
+    # <<< NEW: Ensure gradient_checkpointing flag from CLI is used >>>
+    if args.gradient_checkpointing != model_config.get('gradient_checkpointing', False):
+         print(f"INFO: Overriding loaded model gradient_checkpointing ({model_config.get('gradient_checkpointing', False)}) with CLI value ({args.gradient_checkpointing}) for finetuning.")
+         model_config.gradient_checkpointing = args.gradient_checkpointing
+    elif 'gradient_checkpointing' not in model_config:
+         model_config.gradient_checkpointing = args.gradient_checkpointing # Add if missing
+    # Update the model's config
+    model.config = model_config
 
 
     lora_r = args.lora_r
@@ -2524,7 +2569,7 @@ def chat(args, device, tokenizer):
     # Setup LTM scheduler if not in static mode and learning is enabled
     if not args.static_ltm_lr and (not is_quantized or args.enable_quantized_learning):
         print("INFO: Using Cosine Annealing schedule for LTM updates.")
-        print(f"       - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
+        print(f"         - Max LR: {args.ltm_lr:.2e}, Min LR: {args.ltm_schedule_min_lr:.2e}, Cycle Steps: {args.ltm_schedule_steps}")
         # Schedulers need an optimizer, so we create a dummy one for the LTM LR.
         dummy_param = nn.Parameter(torch.tensor(0.0)) # Needs to be Parameter
         # Use the main LTM LR as the MAX LR for the schedule
@@ -2953,6 +2998,10 @@ def main():
     train_group.add_argument("--override-scheduling", action="store_true", help="[Train] If resuming, ignore the scheduler state in the checkpoint and use the new LR args.")
     train_group.add_argument("--num_workers", type=int, default=0, help="Number of worker processes for data loading. Recommended: 2 or 4 for GPU training.")
     train_group.add_argument("--amp", action="store_true", help="[Train/Finetune/Chat] Enable Automatic Mixed Precision (AMP) for training/learning.")
+    # <<< NEW: Gradient Checkpointing Flag >>>
+    train_group.add_argument("--gradient-checkpointing", action="store_true",
+                             help="[Train/Finetune] Enable gradient checkpointing to save memory during training.")
+    # <<< END >>>
 
 
     # --- Inference Arguments ---
@@ -3034,8 +3083,8 @@ def main():
     # --- AMP Availability Check ---
     if args.amp and not _HAS_AMP:
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print("!!! WARNING: --amp was specified, but torch amp support is not available.   !!!")
-        print("!!!  AMP will be DISABLED. Check CUDA and PyTorch install.                !!!")
+        print("!!! WARNING: --amp was specified, but torch amp support is not available.    !!!")
+        print("!!!  AMP will be DISABLED. Check CUDA and PyTorch install.                 !!!")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         args.amp = False # Force disable
     elif args.amp and pt_device == torch.device('cpu'):
