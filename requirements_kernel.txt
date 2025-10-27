@@ -3,6 +3,7 @@ torch
 transformers
 datasets
 numpy
+datasets
 
 # Optional, but highly recommended for fine-tuning, building the C++ kernel,
 # and enabling all features.
