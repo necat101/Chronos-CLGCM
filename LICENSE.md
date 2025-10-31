@@ -1,6 +1,6 @@
-# Chronos Profit-Sharing Source-Available License
+# Hierarchos Profit-Sharing Source-Available License
 
-This license governs the use of the software known as "Chronos" and its associated source code, binaries, and documentation (collectively, the "Software").
+This license governs the use of the software known as "Hierarchos" and its associated source code, binaries, and documentation (collectively, the "Software").
 
 ### Preamble
 
