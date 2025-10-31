@@ -8,14 +8,14 @@ import argparse
 import math # <<< Import math for ceil
 
 # --- 1. Define Command-Line Arguments ---
-parser = argparse.ArgumentParser(description="Chunk a JSONL dataset for Chronos training, saving chunks into consolidated .pt files.")
+parser = argparse.ArgumentParser(description="Chunk a JSONL dataset for Hierarchos training, saving chunks into consolidated .pt files.")
 parser.add_argument("--dataset", type=str, required=True,
                     help="Path to the input JSONL dataset file (e.g., train.jsonl).")
 parser.add_argument("--tokenizer-path", type=str, default="openai-community/gpt2", # Changed default
                     help="Path or Hugging Face name of the tokenizer to use.")
 parser.add_argument("--overlap", type=int, default=1024,
                     help="Number of tokens to overlap between consecutive chunks.")
-parser.add_argument("--output-dir", type=str, default="train_chronos_chunked_tensors",
+parser.add_argument("--output-dir", type=str, default="train_Hierarchos_chunked_tensors",
                     help="Directory to save the output consolidated .pt chunk files and manifest.jsonl.")
 # <<< ADDED: chunks_per_file argument >>>
 parser.add_argument("--chunks-per-file", type=int, default=1000,
