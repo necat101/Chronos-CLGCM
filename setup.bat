@@ -1,6 +1,6 @@
 @echo off
 echo ===========================================
-echo == Setting up Chronos Environment...     ==
+echo == Setting up Hierarchos Environment...     ==
 echo ===========================================
 
 echo.
@@ -20,7 +20,7 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo [3/3] Compiling and building the Chronos C++ kernel...
+echo [3/3] Compiling and building the Hierarchos C++ kernel...
 pip install .
 if %errorlevel% neq 0 (
     echo Error: Failed to build the C++ kernel. Make sure you have a C++ compiler (like Visual Studio Build Tools) installed.
@@ -34,6 +34,6 @@ echo == The compiled kernel has been placed in the project root. ==
 echo ==============================================================
 echo.
 echo You can now run the program directly, for example:
-echo   python chronos.py chat --load-quantized your_model.npz
+echo   python Hierarchos.py chat --load-quantized your_model.npz
 echo.
 pause
