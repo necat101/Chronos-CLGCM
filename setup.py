@@ -69,13 +69,13 @@ class CMakeBuild(build_ext):
 
 # --- Main Setup ---
 setup(
-    name='chronos_matmul',
+    name='hierarchos_matmul',
     version='0.1.0',
     author='Your Name',
     author_email='your.email@example.com',
     description='Custom C++ kernel for the Chronos project',
     long_description='',
-    ext_modules=[CMakeExtension('chronos_matmul', sourcedir='cpp')],
+    ext_modules=[CMakeExtension('hierarchos_matmul', sourcedir='cpp')],
     cmdclass={'build_ext': CMakeBuild},
     zip_safe=False,
     python_requires=">=3.8",
