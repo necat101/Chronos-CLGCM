@@ -2,7 +2,7 @@
 set -e
 
 echo "==========================================="
-echo "== Setting up Chronos Environment...     =="
+echo "== Setting up Hierarchos Environment...     =="
 echo "==========================================="
 
 echo ""
@@ -14,7 +14,7 @@ echo "[2/3] Installing Python dependencies..."
 pip install -r requirements_kernel.txt
 
 echo ""
-echo "[3/3] Compiling and building the Chronos C++ kernel..."
+echo "[3/3] Compiling and building the Hierarchos C++ kernel..."
 pip install .
 
 echo ""
@@ -24,5 +24,5 @@ echo "== The compiled kernel has been placed in the project root. =="
 echo "=============================================================="
 echo ""
 echo "You can now run the program directly, for example:"
-echo "  python3 chronos.py chat --load-quantized your_model.npz"
+echo "  python3 hierarchos.py chat --load-quantized your_model.npz"
 echo ""
