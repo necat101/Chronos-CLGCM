@@ -1,5 +1,5 @@
 import numpy as np
-import chronos_matmul
+import hierarchos_matmul
 import time
 import inspect
 
@@ -163,7 +163,7 @@ def check_correctness(a, b, name="", threshold=0.1):
 def run_deep_debug(N, K, M, qtype, threshold=0.1):
     dequant_func, block_size = DEQUANT_MAP[qtype]
 
-    print(f"\nChronos Kernel Deep Debug Script: {qtype}")
+    print(f"\nhierarchos Kernel Deep Debug Script: {qtype}")
     print("="*60)
     print(f"Matrix dimensions: A({N}, {K}), B({M}, {K}), Y({N}, {M})")
     print("-" * 60)
@@ -173,7 +173,7 @@ def run_deep_debug(N, K, M, qtype, threshold=0.1):
     B_float = (np.random.rand(M, K).astype(np.float32) - 0.5) * 2
 
     print("1. Quantizing matrix B using C++...")
-    B_quantized_bytes = chronos_matmul.quantize(B_float, qtype=qtype)
+    B_quantized_bytes = hierarchos_matmul.quantize(B_float, qtype=qtype)
     print("   Done.")
 
     print("\n2. Running Matmul Kernels and References...")
@@ -182,16 +182,16 @@ def run_deep_debug(N, K, M, qtype, threshold=0.1):
     
     # C++ CPU Kernel (AVX, NEON, or Scalar)
     start_time_cpu = time.time()
-    Y_cpu = chronos_matmul.matmul_quantized(A, B_quantized_bytes, M, qtype=qtype, device="cpu")
+    Y_cpu = hierarchos_matmul.matmul_quantized(A, B_quantized_bytes, M, qtype=qtype, device="cpu")
     end_time_cpu = time.time()
     print(f"   CPU Kernel Time: {(end_time_cpu - start_time_cpu) * 1000:.2f} ms")
 
     Y_vulkan = None
-    if chronos_matmul.VULKAN_SUPPORT:
+    if hierarchos_matmul.VULKAN_SUPPORT:
         try:
             # Vulkan GPU Kernel
             start_time_vk = time.time()
-            Y_vulkan = chronos_matmul.matmul_quantized(A, B_quantized_bytes, M, qtype=qtype, device="vulkan")
+            Y_vulkan = hierarchos_matmul.matmul_quantized(A, B_quantized_bytes, M, qtype=qtype, device="vulkan")
             end_time_vk = time.time()
             print(f"   Vulkan Kernel Time: {(end_time_vk - start_time_vk) * 1000:.2f} ms")
         except RuntimeError as e:
