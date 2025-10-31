@@ -1,6 +1,6 @@
-﻿#include "chronos_vulkan.h"
+#include "hierarchos_vulkan.h"
 
-#ifdef CHRONOS_USE_VULKAN
+#ifdef HIERARCHOS_USE_VULKAN
 
 #include <vector>
 #include <fstream>
@@ -58,7 +58,7 @@ void VulkanManager::initVulkan() {
     // 1. Create Instance
     VkApplicationInfo appInfo{};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "Chronos Matmul";
+    appInfo.pApplicationName = "hierarchos Matmul";
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
@@ -438,4 +438,4 @@ void VulkanManager::execute(
     vkFreeMemory(device, stagingBufferY.memory, nullptr);
 }
 
-#endif // CHRONOS_USE_VULKAN
+#endif // HIERARCHOS_USE_VULKAN
