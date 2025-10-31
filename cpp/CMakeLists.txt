@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(chronos_matmul LANGUAGES CXX)
+project(hierarchos_matmul LANGUAGES CXX)
 
 option(FORCE_SCALAR "Force compilation without any SIMD intrinsics" OFF)
 
@@ -24,7 +24,7 @@ if(MSVC)
 endif()
 
 if(Vulkan_FOUND)
-    set(CHRONOS_USE_VULKAN TRUE)
+    set(HIERARCHOS_USE_VULKAN TRUE)
     file(GLOB SHADER_SOURCES "shaders/*.comp")
 
     foreach(SHADER_SOURCE ${SHADER_SOURCES})
@@ -43,20 +43,20 @@ if(Vulkan_FOUND)
     add_custom_target(Shaders ALL DEPENDS ${SHADER_SPIRV_FILES})
 endif()
 
-pybind11_add_module(chronos_matmul
-    chronos_matmul.cpp
+pybind11_add_module(hierarchos_matmul
+    hierarchos_matmul.cpp
     bindings.cpp
 )
 
 if(Vulkan_FOUND)
-    target_sources(chronos_matmul PRIVATE chronos_vulkan.cpp)
-    target_link_libraries(chronos_matmul PRIVATE Vulkan::Vulkan)
-    target_compile_definitions(chronos_matmul PRIVATE CHRONOS_USE_VULKAN)
-    target_include_directories(chronos_matmul PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
-    add_dependencies(chronos_matmul Shaders)
+    target_sources(hierarchos_matmul PRIVATE hierarchos_vulkan.cpp)
+    target_link_libraries(hierarchos_matmul PRIVATE Vulkan::Vulkan)
+    target_compile_definitions(hierarchos_matmul PRIVATE HIERARCHOS_USE_VULKAN)
+    target_include_directories(hierarchos_matmul PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    add_dependencies(hierarchos_matmul Shaders)
 
     add_custom_command(
-        TARGET chronos_matmul POST_BUILD
+        TARGET hierarchos_matmul POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${CMAKE_CURRENT_BINARY_DIR}/shaders"
                 "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/shaders"
@@ -64,7 +64,7 @@ if(Vulkan_FOUND)
     )
 endif()
 
-target_compile_features(chronos_matmul PRIVATE cxx_std_17)
+target_compile_features(hierarchos_matmul PRIVATE cxx_std_17)
 
 # --- START OF MODIFICATION: Robust SIMD Detection ---
 include(CheckCXXSourceRuns)
@@ -73,16 +73,16 @@ if(NOT FORCE_SCALAR)
     if(MSVC)
         # MSVC uses /arch, which is safer as it doesn't require hardware checks.
         # We assume the user has Visual Studio configured correctly.
-        target_compile_options(chronos_matmul PRIVATE /W3 /EHsc)
+        target_compile_options(hierarchos_matmul PRIVATE /W3 /EHsc)
         message(STATUS "MSVC detected. Using /arch:AVX2 as a robust default.")
-        target_compile_options(chronos_matmul PRIVATE /arch:AVX2)
+        target_compile_options(hierarchos_matmul PRIVATE /arch:AVX2)
 
     else() # For GCC/Clang
-        target_compile_options(chronos_matmul PRIVATE -O3 -fPIC -std=c++17 -Wno-unused-variable)
+        target_compile_options(hierarchos_matmul PRIVATE -O3 -fPIC -std=c++17 -Wno-unused-variable)
         
         if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|armv8-a")
             message(STATUS "ARM aarch64 architecture detected. Enabling NEON with -march=native.")
-            target_compile_options(chronos_matmul PRIVATE -march=native)
+            target_compile_options(hierarchos_matmul PRIVATE -march=native)
         else()
             # Hierarchical check: Test for the best instruction set first.
             set(SIMD_FLAGS_FOUND FALSE)
@@ -102,7 +102,7 @@ if(NOT FORCE_SCALAR)
 
             if(HOST_SUPPORTS_AVX512)
                 message(STATUS "Host CPU supports AVX-512. Compiling with AVX-512 flags.")
-                target_compile_options(chronos_matmul PRIVATE -mavx512f -mavx512bw -mfma)
+                target_compile_options(hierarchos_matmul PRIVATE -mavx512f -mavx512bw -mfma)
                 set(SIMD_FLAGS_FOUND TRUE)
             endif()
 
@@ -122,7 +122,7 @@ if(NOT FORCE_SCALAR)
 
                 if(HOST_SUPPORTS_AVX2)
                     message(STATUS "Host CPU supports AVX2. Compiling with AVX2 flags.")
-                    target_compile_options(chronos_matmul PRIVATE -mavx2 -mfma)
+                    target_compile_options(hierarchos_matmul PRIVATE -mavx2 -mfma)
                     set(SIMD_FLAGS_FOUND TRUE)
                 endif()
             endif()
@@ -138,15 +138,15 @@ endif()
 
 if (OpenMP_CXX_FOUND)
     message(STATUS "OpenMP support detected. Enabling parallelization.")
-    target_link_libraries(chronos_matmul PRIVATE OpenMP::OpenMP_CXX)
+    target_link_libraries(hierarchos_matmul PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 # The post-build command to copy the final library to the project root
 # This is handled by your setup.py now, but keeping it can be useful for direct cmake builds.
 add_custom_command(
-    TARGET chronos_matmul POST_BUILD
+    TARGET hierarchos_matmul POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:chronos_matmul>"
-        "${PROJECT_ROOT_DIR}/$<TARGET_FILE_NAME:chronos_matmul>"
+        "$<TARGET_FILE:hierarchos_matmul>"
+        "${PROJECT_ROOT_DIR}/$<TARGET_FILE_NAME:hierarchos_matmul>"
     COMMENT "Copying kernel to project root..."
 )
