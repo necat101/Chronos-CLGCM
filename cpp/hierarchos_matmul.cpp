@@ -1,4 +1,4 @@
-#include "chronos_matmul.h"
+#include "hierarchos_matmul.h"
 #include <pybind11/numpy.h>
 #include <cmath>
 #include <stdexcept>
@@ -196,7 +196,7 @@ void quantize_row_q<block_q2_k>(const float* x, block_q2_k* y, ssize_t k) {
 template<typename BlockType>
 float dot_product_q(const float* a, const BlockType* b, ssize_t k);
 
-#if defined(CHRONOS_USE_AVX512)
+#if defined(HIERARCHOS_USE_AVX512)
 // --- AVX-512 Implementations ---
 template<>
 float dot_product_q<block_int4>(const float* a, const block_int4* b, ssize_t k) {
@@ -345,7 +345,7 @@ float dot_product_q<block_q2_k>(const float* a, const block_q2_k* b, ssize_t k) 
     return _mm512_reduce_add_ps(acc_f32);
 }
 
-#elif defined(CHRONOS_USE_AVX2)
+#elif defined(HIERARCHOS_USE_AVX2)
 // --- AVX2 Implementations ---
 template<>
 float dot_product_q<block_int4>(const float* a, const block_int4* b, ssize_t k) {
@@ -535,9 +535,9 @@ float dot_product_q<block_q2_k>(const float* a, const block_q2_k* b, ssize_t k) 
     sum128 = _mm_hadd_ps(sum128, sum128);
     return _mm_cvtss_f32(sum128);
 }
-#endif // CHRONOS_USE_AVX2 / AVX512
+#endif // HIERARCHOS_USE_AVX2 / AVX512
 
-#if defined(CHRONOS_USE_NEON)
+#if defined(HIERARCHOS_USE_NEON)
 // --- NEON Implementations (Corrected & Refactored) ---
 
 template<>
@@ -715,7 +715,7 @@ float dot_product_q<block_q2_k>(const float* a, const block_q2_k* b, ssize_t k) 
     }
     return vaddvq_f32(acc_v);
 }
-#endif // CHRONOS_USE_NEON
+#endif // HIERARCHOS_USE_NEON
 
 
 // Generic matmul loop that dispatches to the correct dot product
@@ -734,7 +734,7 @@ void matmul_q_cpu(const BlockType* B_quantized, const float* A, float* Y, ssize_
             const int num_blocks = static_cast<int>(K / block_size_k);
             const BlockType* Brow = B_quantized + (size_t)m * num_blocks;
 
-#if defined(CHRONOS_USE_AVX512) || defined(CHRONOS_USE_AVX2) || defined(CHRONOS_USE_NEON)
+#if defined(HIERARCHOS_USE_AVX512) || defined(HIERARCHOS_USE_AVX2) || defined(HIERARCHOS_USE_NEON)
             Y[(size_t)n * M + m] = dot_product_q(Arow, Brow, K);
 #else
             // SCALAR FALLBACKS
