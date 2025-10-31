@@ -4,9 +4,9 @@ import os
 import json # MODIFICATION: Added for dataset scanning
 from tqdm import tqdm
 from transformers import AutoTokenizer # MODIFICATION: Added for tokenizer loading
-from chronos import ChronosCore, AttrDict # We import your model definition
+from hierarchos import HierarchosCore, AttrDict # We import your model definition
 
-# --- MODIFICATION START: Add dataset scanning function (adapted from chronos.py) ---
+# --- MODIFICATION START: Add dataset scanning function (adapted from hierarchos.py) ---
 def scan_dataset_for_max_length(dataset_path: str, tokenizer, kayla_mode: bool) -> int:
     """Scans a JSON or JSONL dataset to find the maximum token sequence length."""
     max_found_length = 0
@@ -64,9 +64,9 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
     """
     print(f"Loading old model directory: {old_model_path}")
     # --- MODIFICATION START: Load from directory ---
-    old_weights_path = os.path.join(old_model_path, "chronos.pt")
+    old_weights_path = os.path.join(old_model_path, "hierarchos.pt")
     if not os.path.exists(old_weights_path):
-        raise FileNotFoundError(f"'chronos.pt' not found in directory: {old_model_path}")
+        raise FileNotFoundError(f"'hierarchos.pt' not found in directory: {old_model_path}")
     checkpoint = torch.load(old_weights_path, map_location=device)
     old_state_dict = checkpoint['model_state_dict']
     old_config = AttrDict(checkpoint.get('config', {}))
@@ -83,7 +83,7 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
 
 
     print("Initializing new, larger model...")
-    new_model = ChronosCore(new_config).to(device)
+    new_model = HierarchosCore(new_config).to(device)
     new_state_dict = new_model.state_dict()
 
     print("Transplanting weights...")
@@ -125,7 +125,7 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
     # --- MODIFICATION START: Save as a model directory ---
     print(f"\nSaving expanded model directory to: {output_dir}")
     os.makedirs(output_dir, exist_ok=True)
-    output_weights_path = os.path.join(output_dir, "chronos.pt")
+    output_weights_path = os.path.join(output_dir, "hierarchos.pt")
     torch.save({
         'model_state_dict': new_model.state_dict(),
         'config': new_model.config # Save the final config used
@@ -145,7 +145,7 @@ def transplant_weights(old_model_path: str, new_config: dict, output_dir: str, d
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Expand a trained Chronos model to a larger architecture, including max_length.",
+        description="Expand a trained hierarchos model to a larger architecture, including max_length.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter # MODIFICATION: Better help format
     )
     # MODIFICATION: Changed to model directory
@@ -178,9 +178,9 @@ if __name__ == "__main__":
 
     # --- Load the old config to get base values ---
     print(f"Loading configuration from old model: {args.old_model_path}")
-    old_weights_path = os.path.join(args.old_model_path, "chronos.pt")
+    old_weights_path = os.path.join(args.old_model_path, "hierarchos.pt")
     if not os.path.exists(old_weights_path):
-         raise FileNotFoundError(f"'chronos.pt' not found in directory: {args.old_model_path}")
+         raise FileNotFoundError(f"'hierarchos.pt' not found in directory: {args.old_model_path}")
     old_checkpoint = torch.load(old_weights_path, map_location=device)
     old_config = old_checkpoint.get('config', {})
     if not old_config:
