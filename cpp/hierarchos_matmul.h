@@ -21,13 +21,13 @@ typedef SSIZE_T ssize_t;
 // --- Architecture detection for SIMD instructions ---
 #if (defined(__AVX512F__) && defined(__AVX512BW__))
     #include <immintrin.h>
-    #define CHRONOS_USE_AVX512 1
+    #define HIERARCHOS_USE_AVX512 1
 #elif defined(__AVX2__)
     #include <immintrin.h>
-    #define CHRONOS_USE_AVX2 1
+    #define HIERARCHOS_USE_AVX2 1
 #elif defined(__ARM_NEON)
     #include <arm_neon.h>
-    #define CHRONOS_USE_NEON 1
+    #define HIERARCHOS_USE_NEON 1
 #endif
 
 
@@ -77,7 +77,7 @@ void matmul_quantized_cpu(const void* B_quantized, const float* A, float* Y,
                           ssize_t N, ssize_t K, ssize_t M, const std::string& qtype);
 
 // Forward declaration for Vulkan implementation
-#ifdef CHRONOS_USE_VULKAN
+#ifdef HIERARCHOS_USE_VULKAN
 void matmul_quantized_vulkan(const void* B_quantized, const float* A, float* Y,
                              ssize_t N, ssize_t K, ssize_t M, const std::string& qtype);
 #endif
