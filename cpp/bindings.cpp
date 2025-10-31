@@ -2,7 +2,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <pybind11/functional.h>
-#include "chronos_matmul.h"
+#include "hierarchos_matmul.h"
 
 namespace py = pybind11;
 
@@ -11,8 +11,8 @@ namespace py = pybind11;
 std::vector<float> dequantize_block_cpp(const py::bytes& B_quantized, const std::string& qtype, ssize_t block_idx);
 std::vector<float> dequantize_row_cpp(const py::bytes& B_quantized_row, const std::string& qtype, ssize_t K);
 
-PYBIND11_MODULE(chronos_matmul, m) {
-    m.doc() = "Chronos matmul with k-bit block quantization (llama.cpp style)";
+PYBIND11_MODULE(hierarchos_matmul, m) {
+    m.doc() = "hierarchos matmul with k-bit block quantization (llama.cpp style)";
 
     // Expose the main quantization function
     m.def("quantize", [](py::array_t<float, py::array::c_style | py::array::forcecast> B,
@@ -55,14 +55,14 @@ PYBIND11_MODULE(chronos_matmul, m) {
         if (device == "cpu") {
             matmul_quantized_cpu((const void*)B_ptr, (const float*)bufA.ptr, (float*)Y.request().ptr, N, K, M, qtype);
         } 
-#ifdef CHRONOS_USE_VULKAN
+#ifdef HIERARCHOS_USE_VULKAN
         else if (device == "vulkan") {
             matmul_quantized_vulkan((const void*)B_ptr, (const float*)bufA.ptr, (float*)Y.request().ptr, N, K, M, qtype);
         }
 #endif
         else {
             std::string error_msg = "Unsupported device '" + device + "'.";
-#ifndef CHRONOS_USE_VULKAN
+#ifndef HIERARCHOS_USE_VULKAN
             if (device == "vulkan") {
                 error_msg += " The kernel was not compiled with Vulkan support.";
             }
@@ -84,7 +84,7 @@ PYBIND11_MODULE(chronos_matmul, m) {
       py::arg("B_quantized_row"), py::arg("qtype"), py::arg("K"),
       "Dequantizes a single complete row from a quantized bytes object for debugging.");
 
-#ifdef CHRONOS_USE_VULKAN
+#ifdef HIERARCHOS_USE_VULKAN
     m.attr("VULKAN_SUPPORT") = py::bool_(true);
 #else
     m.attr("VULKAN_SUPPORT") = py::bool_(false);
