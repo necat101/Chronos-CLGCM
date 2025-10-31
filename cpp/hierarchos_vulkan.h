@@ -1,8 +1,8 @@
-﻿#pragma once
+#pragma once
 
-#include "chronos_matmul.h"
+#include "hierarchos_matmul.h"
 
-#ifdef CHRONOS_USE_VULKAN
+#ifdef HIERARCHOS_USE_VULKAN
 #include <vulkan/vulkan.h>
 #include <string>
 #include <vector>
@@ -62,4 +62,4 @@ private:
     std::map<std::string, VkDescriptorSetLayout> descriptorSetLayouts;
 };
 
-#endif // CHRONOS_USE_VULKAN
+#endif // HIERARCHOS_USE_VULKAN
