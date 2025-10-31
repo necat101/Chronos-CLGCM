@@ -1,8 +1,10 @@
 -----
 
-# Chronos v0.7.5 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.7.5 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
+
+Due to Amazon's "Chronos" forcasting models (still based on transformers BTW) I've decdied to rename the project to "Hierarchos" from this point forward. this should prevent any naming confusion that may occur. all functional code is still the same
 
 -----
 
@@ -10,25 +12,25 @@ A novel AI architecture that synergistically integrates Google's Titans memory s
 
 > This version introduces **gradient checkpointing**, a technique that significantly reduces the memory required during training and fine-tuning, making it possible to train larger models or use larger batch sizes on hardware with limited VRAM.
 >
-> 1.  **Train with Less Memory:** 📉 By enabling the new `--gradient-checkpointing` flag during `train` or `finetune` modes, Chronos will intelligently trade some computational overhead for substantial memory savings. Instead of storing all intermediate activations for the backward pass, it recomputes parts of the HRM's reasoning steps, drastically lowering the peak memory usage. This is particularly beneficial for the deep computations performed by the HRM.
-> 2.  **Accessibility:** ✅ This feature makes training Chronos more accessible on consumer-grade GPUs or systems where memory capacity was previously a bottleneck.
+> 1.  **Train with Less Memory:** 📉 By enabling the new `--gradient-checkpointing` flag during `train` or `finetune` modes, Hierarchos will intelligently trade some computational overhead for substantial memory savings. Instead of storing all intermediate activations for the backward pass, it recomputes parts of the HRM's reasoning steps, drastically lowering the peak memory usage. This is particularly beneficial for the deep computations performed by the HRM.
+> 2.  **Accessibility:** ✅ This feature makes training Hierarchos more accessible on consumer-grade GPUs or systems where memory capacity was previously a bottleneck.
 
 ### 📢 **Major Update in v0.7.0: Hugging Face `datasets` Integration & HRM Compute Note**
 
 > This version significantly expanded dataset compatibility by integrating the Hugging Face `datasets` library and clarified the computational cost of the HRM's reasoning process.
 >
-> 1.  **Load Datasets from Anywhere:** 🌍 Chronos can now directly load and process datasets from the **Hugging Face Hub** or local paths using the `datasets` library. This adds support for numerous formats like **CSV, Parquet, JSON, Arrow**, etc., beyond the original JSONL support. New command-line arguments (`--hf_dataset`, `--hf_dataset_config`, `--hf_dataset_split`, `--text_column`, `--prompt_column`, `--completion_column`) allow specifying the dataset, configuration, split, and relevant text columns.
+> 1.  **Load Datasets from Anywhere:** 🌍 Hierarchos can now directly load and process datasets from the **Hugging Face Hub** or local paths using the `datasets` library. This adds support for numerous formats like **CSV, Parquet, JSON, Arrow**, etc., beyond the original JSONL support. New command-line arguments (`--hf_dataset`, `--hf_dataset_config`, `--hf_dataset_split`, `--text_column`, `--prompt_column`, `--completion_column`) allow specifying the dataset, configuration, split, and relevant text columns.
 > 2.  **Clarified HRM Training Cost:** ⏱️ Added notes explaining how the HRM's iterative convergence (`--max_h_steps`, `--max_l_steps`) directly impacts **training speed and compute requirements**. Higher step limits allow for deeper reasoning but increase training time significantly compared to fixed-depth architectures.
 
 ## About The Project
 
-The field of AI has been dominated by a paradigm of unprecedented scale, yet fundamental limitations in today's Transformer models are becoming apparent. The path to Artificial General Intelligence (AGI) may not be paved with scale alone. Chronos challenges this paradigm by focusing on **architectural intelligence**.
+The field of AI has been dominated by a paradigm of unprecedented scale, yet fundamental limitations in today's Transformer models are becoming apparent. The path to Artificial General Intelligence (AGI) may not be paved with scale alone. Hierarchos challenges this paradigm by focusing on **architectural intelligence**.
 
-This project introduces a novel hybrid model where a deep reasoning engine operates within a dynamic, lifelong learning memory environment. Chronos is conceived not merely to process information, but to **think, learn, and remember** in a cohesive, integrated, and human-like manner.
+This project introduces a novel hybrid model where a deep reasoning engine operates within a dynamic, lifelong learning memory environment. Hierarchos is conceived not merely to process information, but to **think, learn, and remember** in a cohesive, integrated, and human-like manner.
 
 ## Core Concepts
 
-Chronos is built on two revolutionary, brain-inspired pillars:
+Hierarchos is built on two revolutionary, brain-inspired pillars:
 
 🧠 **Titans Architecture (The Cognitive Substrate)**
 A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," and its memory slots are now structured with timestamps and source metadata, allowing for sophisticated, context-aware queries.
@@ -49,12 +51,12 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
   * ⚡ **Accelerated Training with AMP**: Supports Automatic Mixed Precision (`--amp`) for faster training and reduced memory usage on compatible NVIDIA GPUs.
   * 🛡️ **Stable Training**: Built-in gradient clipping (`--grad-clip`) to prevent model instability and ensure smoother convergence.
   * 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config for easy sharing and use.
-  * 💾 **Automatic Re-quantization**: After a learning session, Chronos can automatically re-quantize a model to persist the new knowledge (`--enable-quantized-learning` in `chat`). *(Requires compiled kernel)*
+  * 💾 **Automatic Re-quantization**: After a learning session, Hierarchos can automatically re-quantize a model to persist the new knowledge (`--enable-quantized-learning` in `chat`). *(Requires compiled kernel)*
   * 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones, now supporting changes in `max_length` and automatic length detection from datasets.
   * ✨ **Flexible Training Initiation**: Supports starting training runs using weights from existing model directories (inference or expanded models via `--model-path` in `train` mode), not just resuming full training checkpoints (`--resume-from-ckpt`).
   * ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). *(Requires compiled kernel)*
   * 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX/NEON) or on GPUs via Vulkan for broad hardware compatibility. *(Requires compiled kernel)*
-  * 🔧 **Comprehensive Tooling**: Includes a single script (`chronos.py`) for training, LoRA fine-tuning, merging, quantization, and interactive chat, plus the model expansion and dataset chunking scripts.
+  * 🔧 **Comprehensive Tooling**: Includes a single script (`hierarchos.py`) for training, LoRA fine-tuning, merging, quantization, and interactive chat, plus the model expansion and dataset chunking scripts.
 
 -----
 
@@ -79,8 +81,8 @@ Follow these steps to get a local copy up and running.
 1.  **Clone the repository:**
 
     ```bash
-    git clone https://github.com/your-username/Chronos.git
-    cd Chronos
+    git clone https://github.com/your-username/Hierarchos.git
+    cd Hierarchos
     ```
 
 2.  **Create a virtual environment (recommended):**
@@ -117,7 +119,7 @@ Follow these steps to get a local copy up and running.
     bash setup.sh
     ```
 
-    This creates `chronos_matmul.*` in your project root. If you don't compile this, quantization modes (`quantize`, `--quantize-on-complete`, quantized `chat`) and Vulkan inference will be disabled.
+    This creates `Hierarchos_matmul.*` in your project root. If you don't compile this, quantization modes (`quantize`, `--quantize-on-complete`, quantized `chat`) and Vulkan inference will be disabled.
 
 -----
 
@@ -132,10 +134,10 @@ Choose **one** data source option:
 **(A) Local JSON/JSONL File (Fits in RAM):**
 
 ```bash
-python chronos.py train \
+python hierarchos.py train \
     --train "path/to/your_data.jsonl" \
     --tokenizer-path "openai-community/gpt2" `# Or your preferred tokenizer` \
-    --out-dir "./my_chronos_model" \
+    --out-dir "./my_Hierarchos_model" \
     --epochs 3 \
     --batch_size 4 \
     --accumulation-steps 2 `# Effective batch size = 8` \
@@ -152,7 +154,7 @@ python chronos.py train \
 **(B) Hugging Face Dataset (Text Completion):**
 
 ```bash
-python chronos.py train \
+python hierarchos.py train \
     --hf_dataset "wikitext" \
     --hf_dataset_config "wikitext-2-raw-v1" \
     --hf_dataset_split "train" \
@@ -170,7 +172,7 @@ python chronos.py train \
 **(C) Hugging Face Dataset (Instruction/Kayla Format):**
 
 ```bash
-python chronos.py train \
+python hierarchos.py train \
     --hf_dataset "databricks/databricks-dolly-15k" \
     --prompt_column "Instruction" \
     --completion_column "output" \
@@ -200,7 +202,7 @@ python chronos.py train \
     ```
   * **Step 2: Train using Chunks**
     ```bash
-    python chronos.py train \
+    python hierarchos.py train \
         --pre_pt_dataset `# Enable loading via manifest` \
         --train "./very_large_data_chunked" `# Directory with .pt files & manifest` \
         --max_length 3153 `# MUST match chunker output` \
@@ -225,8 +227,8 @@ python chronos.py train \
 Adapt a pre-trained model using new data (any supported format).
 
 ```bash
-python chronos.py finetune \
-    --model-path "./my_chronos_model" `# Path to your trained base model` \
+python hierarchos.py finetune \
+    --model-path "./my_Hierarchos_model" `# Path to your trained base model` \
     --hf_dataset "squad" `# Example: Use SQuAD for QA fine-tuning` \
     --prompt_column "question" \
     --completion_column "answers" `# Might need custom processing depending on format` \
@@ -244,8 +246,8 @@ python chronos.py finetune \
 Combine the base model and the LoRA adapter into a new, standalone model.
 
 ```bash
-python chronos.py merge-lora \
-    --model-path "./my_chronos_model" \
+python hierarchos.py merge-lora \
+    --model-path "./my_Hierarchos_model" \
     --lora-adapter-path "./my_squad_lora" \
     --out-dir "./my_model_merged_squad"
 ```
@@ -255,7 +257,7 @@ python chronos.py merge-lora \
 Convert a full-precision model to a quantized format for faster, lower-resource inference.
 
 ```bash
-python chronos.py quantize \
+python hierarchos.py quantize \
     --model-path "./my_model_merged_squad" \
     --out-dir "./my_model_merged_squad-Q4_0" \
     --qtype Q4_0 `# Choose format: INT4, Q4_0, Q8_0, Q2_K`
@@ -268,13 +270,13 @@ Interact with your trained or fine-tuned model.
 **Full Precision:**
 
 ```bash
-python chronos.py chat --model-path "./my_model_merged_squad"
+python hierarchos.py chat --model-path "./my_model_merged_squad"
 ```
 
 **Quantized *(Requires Compiled Kernel)*:**
 
 ```bash
-python chronos.py chat \
+python hierarchos.py chat \
     --model-path "./my_model_merged_squad-Q4_0" \
     --device cpu `# Or vulkan if compiled with Vulkan support`
 ```
@@ -282,7 +284,7 @@ python chronos.py chat \
 **Chat with Online Learning (Quantized Example - Requires Compiled Kernel):**
 
 ```bash
-python chronos.py chat \
+python hierarchos.py chat \
     --model-path "./my_model_merged_squad-Q4_0" \
     --enable-quantized-learning \
     --shadow-model-path "./my_model_merged_squad" `# Path to original full-precision model` \
@@ -295,10 +297,10 @@ python chronos.py chat \
 Continue a `train` run from a saved checkpoint (`.pt` file).
 
 ```bash
-python chronos.py train \
+python hierarchos.py train \
     # Dataset args might be loaded from checkpoint, specify only if needed \
     --out-dir "./my_large_model" \
-    --resume-from-ckpt "./my_large_model/chronos_epoch_1.pt" \
+    --resume-from-ckpt "./my_large_model/Hierarchos_epoch_1.pt" \
     --epochs 3 `# Total desired epochs` \
     --amp \
     --gradient-checkpointing # Ensure flag is consistent with the resumed run if needed
@@ -312,8 +314,8 @@ Create a larger model architecture initialized with weights from a smaller train
 
 ```bash
 python expand_model.py \
-    --old-model-path "./my_chronos_model/chronos.pt" `# Trained smaller model .pt file` \
-    --output-path "./expanded_model/chronos.pt" `# Path for the new, expanded .pt file` \
+    --old-model-path "./my_Hierarchos_model/Hierarchos.pt" `# Trained smaller model .pt file` \
+    --output-path "./expanded_model/Hierarchos.pt" `# Path for the new, expanded .pt file` \
     --context_dim 1024 `# New larger dimension` \
     --h_hidden 1024 \
     --l_hidden 1024
@@ -326,7 +328,7 @@ python expand_model.py \
 Start a *new* training session using only the *weights* from an existing model directory (not resuming optimizer/scheduler state).
 
 ```bash
-python chronos.py train \
+python hierarchos.py train \
     --hf_dataset "new_dataset_for_larger_model" \
     --text_column "text" \
     --model-path "./expanded_model" `# Load weights from expanded/previous model directory` \
@@ -342,7 +344,7 @@ python chronos.py train \
 
 ## ⚙️ Command-Line Reference
 
-### `chronos.py` Arguments
+### `hierarchos.py` Arguments
 
 | Argument                     | Mode(s)                             | Description                                                                                                                              | Default                 |
 | :----------------------------- | :---------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- | :---------------------- |
@@ -357,7 +359,7 @@ python chronos.py train \
 | `--pre_chunked_dataset`        | `train`, `finetune`                 | Load pre-chunked **JSONL** dataset iteratively (requires `--max_length`). Mutually Exclusive with `--pre_pt_dataset` & `--hf_dataset`.     | `False`                 |
 | `--pre_pt_dataset`             | `train`, `finetune`                 | Load pre-chunked **consolidated `.pt` tensor** dataset from directory specified in `--train` (requires `--max_length`). Mutually Exclusive with `--pre_chunked_dataset` & `--hf_dataset`. | `False`                 |
 | `--model-path`                 | `train`, `finetune`, `merge`, `quantize`, `chat` | Path to model directory. **[Train]**: Loads weights only (starts fresh training). **[Other]**: Loads for the specified mode. | `None`                  |
-| `--out-dir`                    | `train`, `finetune`, `merge`, `quantize` | Directory to save new models, checkpoints, or adapters.                                                                                | `./chronos_model`       |
+| `--out-dir`                    | `train`, `finetune`, `merge`, `quantize` | Directory to save new models, checkpoints, or adapters.                                                                                | `./Hierarchos_model`       |
 | `--tokenizer-path`             | `train`, `finetune`, `merge`, `quantize` | Path or HF name of tokenizer (if not loading from model-path).                                                                           | `openai-community/gpt2` |
 | `--resume-from-ckpt`           | `train`                             | Path to `.pt` checkpoint to **resume full training state** (optimizer, etc.).                                                            | `None`                  |
 | `--shadow-model-path`          | `chat`                              | Path to full-precision model dir for online learning with quantized model.                                                               | `None`                  |
@@ -416,7 +418,7 @@ python chronos.py train \
 | :------------------ | :------------------------------------------------------------------------------------------------ | :------- | :------------------------------ |
 | `--dataset`         | Path to the input **JSONL** dataset file (Kayla format recommended).                              | Yes      |                                 |
 | `--tokenizer-path`  | Path or Hugging Face name of the tokenizer to use for chunking.                                   | No       | `openai-community/gpt2`         |
-| `--output-dir`      | Directory to save the output **consolidated** `.pt` chunk files and `manifest.jsonl`.             | No       | `train_chronos_chunked_tensors` |
+| `--output-dir`      | Directory to save the output **consolidated** `.pt` chunk files and `manifest.jsonl`.             | No       | `train_Hierarchos_chunked_tensors` |
 | `--overlap`         | Number of tokens to overlap between consecutive chunks.                                           | No       | `1024`                          |
 | `--chunks-per-file` | Number of individual chunks to **consolidate** into a single `.pt` file.                          | No       | `1000`                          |
 
@@ -441,11 +443,11 @@ python chronos.py train \
 
 ## License
 
-The source code of Chronos is available to the public under a custom license. It is free for non-commercial use, research, and evaluation. However, any commercial use resulting in profit is subject to a profit-sharing agreement. See `LICENSE.md` for full details.
+The source code of Hierarchos is available to the public under a custom license. It is free for non-commercial use, research, and evaluation. However, any commercial use resulting in profit is subject to a profit-sharing agreement. See `LICENSE.md` for full details.
 
 ## Support This Project
 
-Please consider supporting my work on Patreon. I have motor cortex damage, which prevents me from working in a traditional tech role. I work on Chronos in my spare time while working full-time at a grocery store.
+Please consider supporting my work on Patreon. I have motor cortex damage, which prevents me from working in a traditional tech role. I work on Hierarchos in my spare time while working full-time at a grocery store.
 
 **[https://www.patreon.com/cw/MakhiBurroughs](https://www.patreon.com/cw/MakhiBurroughs)**
 
@@ -462,7 +464,7 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 ### v0.7.5 (alpha)
 
   * **Added Gradient Checkpointing**:
-      * Implemented gradient checkpointing (`torch.utils.checkpoint.checkpoint`) within the `ChronosCore` model's forward pass, specifically targeting the Adaptive HRM loop (`_adaptive_hrm_step`).
+      * Implemented gradient checkpointing (`torch.utils.checkpoint.checkpoint`) within the `HierarchosCore` model's forward pass, specifically targeting the Adaptive HRM loop (`_adaptive_hrm_step`).
       * Added the `--gradient-checkpointing` command-line flag for `train` and `finetune` modes to enable this feature.
       * When enabled, this significantly reduces VRAM usage by recomputing activations during the backward pass instead of storing them, allowing for larger models or batches on memory-constrained GPUs.
       * Updated `train` function to save the `gradient_checkpointing` state in model config/checkpoints.
