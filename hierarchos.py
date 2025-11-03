@@ -14,7 +14,7 @@ import math # For ceil in dataset chunking (though that script is separate)
 # Set this early, before tokenizers might be implicitly loaded by other imports
 # Setting to "true" forces parallelism despite potential fork issues (use with caution)
 # Setting to "false" explicitly disables parallelism in worker processes (safer, suppresses warning)
-os.environ["TOKENIZERS_PARALLELISM"] = "true" # Set to false for safety
+os.environ["TOKENIZERS_PARALLELISM"] = "true" 
 
 import torch
 import torch.nn as nn
@@ -116,10 +116,10 @@ else: # No CUDA detected
 
 # --- C++ Kernel Import ---
 try:
-    import chronos_matmul
+    import hierarchos_matmul
     _HAS_KERNEL = True
     print("Successfully imported C++ quantization kernel.")
-    if hasattr(chronos_matmul, "VULKAN_SUPPORT") and chronos_matmul.VULKAN_SUPPORT:
+    if hasattr(hierarchos_matmul, "VULKAN_SUPPORT") and hierarchos_matmul.VULKAN_SUPPORT:
         print("INFO: Vulkan support is enabled in the compiled kernel.")
         _HAS_VULKAN = True
     else:
@@ -127,7 +127,7 @@ try:
         _HAS_VULKAN = False
 except ImportError:
     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-    print("!!! WARNING: The compiled C++ kernel 'chronos_matmul' was not found.       !!!")
+    print("!!! WARNING: The compiled C++ kernel 'hierarchos_matmul' was not found.       !!!")
     print("!!!          Quantization and quantized inference will be unavailable.     !!!")
     print("!!!                                                                       !!!")
     print("!!! To enable these features, please run the appropriate setup script:    !!!")
@@ -141,8 +141,8 @@ except ImportError:
 
 
 # --- CONSTANTS ---
-MODEL_WEIGHTS_NAME = "chronos.pt"
-QUANTIZED_MODEL_WEIGHTS_NAME_TPL = "chronos-{qtype}.npz" # Template for the name
+MODEL_WEIGHTS_NAME = "hierarchos.pt"
+QUANTIZED_MODEL_WEIGHTS_NAME_TPL = "hierarchos-{qtype}.npz" # Template for the name
 
 
 # --- HELPER CLASS: AttrDict ---
@@ -683,7 +683,7 @@ class OriginalJSONLDataset(Dataset):
 # <<< NEW: Hugging Face Map-Style Dataset Class >>>
 class HuggingFaceMapStyleDataset(Dataset):
     """
-    Wraps a Hugging Face dataset (already loaded) for use with Chronos.
+    Wraps a Hugging Face dataset (already loaded) for use with hierarchos.
     Handles tokenization and formatting on the fly based on specified columns.
     """
     def __init__(self, hf_dataset, tokenizer, max_length: int, kayla_mode: bool = False,
@@ -781,7 +781,7 @@ def create_map_style_dataloader(
 
 
 # --- Quantization & Model Serialization ---
-# ... (Quantization code remains unchanged - assuming chronos_matmul is available) ...
+# ... (Quantization code remains unchanged - assuming hierarchos_matmul is available) ...
 def get_q_block_size(qtype: str) -> int:
     """Returns the block size for a given quantization type."""
     if qtype in ["INT4", "Q4_0", "Q8_0"]:
@@ -821,7 +821,7 @@ def export_and_quantize_model(output_dir: str, model: nn.Module, tokenizer, qtyp
                 pad_cols = Q_BLOCK_SIZE - (K % Q_BLOCK_SIZE)
                 float_tensor_np = np.pad(float_tensor_np, ((0, 0), (0, pad_cols)), 'constant')
 
-            quantized_data = chronos_matmul.quantize(float_tensor_np, qtype)
+            quantized_data = hierarchos_matmul.quantize(float_tensor_np, qtype)
             quantized_tensors[name] = {
                 "quantized": quantized_data,
                 "qtype": qtype,
@@ -904,7 +904,7 @@ class QuantizedLinear:
                 x_np = x_np[..., :padded_k]
 
 
-        y_np = chronos_matmul.matmul_quantized(x_np, self.quantized_w, self.M, self.qtype, device)
+        y_np = hierarchos_matmul.matmul_quantized(x_np, self.quantized_w, self.M, self.qtype, device)
 
         # Output shape should match original input dimensions + output features M
         if original_ndim > 2:
@@ -1115,8 +1115,8 @@ class LTMModule(nn.Module):
                 self.vals.data.add_(final_update)
 
 
-class ChronosCore(nn.Module):
-    """The full, trainable Chronos model, integrating HRM as the core processor."""
+class HierarchosCore(nn.Module):
+    """The full, trainable hierarchos model, integrating HRM as the core processor."""
     def __init__(self, config: dict):
         super().__init__()
         # Use AttrDict for config to support both dot-notation and .get() method access
@@ -1170,7 +1170,7 @@ class ChronosCore(nn.Module):
         self.tok_emb.weight = self.lm_head.weight # Weight tying
 
         # Ensure model config reflects its parameters
-        self.config.model_type = 'chronos'
+        self.config.model_type = 'hierarchos'
 
 
     # Methods to satisfy the PEFT library
@@ -1365,12 +1365,12 @@ class ChronosCore(nn.Module):
         return {"loss": loss, "logits": logits, "topk_vals": seq_topk_vals, "topk_idx": seq_topk_idx, "ponder_cost": ponder_cost_out}
 
 
-class QuantizedChronos:
-    # ... (QuantizedChronos remains unchanged) ...
-    """The quantized Chronos model for CPU/Vulkan inference."""
+class Quantizedhierarchos:
+    # ... (Quantizedhierarchos remains unchanged) ...
+    """The quantized hierarchos model for CPU/Vulkan inference."""
     def __init__(self, config: dict, q_data: dict):
         if not _HAS_KERNEL:
-            raise ImportError("Cannot initialize QuantizedChronos: C++ kernel not found.")
+            raise ImportError("Cannot initialize Quantizedhierarchos: C++ kernel not found.")
 
         self.config = AttrDict(config)
         self.qtype = None # Will be determined from the first quantized layer
@@ -1448,7 +1448,7 @@ class QuantizedChronos:
         if self.qtype is None:
             raise ValueError("Could not determine quantization type from the loaded model file.")
 
-        print(f"Initialized QuantizedChronos model ({self.qtype}) from config.")
+        print(f"Initialized Quantizedhierarchos model ({self.qtype}) from config.")
 
 
     def __call__(self, input_ids: torch.LongTensor, h_state: torch.Tensor, l_state: torch.Tensor, device: str = "cpu", min_timestamp: float = 0.0, source_filter: Optional[int] = None):
@@ -1542,11 +1542,11 @@ def load_quantized(model_path: str):
     config_dict = q_data['_config'].item() # Load config dict from npz
     # Ensure config gets 'model_type' if missing, useful for HF compatibility downstream
     if 'model_type' not in config_dict:
-        config_dict['model_type'] = 'chronos'
+        config_dict['model_type'] = 'hierarchos'
 
     config = AttrDict(config_dict) # Convert to AttrDict
 
-    return QuantizedChronos(config, q_data), config # Return both object and AttrDict config
+    return Quantizedhierarchos(config, q_data), config # Return both object and AttrDict config
 
 
 def load_full_model_with_config(model_path: str, device):
@@ -1580,7 +1580,7 @@ def load_full_model_with_config(model_path: str, device):
     config_dict = checkpoint['config'] # Config is likely a dict
     # Ensure model_type is present for HuggingFace compatibility
     if 'model_type' not in config_dict:
-        config_dict['model_type'] = 'chronos'
+        config_dict['model_type'] = 'hierarchos'
 
     # Ensure vocab_size is present before creating model
     if 'vocab_size' not in config_dict:
@@ -1589,7 +1589,7 @@ def load_full_model_with_config(model_path: str, device):
     config = AttrDict(config_dict) # Convert to AttrDict for model init
 
 
-    model = ChronosCore(config).to(device) # Pass AttrDict config to model
+    model = HierarchosCore(config).to(device) # Pass AttrDict config to model
 
     # Load state dict, be flexible with missing/extra keys if needed
     try:
@@ -1612,7 +1612,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
         config['hf_dataset_split'] = args.hf_dataset_split
     else:
         config['train_data_path'] = args.train
-    config['model_type'] = 'chronos' # Ensure model_type is set
+    config['model_type'] = 'hierarchos' # Ensure model_type is set
     # <<< MODIFIED: Save dataset type flags in config >>>
     config['pre_chunked_dataset'] = args.pre_chunked_dataset
     config['pre_pt_dataset'] = args.pre_pt_dataset
@@ -1751,10 +1751,10 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
 
             # Ensure model_type is present for HuggingFace compatibility
             if 'model_type' not in model_config:
-                model_config['model_type'] = 'chronos'
+                model_config['model_type'] = 'hierarchos'
 
             print("INFO: Re-initializing model architecture from checkpoint config.")
-            model = ChronosCore(model_config).to(device) # Create model AFTER potentially fixing vocab_size/max_length/grad_ckpt
+            model = HierarchosCore(model_config).to(device) # Create model AFTER potentially fixing vocab_size/max_length/grad_ckpt
         else:
             print("Warning: Config not found in checkpoint. Using current CLI args for model architecture.")
             cli_config = config # Use the initial config from vars(args)
@@ -1771,7 +1771,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
             cli_config['gradient_checkpointing'] = args.gradient_checkpointing
 
             model_config = AttrDict(cli_config) # Fallback, might cause issues if arch changed
-            model = ChronosCore(model_config).to(device)
+            model = HierarchosCore(model_config).to(device)
 
 
         # --- Optimizer Initialization/Loading Logic ---
@@ -1888,7 +1888,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
 
         # <<< NEW: gradient_checkpointing is already in config from vars(args) >>>
 
-        model = ChronosCore(config).to(device)
+        model = HierarchosCore(config).to(device)
         optimizer = ADAM_OPTIMIZER(model.parameters(), lr=args.starting_lr)
         model_config = AttrDict(config) # Use the potentially updated CLI args config
 
@@ -2053,7 +2053,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
             })
 
         # --- End of Epoch ---
-        ckpt_path = os.path.join(args.out_dir, f"chronos_epoch_{epoch + 1}.pt")
+        ckpt_path = os.path.join(args.out_dir, f"hierarchos_epoch_{epoch + 1}.pt")
         print(f"Epoch {epoch + 1} complete. Saving training checkpoint to {ckpt_path}")
 
         # Ensure config saved reflects current state (including potential patches)
@@ -2437,7 +2437,7 @@ def quantize(args, device, model=None, tokenizer=None, out_dir=None):
     if out_dir is None:
         if not args.out_dir:
             # Default to creating a new dir next to the source, e.g., './my_model-INT4'
-            source_dir = args.model_path if args.model_path else "./chronos_model"
+            source_dir = args.model_path if args.model_path else "./hierarchos_model"
             out_dir = source_dir.rstrip('/\\') + f"-{args.qtype}"
         else:
             out_dir = args.out_dir
@@ -2606,7 +2606,7 @@ def chat(args, device, tokenizer):
         dummy_optimizer = torch.optim.SGD([dummy_param_amp], lr=1.0) # Dummy optimizer for AMP scaler
         print("INFO: Automatic Mixed Precision (AMP) ENABLED for online learning.")
 
-    print("\nWelcome to Chronos Chat. Type 'exit' or 'quit' to end.")
+    print("\nWelcome to hierarchos Chat. Type 'exit' or 'quit' to end.")
     print("Use '/filter time=-<seconds>' or '/filter source=<id>' to constrain memory.")
     print("Example: /filter time=-3600  (memories from the last hour)")
     print("Use '/filter reset' to clear memory filters.")
@@ -2672,7 +2672,7 @@ def chat(args, device, tokenizer):
             prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device)
 
 
-            print("\nChronos: ", end="", flush=True)
+            print("\nhierarchos: ", end="", flush=True)
             response_ids = []
 
             # Initialize RNN states on the appropriate device
@@ -2944,7 +2944,7 @@ def chat(args, device, tokenizer):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Chronos: A Hybrid Memory-Reasoning Architecture")
+    parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora"], help="Operation mode.")
 
     # --- Data and Path Arguments (Universal) ---
@@ -2961,7 +2961,7 @@ def main():
     path_group.add_argument("--completion_column", type=str, default=None, help="[Train/Finetune] Column name for completion/response in HF dataset.")
     # --- Existing path arguments ---
     path_group.add_argument("--model-path", type=str, default=None, help="Path to the model directory (required for all modes except 'train' unless resuming or starting from scratch).")
-    path_group.add_argument("--out-dir", type=str, default="./chronos_model", help="[Train/Finetune/Merge/Quantize] Directory to save the new model/adapter.")
+    path_group.add_argument("--out-dir", type=str, default="./hierarchos_model", help="[Train/Finetune/Merge/Quantize] Directory to save the new model/adapter.")
     path_group.add_argument("--lora-adapter-path", type=str, default=None, help="[Merge/Finetune] Path to the LoRA adapter directory.")
     path_group.add_argument("--tokenizer-path", type=str, default=None, help="Path or HF name of the tokenizer (used if not loading from model-path, defaults to openai-community/gpt2).") # Allow None default
     path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="[Train] Path to a specific training checkpoint .pt file to resume from.")
