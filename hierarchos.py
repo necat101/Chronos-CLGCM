@@ -3,6 +3,7 @@ import sys
 import json
 import argparse
 import time
+import subprocess
 import numpy as np
 from typing import Optional, Tuple
 from tqdm import tqdm
@@ -14,6 +15,238 @@ import math # For ceil in dataset chunking (though that script is separate)
 # Set this early, before tokenizers might be implicitly loaded by other imports
 # Setting to "true" forces parallelism despite potential fork issues (use with caution)
 # Setting to "false" explicitly disables parallelism in worker processes (safer, suppresses warning)
+# Only run this environment setup logic if on Windows
+if os.name == 'nt':
+    CACHE_FILE = 'vcvars_path.cache.txt'
+    vcvars_path = None
+
+    # 1. Try to load the path from the cache file
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, 'r') as f:
+                cached_path = f.read().strip()
+            if os.path.exists(cached_path):
+                print(f"INFO: Found cached vcvars64.bat path: {cached_path}")
+                vcvars_path = cached_path
+            else:
+                print(f"INFO: Cached path '{cached_path}' no longer exists. Will try auto-detect.")
+        except Exception as e:
+            print(f"WARNING: Could not read cache file. Will try auto-detect. Error: {e}")
+
+    # 2. If no valid path from cache, try auto-detection
+    if vcvars_path is None:
+        print("INFO: No cached vcvars path. Attempting auto-detection...")
+        # Check standard paths for vswhere.exe
+        vswhere_path_progfiles_x86 = os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe")
+        vswhere_path_progfiles = os.path.expandvars(r"%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe")
+        
+        vswhere_path = None
+        if os.path.exists(vswhere_path_progfiles_x86):
+            vswhere_path = vswhere_path_progfiles_x86
+        elif os.path.exists(vswhere_path_progfiles):
+            vswhere_path = vswhere_path_progfiles
+            
+        if vswhere_path:
+            try:
+                # <<< MODIFICATION: Use vswhere to find vcvars64.bat directly >>>
+                # This is more robust than finding the installationPath and guessing.
+                # It asks for the path to 'vcvars64.bat' from the latest product
+                # that *requires* the C++ tools.
+                print("INFO: vswhere.exe found. Querying directly for vcvars64.bat...")
+                cmd = [
+                    vswhere_path,
+                    "-latest",
+                    "-products", "*",
+                    "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-find", r"VC\Auxiliary\Build\vcvars64.bat",
+                    "-nologo"
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8')
+                found_path = result.stdout.strip()
+
+                if found_path and os.path.exists(found_path):
+                    vcvars_path = found_path
+                    print(f"✅ INFO: vswhere.exe successfully found vcvars64.bat at: {vcvars_path}")
+                else:
+                    print(f"INFO: vswhere.exe ran but did not return a valid path.")
+                    print(f"   (stdout: {result.stdout})")
+
+            except Exception as e:
+                print(f"WARNING: 'vswhere.exe' direct find failed. Will fall back to manual prompt. Error: {e}")
+                # Note: stdout/stderr might be in e.args if check=True failed
+                if hasattr(e, 'stdout'): print(f"   (stdout: {e.stdout})")
+                if hasattr(e, 'stderr'): print(f"   (stderr: {e.stderr})")
+        else:
+            print(f"INFO: 'vswhere.exe' not found in standard locations. Will fall back to manual prompt.")
+
+    # 3. If auto-detection failed, fall back to user prompt
+    if vcvars_path is None:
+        print("---" * 20)
+        print("Microsoft Visual C++ (MSVC) 64-bit Compiler Setup (Manual Fallback)")
+        print("---" * 20)
+        print("Could not automatically find your 64-bit C++ compiler.")
+        print("To use 'torch.compile' (e.g., with --gradient-checkpointing), this script")
+        print("needs to find your 'vcvars64.bat' file.")
+        print("\nIt is usually located in a path like:")
+        print(r"  C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat")
+        print(r"  C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat")
+        print("---" * 20)
+        
+        try:
+            user_path = input("Enter the full path to vcvars64.bat (or press Enter to skip): ").strip()
+
+            if user_path and os.path.exists(user_path):
+                vcvars_path = user_path
+                print("INFO: Path validated.")
+            elif user_path: # User provided a path, but it's invalid
+                print(f"WARNING: Path '{user_path}' not found or is invalid.")
+                print("         Skipping environment setup. torch.compile may fail.")
+            else: # User pressed Enter
+                print("INFO: Skipping 64-bit environment setup.")
+                print("         'torch.compile' may fail unless you are in the correct dev terminal.")
+        
+        except EOFError:
+             print("\nINFO: No input received. Skipping 64-bit environment setup.")
+        
+        print("---" * 20)
+
+    # 4. If we have a valid path (from cache, auto-detect, or input), run it and set the environment
+    if vcvars_path:
+        # Cache the valid path for next time, regardless of how we found it
+        try:
+            with open(CACHE_FILE, 'w') as f:
+                f.write(vcvars_path)
+            print(f"INFO: 64-bit compiler path cached to '{CACHE_FILE}' for future runs.")
+        except Exception as e:
+            print(f"WARNING: Could not write cache file. You may be asked again. Error: {e}")
+
+        print(f"INFO: Loading 64-bit MSVC environment from '{vcvars_path}'...")
+        try:
+            python_exe = sys.executable
+            vcvars_dir = os.path.dirname(vcvars_path)
+            vcvarsall_path = os.path.join(vcvars_dir, "vcvarsall.bat")
+
+            if not os.path.exists(vcvarsall_path):
+                print(f"❌ ERROR: 'vcvarsall.bat' not found in the same directory as 'vcvars64.bat'.")
+                print(f"  Looked for: {vcvarsall_path}")
+                raise FileNotFoundError("vcvarsall.bat not found")
+
+            # This command runs vcvarsall.bat x64, which sets up the env,
+            # then (&&) runs a python one-liner (using the *exact* python.exe path)
+            # to print that new environment as a JSON string.
+            # --- FIX: Add >NUL 2>&1 to redirect stdout and stderr ---
+            cmd = f'"{vcvarsall_path}" x64 >NUL 2>&1 && echo ^"---ENV-JSON-START---^" && "{python_exe}" -c "import json, os; print(json.dumps(dict(os.environ)))"'
+            
+            # Hide the command window
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                shell=True,
+                check=True, # This will raise CalledProcessError if it fails
+                startupinfo=startupinfo,
+                encoding='utf-8',
+                errors='ignore',
+                cwd=vcvars_dir # Set CWD just in case
+            )
+            
+            json_start = result.stdout.find("---ENV-JSON-START---")
+            if json_start != -1:
+                # --- FIX: More robust JSON finding to skip control characters ---
+                raw_output_after_marker = result.stdout[json_start + len("---ENV-JSON-START---"):]
+                
+                # Find the first '{'
+                json_obj_start = raw_output_after_marker.find('{')
+                # Find the last '}'
+                json_obj_end = raw_output_after_marker.rfind('}')
+                
+                if json_obj_start != -1 and json_obj_end != -1 and json_obj_end > json_obj_start:
+                    json_str = raw_output_after_marker[json_obj_start : json_obj_end + 1]
+                    
+                    # Now try to parse this cleaned string
+                    try:
+                        env_vars = json.loads(json_str)
+                        
+                        # ==========================================================
+                        # --- ❗️❗️❗️ BEGIN KEY FIX ❗️❗️❗️ ---
+                        # ==========================================================
+                        # We must use env_vars.get() to retrieve the new values
+                        # and only assign them to os.environ if they are not None.
+                        # This avoids the KeyError: 'LIB' when os.environ['LIB']
+                        # is used as a fallback but doesn't exist.
+
+                        new_path = env_vars.get('PATH')
+                        new_lib = env_vars.get('LIB')
+                        new_include = env_vars.get('INCLUDE')
+                        
+                        if new_path is not None:
+                            os.environ['PATH'] = new_path
+                        else:
+                            print("WARNING: 'PATH' not found in vcvarsall.bat output.")
+                            
+                        if new_lib is not None:
+                            os.environ['LIB'] = new_lib
+                        else:
+                            # This was the variable causing the KeyError.
+                            # Set it to an empty string if not provided by vcvarsall.
+                            print("INFO: 'LIB' not found in vcvarsall.bat output. Setting to empty string.")
+                            os.environ['LIB'] = "" 
+                            
+                        if new_include is not None:
+                            os.environ['INCLUDE'] = new_include
+                        else:
+                            # Also set INCLUDE to empty string just in case.
+                            print("INFO: 'INCLUDE' not found in vcvarsall.bat output. Setting to empty string.")
+                            os.environ['INCLUDE'] = ""
+                        
+                        # ==========================================================
+                        # --- ❗️❗️❗️ END KEY FIX ❗️❗️❗️ ---
+                        # ==========================================================
+
+                        print("✅ INFO: 64-bit MSVC environment loaded successfully.")
+                    except json.JSONDecodeError as json_e:
+                        print(f"❌ ERROR: Failed to parse the environment JSON. {json_e}")
+                        print("     --- Raw JSON String (cleaned) ---")
+                        print(json_str[:500] + "...") # Print start of what was parsed
+                        print("     --- Full stdout after marker ---")
+                        print(raw_output_after_marker[:500] + "...")
+                else:
+                    print(f"WARNING: Could not find valid JSON object markers '{{' and '}}' after '---ENV-JSON-START---'.")
+                    print("STDOUT after marker:", raw_output_after_marker)
+            else:
+                print(f"WARNING: Could not find JSON marker in vcvarsall.bat output. Compiler might still fail.")
+                print("STDOUT:", result.stdout)
+                print("STDERR:", result.stderr)
+
+        except subprocess.CalledProcessError as e:
+            print(f"❌ ERROR: Failed to run vcvarsall.bat. torch.compile may fail.")
+            print(f"   Return Code: {e.returncode}")
+            print("   --- STDOUT ---")
+            print(e.stdout if e.stdout else "<No stdout>")
+            print("   --- STDERR ---")
+            print(e.stderr if e.stderr else "<No stderr>")
+            print("   --- End Output ---")
+            
+            # If the cached path failed, delete it so we ask again next time
+            if os.path.exists(CACHE_FILE):
+                print("INFO: Deleting bad cached path...")
+                try:
+                    os.remove(CACHE_FILE)
+                except Exception as del_e:
+                    print(f"WARNING: Could not delete cache file: {del_e}")
+                    
+        except Exception as e:
+            # Catch other errors like file-not-found for subprocess itself or JSONDecodeError
+            print(f"❌ ERROR: An unexpected error occurred while trying to run vcvarsall.bat.")
+            print(f"   Error: {e}")
+            print(f"   Error Type: {type(e)}") # Added type for debugging
+            traceback.print_exc(limit=2) # Print traceback for this
+        print("---" * 20)
+
 os.environ["TOKENIZERS_PARALLELISM"] = "true" 
 
 import torch
@@ -1171,6 +1404,21 @@ class HierarchosCore(nn.Module):
 
         # Ensure model config reflects its parameters
         self.config.model_type = 'hierarchos'
+
+        # <<< NEW: Apply torch.compile to the adaptive HRM step >>>
+        # This compiles the helper method that contains the static L-module loop
+        # for optimized training.
+        try:
+            # Check if torch.compile is available (requires PyTorch 2.0+)
+            if hasattr(torch, "compile"):
+                print("INFO: torch.compile available. Compiling _adaptive_hrm_step...")
+                # mode="reduce-overhead" is good for loops and small ops
+                # Note: This line re-binds the method on the instance
+                self._adaptive_hrm_step = torch.compile(self._adaptive_hrm_step, mode="reduce-overhead")
+            else:
+                print("INFO: torch.compile not found (requires PyTorch 2.0+). Skipping compilation.")
+        except Exception as e:
+                print(f"Warning: Failed to apply torch.compile. {e}. Proceeding without compilation.")
 
 
     # Methods to satisfy the PEFT library
