@@ -9,6 +9,7 @@ from typing import Optional, Tuple
 from tqdm import tqdm
 import traceback # Added for better error reporting
 import signal # <<< MODIFIED: Import signal >>>
+from torch.compiler import cudagraph_mark_step_begin # <<< ADD THIS LINE
 import math # For ceil in dataset chunking (though that script is separate)
 
 # <<< MODIFIED: Set Tokenizers Parallelism Environment Variable >>>
@@ -1409,17 +1410,21 @@ class HierarchosCore(nn.Module):
         # This compiles the helper method that contains the static L-module loop
         # for optimized training.
         try:
-            # Check if torch.compile is available (requires PyTorch 2.0+)
-            if hasattr(torch, "compile"):
-                print("INFO: torch.compile available. Compiling _adaptive_hrm_step...")
-                # mode="reduce-overhead" is good for loops and small ops
-                # Note: This line re-binds the method on the instance
-                self._adaptive_hrm_step = torch.compile(self._adaptive_hrm_step, mode="reduce-overhead")
-            else:
-                print("INFO: torch.compile not found (requires PyTorch 2.0+). Skipping compilation.")
-        except Exception as e:
-                print(f"Warning: Failed to apply torch.compile. {e}. Proceeding without compilation.")
+                # Check if torch.compile is available (requires PyTorch 2.0+)
+                if hasattr(torch, "compile"):
+                    print("INFO: torch.compile available. Compiling _adaptive_hrm_step...")
+                    print("INFO: Setting compiler options (no CUDAGraphs, dynamic shapes).")
 
+                    # Note: This line re-binds the method on the instance
+                    self._adaptive_hrm_step = torch.compile(
+                        self._adaptive_hrm_step,
+                        dynamic=True,                     # Fixes recompilation on variable length
+                        options={"triton.cudagraphs": False} # Fixes DataLoader hang
+                    )
+                else:
+                    print("INFO: torch.compile not found (requires PyTorch 2.0+). Skipping compilation.")
+        except Exception as e:
+            print(f"Warning: Failed to apply torch.compile. {e}. Proceeding without compilation.")
 
     # Methods to satisfy the PEFT library
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
@@ -2171,6 +2176,18 @@ def train(args, device, tokenizer, dataloader, dataloader_len): # <<< Pass datal
         steps_in_epoch = 0 # Track steps for averaging
 
         for i, batch in enumerate(pbar):
+
+            # ==========================================================
+            # --- ❗️❗️❗️ BEGIN KEY FIX ❗️❗️❗️ ---
+            # ==========================================================
+            # Tell the compiler that a new step is beginning.
+            # This fixes the CUDAGraphs + Checkpointing conflict.
+            #if device.type == 'cuda': # Only needed for CUDAGraphs
+            #    cudagraph_mark_step_begin()
+            # ==========================================================
+            # --- ❗️❗️❗️ END KEY FIX ❗️❗️❗️ ---
+            # ==========================================================
+
             # Handle potential None batch from collate_fn if it was empty
             if batch is None:
                 print(f"Warning: Skipping empty batch at step {i}.")
@@ -3189,8 +3206,6 @@ def chat(args, device, tokenizer):
 
         elif ltm_has_been_updated:
             print("\nLTM was updated, but saving is disabled (e.g., quantized mode without --enable-quantized-learning). Changes will be lost.")
-
-
 def main():
     parser = argparse.ArgumentParser(description="hierarchos: A Hybrid Memory-Reasoning Architecture")
     parser.add_argument("mode", type=str, choices=["train", "finetune", "chat", "quantize", "merge-lora"], help="Operation mode.")
@@ -3260,7 +3275,7 @@ def main():
     train_group.add_argument("--amp", action="store_true", help="[Train/Finetune/Chat] Enable Automatic Mixed Precision (AMP) for training/learning.")
     # <<< NEW: Gradient Checkpointing Flag >>>
     train_group.add_argument("--gradient-checkpointing", action="store_true",
-                             help="[Train/Finetune] Enable gradient checkpointing to save memory during training.")
+                                help="[Train/Finetune] Enable gradient checkpointing to save memory during training.")
     # <<< END >>>
 
 
@@ -3340,11 +3355,14 @@ def main():
     pt_device = pick_device()
     print(f"Using PyTorch device: {pt_device}")
 
+    if pt_device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
+
     # --- AMP Availability Check ---
     if args.amp and not _HAS_AMP:
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        print("!!! WARNING: --amp was specified, but torch amp support is not available.    !!!")
-        print("!!!  AMP will be DISABLED. Check CUDA and PyTorch install.                 !!!")
+        print("!!! WARNING: --amp was specified, but torch amp support is not available.     !!!")
+        print("!!!  AMP will be DISABLED. Check CUDA and PyTorch install.                  !!!")
         print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         args.amp = False # Force disable
     elif args.amp and pt_device == torch.device('cpu'):
@@ -3625,4 +3643,16 @@ def main():
 
 
 if __name__ == "__main__":
+    # --- ADD THIS LINE ---
+    # Fix for linux dataloader deadlock when num_workers > 0
+    # Must be inside __name__ == "__main__" block
+    try:
+        torch.multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError as e:
+        if "cannot be called" in str(e):
+             print("INFO: Multiprocessing context already set. Skipping 'spawn'.")
+        else:
+             print(f"Warning: Could not set multiprocessing start method 'spawn': {e}")
+    # --- END OF FIX ---
+    
     main()
