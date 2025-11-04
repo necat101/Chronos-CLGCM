@@ -4,7 +4,7 @@
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
-Due to Amazon's "Chronos" forcasting models (still based on transformers BTW) I've decdied to rename the project to "Hierarchos" from this point forward. this should prevent any naming confusion that may occur. all functional code is still the same
+Due to Amazon's "Chronos" forcasting models (still based on transformers BTW) I've decided to rename the project to "Hierarchos" from this point forward. this should prevent any naming confusion that may occur. all functional code is still the same
 
 -----
 
