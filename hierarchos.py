@@ -4,6 +4,7 @@ import json
 import argparse
 import time
 import subprocess
+import functools
 import numpy as np
 from typing import Optional, Tuple
 from tqdm import tqdm
@@ -966,6 +967,38 @@ class HuggingFaceMapStyleDataset(Dataset):
         return processed # process_text_sample returns None on error
 
 
+# <<< START: NEW TOP-LEVEL COLLATE FUNCTION >>>
+def _collate_fn_dynamic_padding(batch, pad_token_id: int):
+    """
+    Top-level collate function for map-style datasets, handling dynamic padding.
+    MUST be top-level for multiprocessing (num_workers > 0) to work on Windows/spawn.
+    """
+    # Filter out None items potentially returned by dataset __getitem__ if processing failed
+    batch = [item for item in batch if item is not None]
+    if not batch: return None # Return None if batch becomes empty
+
+    # Find max length *in this batch* for dynamic padding
+    max_len_batch = max(len(item['input_ids']) for item in batch)
+
+    input_ids_batch = torch.full((len(batch), max_len_batch), pad_token_id, dtype=torch.long)
+    labels_batch = torch.full((len(batch), max_len_batch), -100, dtype=torch.long) # Use -100 for padding labels
+    attention_mask_batch = torch.zeros((len(batch), max_len_batch), dtype=torch.long)
+
+    for i, item in enumerate(batch):
+        seq_len = len(item['input_ids'])
+        # Copy sequence data
+        input_ids_batch[i, :seq_len] = item['input_ids']
+        labels_batch[i, :seq_len] = item['labels']
+        attention_mask_batch[i, :seq_len] = 1 # Set attention mask to 1 for non-pad tokens
+
+    return {
+        "input_ids": input_ids_batch,
+        "labels": labels_batch,
+        "attention_mask": attention_mask_batch
+    }
+# <<< END: NEW TOP-LEVEL COLLATE FUNCTION >>>
+
+
 # <<< Modified original dataloader creator function to handle ANY map-style dataset >>>
 def create_map_style_dataloader(
     dataset: Dataset, # Accepts OriginalJSONLDataset or HuggingFaceMapStyleDataset
@@ -981,35 +1014,18 @@ def create_map_style_dataloader(
     if len(dataset) == 0:
         raise ValueError("Dataset provided to create_map_style_dataloader is empty or invalid.")
 
-    def collate_fn_dynamic_padding(batch):
-        # Filter out None items potentially returned by dataset __getitem__ if processing failed
-        batch = [item for item in batch if item is not None]
-        if not batch: return None # Return None if batch becomes empty
-
-        # Find max length *in this batch* for dynamic padding
-        max_len_batch = max(len(item['input_ids']) for item in batch)
-
-        input_ids_batch = torch.full((len(batch), max_len_batch), pad_token_id, dtype=torch.long)
-        labels_batch = torch.full((len(batch), max_len_batch), -100, dtype=torch.long) # Use -100 for padding labels
-        attention_mask_batch = torch.zeros((len(batch), max_len_batch), dtype=torch.long)
-
-        for i, item in enumerate(batch):
-            seq_len = len(item['input_ids'])
-            # Copy sequence data
-            input_ids_batch[i, :seq_len] = item['input_ids']
-            labels_batch[i, :seq_len] = item['labels']
-            attention_mask_batch[i, :seq_len] = 1 # Set attention mask to 1 for non-pad tokens
-
-        return {
-            "input_ids": input_ids_batch,
-            "labels": labels_batch,
-            "attention_mask": attention_mask_batch
-        }
+    # <<< FIX: Use functools.partial to create a collate_fn instance >>>
+    # This passes the pad_token_id to our new top-level function.
+    # This is necessary for multiprocessing (num_workers > 0) to work.
+    collate_fn_with_padding = functools.partial(
+        _collate_fn_dynamic_padding,
+        pad_token_id=pad_token_id
+    )
 
     pin_memory = torch.cuda.is_available() and num_workers > 0
     persistent_workers = num_workers > 0
-    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_dynamic_padding, shuffle=shuffle,
-                      num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
+    return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn_with_padding, shuffle=shuffle,
+                        num_workers=num_workers, pin_memory=pin_memory, persistent_workers=persistent_workers)
 
 # <<< END: Dataloader modifications >>>
 
