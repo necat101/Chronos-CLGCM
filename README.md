@@ -448,6 +448,12 @@ python hierarchos.py train \
 
 -----
 
+### Real world training performance (ROG ALLY Z1 Extreme CPU on Hierarchos v0.8.0 alpha):
+
+<img width="1824" height="647" alt="chrome_wX62mwSBIH" src="https://github.com/user-attachments/assets/500aa35b-ab32-427e-b0de-2842087f48c2" />
+<img width="1113" height="626" alt="WindowsTerminal_GXV9uDzz0R" src="https://github.com/user-attachments/assets/7fc825f5-410c-4189-9aca-d3f42e15b7c0" />
+
+
 ## Roadmap
 
   * [ ] Develop a user-friendly GUI wrapper for easier interaction.
