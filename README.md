@@ -437,9 +437,10 @@ python hierarchos.py train \
 -----
 
 ### Real world training performance (ROG ALLY Z1 Extreme CPU on Hierarchos v0.8.0 alpha):
+<img width="1113" height="626" alt="WindowsTerminal_GXV9uDzz0R" src="https://github.com/user-attachments/assets/ade557e2-b577-4df9-a688-06bbf0ec49b2" />
+<img width="1824" height="647" alt="chrome_wX62mwSBIH" src="https://github.com/user-attachments/assets/8b864948-4320-41cd-b619-665309fd1f48" />
 
-\<img width="1824" height="647" alt="chrome\_wX62mwSBIH" src="[https://github.com/user-attachments/assets/500aa35b-ab32-427e-b0de-2842087f48c2](https://github.com/user-attachments/assets/500aa35b-ab32-427e-b0de-2842087f48c2)" /\>
-\<img width="1113" height="626" alt="WindowsTerminal\_GXV9uDzz0R" src="[https://github.com/user-attachments/assets/7fc825f5-410c-4189-9aca-d3f42e15b7c0](https://github.com/user-attachments/assets/7fc825f5-410c-4189-9aca-d3f42e15b7c0)" /\>
+
 
 ## Roadmap
 
