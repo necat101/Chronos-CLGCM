@@ -21,12 +21,12 @@ Due to Amazon's "Chronos" forcasting models (still based on transformers BTW) I'
 
 > This version introduces **`torch.compile`**, leveraging the PyTorch 2.0+ JIT compiler to dramatically accelerate training on modern NVIDIA GPUs.
 >
-> 1.  **Experimental, Automatic Speedup:** 🔥 Hierarchos now **automatically** uses `torch.compile` on its core reasoning loop (`_adaptive_hrm_step`) if a compatible PyTorch version (2.0+) is detected. This fuses the model's complex operations into highly optimized kernels.
-> 2.  **Pay a One-Time "Warmup" Cost:** ⏳ The **first few steps or the first epoch of training will be significantly slower** than usual (e.g., 30-60+ seconds per step). This is expected—it's the one-time cost of the JIT compiler analyzing and optimizing the model.
-> 3.  **Massively Faster Training:** ⚡ After the initial compilation, subsequent training steps and epochs will be **dramatically faster** (often 1.5x-3x+), especially on powerful GPUs like the A100.
-> 4.  **Intelligent Configuration:** ⚙️ The implementation is pre-configured to handle the most common pitfalls:
->        \* **`dynamic=True`**: Handles variable sequence lengths from dynamic batching, preventing a recompilation on every step.
->        \* **`options={"triton.cudagraphs": False}`**: CUDAGraphs is disabled to prevent notorious deadlocks with the `DataLoader`'s multiprocessing workers on Linux systems.
+> 1.  **Experimental, Automatic Speedup:** 🔥 Hierarchos now **automatically** uses `torch.compile` on its core reasoning loop (`_adaptive_hrm_step`) if a compatible PyTorch version (2.0+) is detected. This fuses the model's complex operations into highly optimized kernels.
+> 2.  **Pay a One-Time "Warmup" Cost:** ⏳ The **first few steps or the first epoch of training will be significantly slower** than usual (e.g., 30-60+ seconds per step). This is expected—it's the one-time cost of the JIT compiler analyzing and optimizing the model.
+> 3.  **Massively Faster Training:** ⚡ After the initial compilation, subsequent training steps and epochs will be **dramatically faster** (often 1.5x-3x+), especially on powerful GPUs like the A100.
+> 4.  **Intelligent Configuration:** ⚙️ The implementation is pre-configured to handle the most common pitfalls:
+>       * **`dynamic=True`**: Handles variable sequence lengths from dynamic batching, preventing a recompilation on every step.
+>       * **`options={"triton.cudagraphs": False}`**: CUDAGraphs is disabled to prevent notorious deadlocks with the `DataLoader`'s multiprocessing workers on Linux systems.
 
 ## About The Project
 
@@ -46,24 +46,24 @@ A powerful, data-efficient, and deep reasoning engine. Its dual-module design (a
 
 ## Features ✨
 
-  \* 🔥 **PyTorch 2.0+ Compiled Training**: **Automatically uses `torch.compile`** on the core HRM loop for massive speedups (1.5x-3x+) on modern NVIDIA GPUs after an initial "warmup" compilation.
-  \* 🌐 **Hugging Face `datasets` Integration**: Load datasets directly from the HF Hub or local paths in various formats (CSV, Parquet, JSON, etc.) using `--hf_dataset`.
-  \* 💾 **Optimized Consolidated Chunk Loading**: Dramatically reduces RAM usage and speeds up training startup for large datasets using pre-processed, consolidated `.pt` tensor files and a manifest (`--pre_pt_dataset`). Includes file caching for efficiency.
-  \* 📜 **Iterable Dataset Support**: Option to load pre-chunked JSONL datasets line-by-line (`--pre_chunked_dataset`) for minimal memory overhead during training.
-  \* ✂️ **Dataset Consolidation Script (`dataset_chunk_create.py`)**: Enhanced tool to prepare large datasets, chunking them into **consolidated `.pt` files** and creating a `manifest.jsonl` for efficient loading. Handles tokenization, anchoring, padding, and masking.
-  \* 📉 **Gradient Checkpointing**: Significantly reduces VRAM usage during training/fine-tuning (`--gradient-checkpointing`), enabling larger models or batches on memory-constrained hardware by trading compute for memory.
-  \* 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
-  \* 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
-  \* 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
-  \* ⚡ **Accelerated Training with AMP**: Supports Automatic Mixed Precision (`--amp`) for faster training and reduced memory usage on compatible NVIDIA GPUs.
-  \* 🛡️ **Stable Training**: Built-in gradient clipping (`--grad-clip`) to prevent model instability and ensure smoother convergence.
-  \* 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config for easy sharing and use.
-  \* 💾 **Automatic Re-quantization**: After a learning session, Hierarchos can automatically re-quantize a model to persist the new knowledge (`--enable-quantized-learning` in `chat`). *(Requires compiled kernel)*
-  \* 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones, now supporting changes in `max_length` and automatic length detection from datasets.
-  \* ✨ **Flexible Training Initiation**: Supports starting training runs using weights from existing model directories (inference or expanded models via `--model-path` in `train` mode), not just resuming full training checkpoints (`--resume-from-ckpt`).
-  \* ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). *(Requires compiled kernel)*
-  \* 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX/NEON) or on GPUs via Vulkan for broad hardware compatibility. *(Requires compiled kernel)*
-  \* 🔧 **Comprehensive Tooling**: Includes a single script (`hierarchos.py`) for training, LoRA fine-tuning, merging, quantization, and interactive chat, plus the model expansion and dataset chunking scripts.
+  * 🔥 **PyTorch 2.0+ Compiled Training**: **Automatically uses `torch.compile`** on the core HRM loop for massive speedups (1.5x-3x+) on modern NVIDIA GPUs after an initial "warmup" compilation.
+  * 🌐 **Hugging Face `datasets` Integration**: Load datasets directly from the HF Hub or local paths in various formats (CSV, Parquet, JSON, etc.) using `--hf_dataset`.
+  * 💾 **Optimized Consolidated Chunk Loading**: Dramatically reduces RAM usage and speeds up training startup for large datasets using pre-processed, consolidated `.pt` tensor files and a manifest (`--pre_pt_dataset`). Includes file caching for efficiency.
+  * 📜 **Iterable Dataset Support**: Option to load pre-chunked JSONL datasets line-by-line (`--pre_chunked_dataset`) for minimal memory overhead during training.
+  * ✂️ **Dataset Consolidation Script (`dataset_chunk_create.py`)**: Enhanced tool to prepare large datasets, chunking them into **consolidated `.pt` files** and creating a `manifest.jsonl` for efficient loading. Handles tokenization, anchoring, padding, and masking.
+  * 📉 **Gradient Checkpointing**: Significantly reduces VRAM usage during training/fine-tuning (`--gradient-checkpointing`), enabling larger models or batches on memory-constrained hardware by trading compute for memory.
+  * 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
+  * 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
+  * 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
+  * ⚡ **Accelerated Training with AMP**: Supports Automatic Mixed Precision (`--amp`) for faster training and reduced memory usage on compatible NVIDIA GPUs.
+  * 🛡️ **Stable Training**: Built-in gradient clipping (`--grad-clip`) to prevent model instability and ensure smoother convergence.
+  * 📦 **Self-Contained & Portable Models**: Models are saved as directories containing weights, tokenizer, and architecture config for easy sharing and use.
+  * 💾 **Automatic Re-quantization**: After a learning session, Hierarchos can automatically re-quantize a model to persist the new knowledge (`--enable-quantized-learning` in `chat`). *(Requires compiled kernel)*
+  * 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones, now supporting changes in `max_length` and automatic length detection from datasets.
+  * ✨ **Flexible Training Initiation**: Supports starting training runs using weights from existing model directories (inference or expanded models via `--model-path` in `train` mode), not just resuming full training checkpoints (`--resume-from-ckpt`).
+  * ⚡ **High-Performance Inference**: Utilizes a custom C++ kernel inspired by `llama.cpp` for state-of-the-art quantization (`INT4`, `Q4_0`, `Q8_0`, `Q2_K`). *(Requires compiled kernel)*
+  * 💻 **CPU & GPU Support**: Runs fast quantized inference on standard CPUs (with AVX/NEON) or on GPUs via Vulkan for broad hardware compatibility. *(Requires compiled kernel)*
+  * 🔧 **Comprehensive Tooling**: Includes a single script (`hierarchos.py`) for training, LoRA fine-tuning, merging, quantization, and interactive chat, plus the model expansion and dataset chunking scripts.
 
 -----
 
@@ -73,16 +73,16 @@ Follow these steps to get a local copy up and running.
 
 ### Prerequisites
 
-  \* Python 3.8+
-  \* **PyTorch 2.0+ (Required for `torch.compile` speedups)**
-  \* **For Hugging Face Datasets:** `pip install datasets`
-  \* **Optional (Quantization/Vulkan):**
-  \* A C++ compiler (e.g., MSVC on Windows, GCC on Linux)
-  \* CMake (must be available in your system's `PATH`)
-  \* Vulkan-compatible GPU and installed drivers (for Vulkan inference)
-  \* **Vulkan SDK** (if compiling with `--vulkan` on Windows. On Linux, the script will attempt to auto-install `glslang-tools` and `libvulkan-dev` via `apt`.)
-  \* **Optional (AMP Training/Gradient Checkpointing):** NVIDIA GPU with CUDA support (Compute Capability 7.0+ recommended) and a PyTorch build with CUDA enabled.
-  \* **Optional (Kernel Build Dependencies):** `pip install pybind11 cmake`
+  * Python 3.8+
+  * **PyTorch 2.0+ (Required for `torch.compile` speedups)**
+  * **For Hugging Face Datasets:** `pip install datasets`
+  * **Optional (Quantization/Vulkan):**
+  * A C++ compiler (e.g., MSVC on Windows, GCC on Linux)
+  * CMake (must be available in your system's `PATH`)
+  * Vulkan-compatible GPU and installed drivers (for Vulkan inference)
+  * **Vulkan SDK** (if compiling with `--vulkan` on Windows. On Linux, the script will attempt to auto-install `glslang-tools` and `libvulkan-dev` via `apt`.)
+  * **Optional (AMP Training/Gradient Checkpointing):** NVIDIA GPU with CUDA support (Compute Capability 7.0+ recommended) and a PyTorch build with CUDA enabled.
+  * **Optional (Kernel Build Dependencies):** `pip install pybind11 cmake`
 
 ### Installation
 
@@ -136,57 +136,57 @@ Choose **one** data source option:
 
 ```bash
 python hierarchos.py train \
-    --train "path/to/your_data.jsonl" \
-    --tokenizer-path "openai-community/gpt2" `# Or your preferred tokenizer` \
-    --out-dir "./my_Hierarchos_model" \
-    --epochs 3 \
-    --batch_size 4 \
-    --accumulation-steps 2 `# Effective batch size = 8` \
-    --auto-max-length `# Automatically determines max sequence length` \
-    --context_dim 768 `# Example architecture` \
-    --h_hidden 768 \
-    --l_hidden 768 \
-    --max_h_steps 5 \
-    --max_l_steps 5 \
-    --amp `# Enable Mixed Precision for speed` \
-    --gradient-checkpointing # Add this if VRAM is limited
+    --train "path/to/your_data.jsonl" \
+    --tokenizer-path "openai-community/gpt2" `# Or your preferred tokenizer` \
+    --out-dir "./my_Hierarchos_model" \
+    --epochs 3 \
+    --batch_size 4 \
+    --accumulation-steps 2 `# Effective batch size = 8` \
+    --auto-max-length `# Automatically determines max sequence length` \
+    --context_dim 768 `# Example architecture` \
+    --h_hidden 768 \
+    --l_hidden 768 \
+    --max_h_steps 5 \
+    --max_l_steps 5 \
+    --amp `# Enable Mixed Precision for speed` \
+    --gradient-checkpointing # Add this if VRAM is limited
 ```
 
 **(B) Hugging Face Dataset (Text Completion):**
 
 ```bash
 python hierarchos.py train \
-    --hf_dataset "wikitext" \
-    --hf_dataset_config "wikitext-2-raw-v1" \
-    --hf_dataset_split "train" \
-    --text_column "text" `# Column containing the text` \
-    --tokenizer-path "openai-community/gpt2" \
-    --out-dir "./my_wikitext_model" \
-    --epochs 1 \
-    --batch_size 2 \
-    --accumulation-steps 4 \
-    --auto-max-length \
-    --amp \
-    --gradient-checkpointing # Add this if VRAM is limited
+    --hf_dataset "wikitext" \
+    --hf_dataset_config "wikitext-2-raw-v1" \
+    --hf_dataset_split "train" \
+    --text_column "text" `# Column containing the text` \
+    --tokenizer-path "openai-community/gpt2" \
+    --out-dir "./my_wikitext_model" \
+    --epochs 1 \
+    --batch_size 2 \
+    --accumulation-steps 4 \
+    --auto-max-length \
+    --amp \
+    --gradient-checkpointing # Add this if VRAM is limited
 ```
 
 **(C) Hugging Face Dataset (Instruction/Kayla Format):**
 
 ```bash
 python hierarchos.py train \
-    --hf_dataset "databricks/databricks-dolly-15k" \
-    --prompt_column "Instruction" \
-    --completion_column "output" \
-    # --kayla # Add if your HF data structure matches Kayla format (instruction, output, thought-process, feelings) \
-    # --text_column "context" # Example: Map 'context' field if needed for your format \
-    --tokenizer-path "openai-community/gpt2" \
-    --out-dir "./my_dolly_model" \
-    --epochs 2 \
-    --batch_size 1 \
-    --accumulation-steps 8 \
-    --auto-max-length \
-    --amp \
-    --gradient-checkpointing # Add this if VRAM is limited
+    --hf_dataset "databricks/databricks-dolly-15k" \
+    --prompt_column "Instruction" \
+    --completion_column "output" \
+    # --kayla # Add if your HF data structure matches Kayla format (instruction, output, thought-process, feelings) \
+    # --text_column "context" # Example: Map 'context' field if needed for your format \
+    --tokenizer-path "openai-community/gpt2" \
+    --out-dir "./my_dolly_model" \
+    --epochs 2 \
+    --batch_size 1 \
+    --accumulation-steps 8 \
+    --auto-max-length \
+    --amp \
+    --gradient-checkpointing # Add if VRAM is limited
 ```
 
 **(D) Pre-Chunked Local Dataset (Very Large Dataset):**
@@ -229,17 +229,17 @@ Adapt a pre-trained model using new data (any supported format).
 
 ```bash
 python hierarchos.py finetune \
-    --model-path "./my_Hierarchos_model" `# Path to your trained base model` \
-    --hf_dataset "squad" `# Example: Use SQuAD for QA fine-tuning` \
-    --prompt_column "question" \
-    --completion_column "answers" `# Might need custom processing depending on format` \
-    --text_column "context" `# Use context as part of the prompt` \
-    --out-dir "./my_squad_lora" \
-    --epochs 1 \
-    --lora_r 16 \
-    --lora_alpha 32 \
-    --amp \
-    --gradient-checkpointing `# Use if fine-tuning large models on limited VRAM`
+    --model-path "./my_Hierarchos_model" `# Path to your trained base model` \
+    --hf_dataset "squad" `# Example: Use SQuAD for QA fine-tuning` \
+    --prompt_column "question" \
+    --completion_column "answers" `# Might need custom processing depending on format` \
+    --text_column "context" `# Use context as part of the prompt` \
+    --out-dir "./my_squad_lora" \
+    --epochs 1 \
+    --lora_r 16 \
+    --lora_alpha 32 \
+    --amp \
+    --gradient-checkpointing `# Use if fine-tuning large models on limited VRAM`
 ```
 
 ### Workflow 3: Merging LoRA Adapter
@@ -248,9 +248,9 @@ Combine the base model and the LoRA adapter into a new, standalone model.
 
 ```bash
 python hierarchos.py merge-lora \
-    --model-path "./my_Hierarchos_model" \
-    --lora-adapter-path "./my_squad_lora" \
-    --out-dir "./my_model_merged_squad"
+    --model-path "./my_Hierarchos_model" \
+    --lora-adapter-path "./my_squad_lora" \
+    --out-dir "./my_model_merged_squad"
 ```
 
 ### Workflow 4: Quantizing a Model *(Requires Compiled Kernel)*
@@ -259,9 +259,9 @@ Convert a full-precision model to a quantized format for faster, lower-resource 
 
 ```bash
 python hierarchos.py quantize \
-    --model-path "./my_model_merged_squad" \
-    --out-dir "./my_model_merged_squad-Q4_0" \
-    --qtype Q4_0 `# Choose format: INT4, Q4_0, Q8_0, Q2_K`
+    --model-path "./my_model_merged_squad" \
+    --out-dir "./my_model_merged_squad-Q4_0" \
+    --qtype Q4_0 `# Choose format: INT4, Q4_0, Q8_0, Q2_K`
 ```
 
 ### Workflow 5: Running Chat Inference
@@ -278,19 +278,19 @@ python hierarchos.py chat --model-path "./my_model_merged_squad"
 
 ```bash
 python hierarchos.py chat \
-    --model-path "./my_model_merged_squad-Q4_0" \
-    --device cpu `# Use "vulkan" if you built with --vulkan`
+    --model-path "./my_model_merged_squad-Q4_0" \
+    --device cpu `# Use "vulkan" if you built with --vulkan`
 ```
 
 **Chat with Online Learning (Quantized Example - Requires Compiled Kernel):**
 
 ```bash
 python hierarchos.py chat \
-    --model-path "./my_model_merged_squad-Q4_0" \
-    --enable-quantized-learning \
-    --shadow-model-path "./my_model_merged_squad" `# Path to original full-precision model` \
-    --amp `# Optional: Speed up the learning step on CUDA` \
-    # --ltm-lora-path "./my_chat_ltm_updates.pt" # Optional: Save LTM updates separately
+    --model-path "./my_model_merged_squad-Q4_0" \
+    --enable-quantized-learning \
+    --shadow-model-path "./my_model_merged_squad" `# Path to original full-precision model` \
+    --amp `# Optional: Speed up the learning step on CUDA` \
+    # --ltm-lora-path "./my_chat_ltm_updates.pt" # Optional: Save LTM updates separately
 ```
 
 ### Workflow 6: Resuming Interrupted Training
@@ -299,15 +299,15 @@ Continue a `train` run from a saved checkpoint (`.pt` file).
 
 ```bash
 python hierarchos.py train \
-    # Dataset args might be loaded from checkpoint, specify only if needed \
-    --out-dir "./my_large_model" \
-    --resume-from-ckpt "./my_large_model/Hierarchos_epoch_1.pt" \
-    --epochs 3 `# Total desired epochs` \
-    --amp \
-    --gradient-checkpointing # Ensure flag is consistent with the resumed run if needed
+    # Dataset args might be loaded from checkpoint, specify only if needed \
+    --out-dir "./my_large_model" \
+    --resume-from-ckpt "./my_large_model/Hierarchos_epoch_1.pt" \
+    --epochs 3 `# Total desired epochs` \
+    --amp \
+    --gradient-checkpointing # Ensure flag is consistent with the resumed run if needed
 ```
 
-  \* Use `--override-scheduling` with `--starting-lr`/`--min-lr` to change the learning rate schedule upon resuming.
+  * Use `--override-scheduling` with `--starting-lr`/`--min-lr` to change the learning rate schedule upon resuming.
 
 ### Workflow 7: Expanding a Model *(Requires `expand_model.py`)*
 
@@ -315,13 +315,13 @@ Create a larger model architecture initialized with weights from a smaller train
 
 ```bash
 python expand_model.py \
-    --old-model-path "./my_Hierarchos_model/Hierarchos.pt" `# Trained smaller model .pt file` \
-    --output-path "./expanded_model/Hierarchos.pt" `# Path for the new, expanded .pt file` \
-    --context_dim 1024 `# New larger dimension` \
-    --h_hidden 1024 \
-    --l_hidden 1024
-    # Note: expand_model.py takes specific architecture args to change.
-    # Other config values are copied from the old model's checkpoint.
+    --old-model-path "./my_Hierarchos_model/Hierarchos.pt" `# Trained smaller model .pt file` \
+    --output-path "./expanded_model/Hierarchos.pt" `# Path for the new, expanded .pt file` \
+    --context_dim 1024 `# New larger dimension` \
+    --h_hidden 1024 \
+    --l_hidden 1024
+    # Note: expand_model.py takes specific architecture args to change.
+    # Other config values are copied from the old model's checkpoint.
 ```
 
 ### Workflow 8: Continuing Training (After Expanding or from Inference Checkpoint)
@@ -330,15 +330,15 @@ Start a *new* training session using only the *weights* from an existing model d
 
 ```bash
 python hierarchos.py train \
-    --hf_dataset "new_dataset_for_larger_model" \
-    --text_column "text" \
-    --model-path "./expanded_model" `# Load weights from expanded/previous model directory` \
-    --tokenizer-path "./expanded_model" `# Use its tokenizer (assuming it was copied)` \
-    --out-dir "./expanded_model_trained" \
-    --epochs 2 \
-    --starting-lr 5e-5 `# Start with a potentially smaller LR` \
-    --amp \
-    --gradient-checkpointing # Add if VRAM is limited
+    --hf_dataset "new_dataset_for_larger_model" \
+    --text_column "text" \
+    --model-path "./expanded_model" `# Load weights from expanded/previous model directory` \
+    --tokenizer-path "./expanded_model" `# Use its tokenizer (assuming it was copied)` \
+    --out-dir "./expanded_model_trained" \
+    --epochs 2 \
+    --starting-lr 5e-5 `# Start with a potentially smaller LR` \
+    --amp \
+    --gradient-checkpointing # Add if VRAM is limited
 ```
 
 -----
@@ -443,9 +443,9 @@ python hierarchos.py train \
 
 ## Roadmap
 
-  \* [ ] Develop a user-friendly GUI wrapper for easier interaction.
-  \* [ ] Extend the architecture to support multi-modal inputs (images, audio).
-  \* [ ] Implement the entire training loop in Vulkan/CUDA for end-to-end GPU acceleration.
+  * [ ] Develop a user-friendly GUI wrapper for easier interaction.
+  * [ ] Extend the architecture to support multi-modal inputs (images, audio).
+  * [ ] Implement the entire training loop in Vulkan/CUDA for end-to-end GPU acceleration.
 
 ## License
 
@@ -459,102 +459,100 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ## Acknowledgements
 
-  \* This architecture is inspired by the concepts in Google's **Titans** and Sapient Intelligence's **HRM** papers.
-  \* The quantization kernel design is heavily influenced by the groundbreaking work in **llama.cpp**.
-  \* **pybind11** for seamless C++/Python integration.
-  \* **Hugging Face `datasets`** library for broad data compatibility.
-  \* **PyTorch Team** for `torch.compile` and gradient checkpointing functionality.
+  * This architecture is inspired by the concepts in Google's **Titans** and Sapient Intelligence's **HRM** papers.
+  * The quantization kernel design is heavily influenced by the groundbreaking work in **llama.cpp**.
+  * **pybind11** for seamless C++/Python integration.
+  * **Hugging Face `datasets`** library for broad data compatibility.
+  * **PyTorch Team** for `torch.compile` and gradient checkpointing functionality.
 
 ## Changelog
 
 ### v0.8.5 (alpha)
 
-  \* **Reworked Kernel Build System**:
-      \* `setup.bat` and `setup.sh` now build the **CPU-only** kernel by default, which is recommended for most users due to the model's sequential nature.
-      \* Added a `--vulkan` flag to both scripts to optionally compile the Vulkan backend for GPU-accelerated quantized inference.
-  \* **Added Linux Vulkan SDK Auto-Installer**:
-      \* `setup.sh --vulkan` will now detect if `glslangValidator` is missing and attempt to install `glslang-tools` and `libvulkan-dev` via `apt` (prompting for sudo).
-  \* **Fixed Cross-Platform Vulkan Build**:
-      \* Updated `CMakeLists.txt` to correctly find both `glslangValidator` (common on Linux) and `glslc` (common on Windows).
-      \* Made the `-V` compiler flag conditional, as it's required by `glslangValidator` but rejected by `glslc`, fixing the Windows build failure.
-      \* Fixed the Linux build failure by adding a command to create the `shaders` build directory before the compiler tries to write to it.
+  * **Reworked Kernel Build System**:
+      * `setup.bat` and `setup.sh` now build the **CPU-only** kernel by default, which is recommended for most users due to the model's sequential nature.
+      * Added a `--vulkan` flag to both scripts to optionally compile the Vulkan backend for GPU-accelerated quantized inference.
+  * **Added Linux Vulkan SDK Auto-Installer**:
+      * `setup.sh --vulkan` will now detect if `glslangValidator` is missing and attempt to install `glslang-tools` and `libvulkan-dev` via `apt` (prompting for sudo).
+  * **Fixed Cross-Platform Vulkan Build**:
+      * Updated `CMakeLists.txt` to correctly find both `glslangValidator` (common on Linux) and `glslc` (common on Windows).
+      * Made the `-V` compiler flag conditional, as it's required by `glslangValidator` but rejected by `glslc`, fixing the Windows build failure.
+      * Fixed the Linux build failure by adding a command to create the `shaders` build directory before the compiler tries to write to it.
 
 ### v0.8.0 (alpha)
 
-  \* **Added Experimental `torch.compile` Support**:
-      \* The core reasoning loop (`_adaptive_hrm_step`) is now automatically compiled using `torch.compile` if PyTorch 2.0+ is detected.
-      \* This results in a **massive training speedup** (1.5x-3x+) on modern NVIDIA GPUs after an initial one-time "warmup" compilation on the first few steps.
-      \* The compiler is pre-configured with `dynamic=True` to handle variable batch lengths and prevent recompilation.
-      \* CUDAGraphs is explicitly disabled (`options={"triton.cudagraphs": False}`) to resolve `DataLoader` multiprocessing deadlocks on Linux systems.
+  * **Added Experimental `torch.compile` Support**:
+      * The core reasoning loop (`_adaptive_hrm_step`) is now automatically compiled using `torch.compile` if PyTorch 2.0+ is detected.
+      * This results in a **massive training speedup** (1.5x-3x+) on modern NVIDIA GPUs after an initial one-time "warmup" compilation on the first few steps.
+      * The compiler is pre-configured with `dynamic=True` to handle variable batch lengths and prevent recompilation.
+      * CUDAGraphs is explicitly disabled (`options={"triton.cudagraphs": False}`) to resolve `DataLoader` multiprocessing deadlocks on Linux systems.
 
 ### v0.7.5 (alpha)
 
-  \* **Added Gradient Checkpointing**:
-      \* Implemented gradient checkpointing (`torch.utils.checkpoint.checkpoint`) within the `HierarchosCore` model's forward pass, specifically targeting the Adaptive HRM loop (`_adaptive_hrm_step`).
-      \* Added the `--gradient-checkpointing` command-line flag for `train` and `finetune` modes to enable this feature.
-      \* When enabled, this significantly reduces VRAM usage by recomputing activations during the backward pass instead of storing them, allowing for larger models or batches on memory-constrained GPUs.
-
+  * **Added Gradient Checkpointing**:
+      * Implemented gradient checkpointing (`torch.utils.checkpoint.checkpoint`) within the `HierarchosCore` model's forward pass, specifically targeting the Adaptive HRM loop (`_adaptive_hrm_step`).
+      * Added the `--gradient-checkpointing` command-line flag for `train` and `finetune` modes to enable this feature.
+      * When enabled, this significantly reduces VRAM usage by recomputing activations during the backward pass instead of storing them, allowing for larger models or batches on memory-constrained GPUs.
   * Updated `train` function to save the `gradient_checkpointing` state in model config/checkpoints.
-      \* **Updated Documentation**: Added comprehensive documentation for gradient checkpointing in README (Features, User Guide, Command-Line Reference, Changelog). Updated version number. Corrected `expand_model.py` usage/arguments. Restored previously removed documentation sections.
+  * **Updated Documentation**: Added comprehensive documentation for gradient checkpointing in README (Features, User Guide, Command-Line Reference, Changelog). Updated version number. Corrected `expand_model.py` usage/arguments. Restored previously removed documentation sections.
 
 ### v0.7.0 (alpha)
 
-  \* **Added Hugging Face `datasets` Support**:
-      \* Integrated `datasets` library to load data directly from the Hub or local paths (CSV, Parquet, JSON, Arrow, text, etc.).
-      \* Added new arguments: `--hf_dataset`, `--hf_dataset_config`, `--hf_dataset_split`, `--text_column`, `--prompt_column`, `--completion_column`.
-      \* `--train` and `--hf_dataset` are now mutually exclusive sources.
-      \* Updated `train`, `finetune`, and `main` functions to handle the new loading mechanism.
-      \* Added `HuggingFaceMapStyleDataset` class and refactored dataloader creation.
-      \* Added `datasets` to requirements files.
-  \* **Clarified HRM Training Cost**: Added explanation in README about the impact of `--max_h_steps` and `--max_l_steps` on training speed and compute requirements due to iterative convergence.
-  \* **Updated Documentation**: Modified User Guide examples and Command-Line Reference to include HF dataset usage and arguments. Corrected defaults and argument descriptions based on latest code.
+  * **Added Hugging Face `datasets` Support**:
+      * Integrated `datasets` library to load data directly from the Hub or local paths (CSV, Parquet, JSON, Arrow, text, etc.).
+      * Added new arguments: `--hf_dataset`, `--hf_dataset_config`, `--hf_dataset_split`, `--text_column`, `--prompt_column`, `--completion_column`.
+      * `--train` and `--hf_dataset` are now mutually exclusive sources.
+      * Updated `train`, `finetune`, and `main` functions to handle the new loading mechanism.
+      * Added `HuggingFaceMapStyleDataset` class and refactored dataloader creation.
+      * Added `datasets` to requirements files.
+  * **Clarified HRM Training Cost**: Added explanation in README about the impact of `--max_h_steps` and `--max_l_steps` on training speed and compute requirements due to iterative convergence.
+  * **Updated Documentation**: Modified User Guide examples and Command-Line Reference to include HF dataset usage and arguments. Corrected defaults and argument descriptions based on latest code.
 
 ### v0.6.2 (alpha)
 
-  \* **Migrated from keyboard to signal**: Now uses Python standard "signal" library for chat interruption.
+  * **Migrated from keyboard to signal**: Now uses Python standard "signal" library for chat interruption.
 
 ### v0.6.1 (alpha)
 
-  \* **Optimized Pre-Chunked Tensor Loading (`--pre_pt_dataset`)**:
-      \* `dataset_chunk_create.py` now saves **consolidated `.pt` files**.
-      \* A `manifest.jsonl` file is created for mapping chunks.
-      \* `PTChunkedDataset` updated to use manifest and **caching**.
-  \* **Documentation**: Updated README for consolidated chunking.
+  * **Optimized Pre-Chunked Tensor Loading (`--pre_pt_dataset`)**:
+  * `dataset_chunk_create.py` now saves **consolidated `.pt` files**.
+  * A `manifest.jsonl` file is created for mapping chunks.
+  * `PTChunkedDataset` updated to use manifest and **caching**.
+  * **Documentation**: Updated README for consolidated chunking.
 
 ### v0.6 (alpha)
 
-  \* **Added Dataset Pre-processing Script (`dataset_chunk_create.py`)**: Chunks large `.jsonl` datasets into `.pt` tensor files.
-  \* **Implemented Direct Tensor Dataset Loading (`--pre_pt_dataset`)**: Load from `.pt` files + manifest.
-  \* **Implemented Iterable Pre-Chunked JSONL Loading (`--pre_chunked_dataset`)**: Load large JSONL line-by-line.
-
+  * **Added Dataset Pre-processing Script (`dataset_chunk_create.py`)**: Chunks large `.jsonl` datasets into `.pt` tensor files.
+  * **Implemented Direct Tensor Dataset Loading (`--pre_pt_dataset`)**: Load from `.pt` files + manifest.
+  * **Implemented Iterable Pre-Chunked JSONL Loading (`--pre_chunked_dataset`)**: Load large JSONL line-by-line.
   * **Updated Dataloader Logic**: Conditional loading based on flags.
-      \* **Refined Training State Saving**: Checkpoints save dataset type flags.
-      \* **Documentation**: Updated for new chunking workflow.
+  * **Refined Training State Saving**: Checkpoints save dataset type flags.
+  * **Documentation**: Updated for new chunking workflow.
 
 ### v0.5.2 (alpha)
 
-  \* **Added Flexible Training Initiation**: `--model-path` in `train` mode loads weights only for a new session.
-  \* **Enhanced `expand_model.py` Script**: Added `max_length` expansion and auto-detection.
-  \* **Added Automatic Mixed Precision (AMP)**: `--amp` flag for `train`, `finetune`, `chat`.
-  \* **Documentation**: Updated for new features.
+  * **Added Flexible Training Initiation**: `--model-path` in `train` mode loads weights only for a new session.
+  * **Enhanced `expand_model.py` Script**: Added `max_length` expansion and auto-detection.
+  * **Added Automatic Mixed Precision (AMP)**: `--amp` flag for `train`, `finetune`, `chat`.
+  * **Documentation**: Updated for new features.
 
 ### v0.5.1 (alpha)
 
-  \* **Added `--override-scheduling` flag**: Force new LR schedule when resuming.
-  \* **Documentation**: Updated for `--override-scheduling`.
+  * **Added `--override-scheduling` flag**: Force new LR schedule when resuming.
+  * **Documentation**: Updated for `--override-scheduling`.
 
 ### v0.5 (alpha)
 
-  \* **Implemented Structured Long-Term Memory**: Added timestamps and source metadata.
-  \* **Implemented Adaptive Reasoning Depth (Ponder Time)**: Dynamic HRM steps.
-  \* **Added Ponder Cost**: Auxiliary loss for efficiency.
-  \* **Added Halting Threshold**: Inference control (`--h-halt-thresh`).
+  * **Implemented Structured Long-Term Memory**: Added timestamps and source metadata.
+  * **Implemented Adaptive Reasoning Depth (Ponder Time)**: Dynamic HRM steps.
+  * **Added Ponder Cost**: Auxiliary loss for efficiency.
+  * **Added Halting Threshold**: Inference control (`--h-halt-thresh`).
 
 ### v0.4 (alpha)
 
-  \* **Implemented Dynamic LTM Learning Rate**: Default Cosine Annealing schedule in chat.
-  \* **Added Static LR Fallback**: `--static-ltm-lr` flag for chat.
-  \* **Added Gradient Clipping**: `--grad-clip` for training stability.
+  * **Implemented Dynamic LTM Learning Rate**: Default Cosine Annealing schedule in chat.
+  * **Added Static LR Fallback**: `--static-ltm-lr` flag for chat.
+  * **Added Gradient Clipping**: `--grad-clip` for training stability.
 
 -----
 
