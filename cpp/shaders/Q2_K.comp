@@ -1,80 +1,115 @@
 #version 450
 layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+// Buffers
 layout(binding = 0, std430) readonly buffer MatrixA { float A[]; };
-layout(binding = 1, std430) readonly buffer QuantizedB { uint B[]; };
+layout(binding = 1, std430) readonly buffer QuantizedB { uint B[]; }; // block_q2_k
 layout(binding = 2, std430) writeonly buffer MatrixY { float Y[]; };
 
+// Push constants for dimensions
 layout(push_constant) uniform PushConstants {
     int K;
     int M;
     int N;
 };
 
-void main() {
-    uint n = gl_GlobalInvocationID.x;
-    uint m = gl_GlobalInvocationID.y;
+// Workgroup shared memory for tiling
+shared float tileA[16][16];
+shared float tileB[16][16];
 
-    if (n >= N || m >= M) {
-        return;
+// Dequantization function for one element of B
+float dequantize_B_element(uint m, uint k) {
+    uint block_size_k = 256;
+    uint sizeof_block_bytes = 88; // 4*2 (d, dmin) + 16 (scales) + 64 (qs)
+    uint num_blocks_per_row = uint(K) / block_size_k;
+    
+    uint block_idx = k / block_size_k;
+    uint idx_in_block = k % block_size_k;
+
+    uint b_row_offset_uints = m * num_blocks_per_row * sizeof_block_bytes / 4;
+    uint block_offset_uints = b_row_offset_uints + block_idx * sizeof_block_bytes / 4;
+
+    // Read scales
+    float d = uintBitsToFloat(B[block_offset_uints + 0]);
+    float dmin = uintBitsToFloat(B[block_offset_uints + 1]);
+
+    // Find sub-block (32 elements)
+    uint sub_block_idx = idx_in_block / 32;
+    uint idx_in_sub_block = idx_in_block % 32;
+
+    // Find scale byte
+    uint scale_uint_idx = block_offset_uints + 2 + (sub_block_idx / 4);
+    uint scale_byte_idx = sub_block_idx % 4;
+    uint scales_packed = B[scale_uint_idx];
+    int scale_byte = int((scales_packed >> (scale_byte_idx * 8)) & 0xFF);
+
+    float d_sub;
+    if (idx_in_sub_block < 16) {
+        // First 16 values use low nibble
+        d_sub = (float(scale_byte & 0x0F) / 15.0) * d;
+    } else {
+        // Second 16 values use high nibble
+        d_sub = (float(scale_byte >> 4) / 15.0) * d;
     }
+    
+    // Find packed quant byte
+    uint qs_byte_idx_in_block = idx_in_block / 4;
+    uint qs_uint_idx_in_block = qs_byte_idx_in_block / 4;
+    uint byte_offset_in_uint = qs_byte_idx_in_block % 4;
+
+    uint qs_uint = B[block_offset_uints + 6 + qs_uint_idx_in_block];
+    uint qs_byte = (qs_uint >> (byte_offset_in_uint * 8)) & 0xFF;
+
+    // Find 2-bit value
+    uint shift = (2 * (idx_in_block % 4));
+    int qi = int((qs_byte >> shift) & 0x03);
+
+    return float(qi) * d_sub + dmin;
+}
+
+void main() {
+    uint n_base = gl_WorkGroupID.x * 16; // Base row index for Y (from A)
+    uint m_base = gl_WorkGroupID.y * 16; // Base col index for Y (from B)
+    
+    uint n_local = gl_LocalInvocationID.x;
+    uint m_local = gl_LocalInvocationID.y;
+    
+    uint n_global = n_base + n_local; // Global Y row
+    uint m_global = m_base + m_local; // Global Y col
 
     float sum = 0.0;
-    uint block_size_k = 256;
-    uint sizeof_block_bytes = 88;
-    uint num_blocks_per_row = uint(K) / block_size_k;
-    uint b_row_offset_uints = m * num_blocks_per_row * sizeof_block_bytes / 4;
+    uint k_tiles = (uint(K) + 15) / 16; // Tile size is 16
 
-    for (uint i = 0; i < num_blocks_per_row; ++i) {
-        uint block_offset_uints = b_row_offset_uints + i * sizeof_block_bytes / 4;
-        float d = uintBitsToFloat(B[block_offset_uints + 0]);
-        float dmin = uintBitsToFloat(B[block_offset_uints + 1]);
+    for (uint k_tile = 0; k_tile < k_tiles; ++k_tile) {
+        // --- 1. Load tiles into shared memory ---
+        uint k_global = k_tile * 16 + n_local; // Use n_local for k-dim load
 
-        for (uint j = 0; j < 8; ++j) { // Iterate over 8 sub-blocks of 32
-            uint scale_uint_idx = block_offset_uints + 2 + (j / 4);
-            uint scale_byte_idx = j % 4;
-            uint scales_packed = B[scale_uint_idx];
-            int scale_byte = int((scales_packed >> (scale_byte_idx * 8)) & 0xFF);
-
-            float s1 = float(scale_byte & 0x0F) / 15.0;
-            float s2 = float(scale_byte >> 4)   / 15.0;
-            float d1 = s1 * d;
-            float d2 = s2 * d;
-            
-            // --- First 16 values (use scale d1) ---
-            for (uint l = 0; l < 16; ++l) {
-                uint val_offset_in_block = j * 32 + l;
-                uint qs_byte_idx_in_block = val_offset_in_block / 4;
-                uint qs_uint_idx_in_block = qs_byte_idx_in_block / 4;
-                uint byte_offset_in_uint = qs_byte_idx_in_block % 4;
-
-                uint qs_uint = B[block_offset_uints + 6 + qs_uint_idx_in_block];
-                uint qs_byte = (qs_uint >> (byte_offset_in_uint * 8)) & 0xFF;
-                
-                uint shift = (2 * (val_offset_in_block % 4));
-                int qi = int((qs_byte >> shift) & 0x03);
-
-                uint a_idx = n * uint(K) + i * 256 + val_offset_in_block;
-                sum += A[a_idx] * (float(qi) * d1 + dmin);
-            }
-            
-            // --- Second 16 values (use scale d2) ---
-            for (uint l = 0; l < 16; ++l) {
-                uint val_offset_in_block = j * 32 + 16 + l;
-                uint qs_byte_idx_in_block = val_offset_in_block / 4;
-                uint qs_uint_idx_in_block = qs_byte_idx_in_block / 4;
-                uint byte_offset_in_uint = qs_byte_idx_in_block % 4;
-
-                uint qs_uint = B[block_offset_uints + 6 + qs_uint_idx_in_block];
-                uint qs_byte = (qs_uint >> (byte_offset_in_uint * 8)) & 0xFF;
-
-                uint shift = (2 * (val_offset_in_block % 4));
-                int qi = int((qs_byte >> shift) & 0x03);
-
-                uint a_idx = n * uint(K) + i * 256 + val_offset_in_block;
-                sum += A[a_idx] * (float(qi) * d2 + dmin);
-            }
+        // Load tileA[m_local][n_local] = A[n_base + m_local, k_tile*16 + n_local]
+        if (n_base + m_local < N && k_global < K) {
+            tileA[m_local][n_local] = A[(n_base + m_local) * K + k_global];
+        } else {
+            tileA[m_local][n_local] = 0.0;
         }
+
+        // Load tileB[m_local][n_local] = B[m_base + m_local, k_tile*16 + n_local]
+        if (m_base + m_local < M && k_global < K) {
+            tileB[m_local][n_local] = dequantize_B_element(m_base + m_local, k_global);
+        } else {
+            tileB[m_local][n_local] = 0.0;
+        }
+
+        barrier(); // Wait for all threads to finish loading
+
+        // --- 2. Compute partial dot product from shared memory ---
+        for (uint k = 0; k < 16; ++k) {
+            // sum += A[n_global, k_tile*16 + k] * B[m_global, k_tile*16 + k]
+            sum += tileA[n_local][k] * tileB[m_local][k];
+        }
+        barrier(); // Wait for all threads to finish compute
     }
-    Y[n * uint(M) + m] = sum;
+
+    // --- 3. Write final result ---
+    if (n_global < N && m_global < M) {
+        Y[n_global * M + m_global] = sum;
+    }
 }
