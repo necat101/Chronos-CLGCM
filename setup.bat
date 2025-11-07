@@ -1,9 +1,45 @@
 @echo off
 setlocal enabledelayedexpansion
 
+:: --- NEW: Argument Parsing ---
+set "BUILD_VULKAN=OFF"
+:arg_loop
+if "%~1"=="" goto :args_done
+if /I "%~1"=="--vulkan" (
+    echo INFO: --vulkan flag detected. Will attempt to build with Vulkan support.
+    set "BUILD_VULKAN=ON"
+)
+shift
+goto :arg_loop
+:args_done
+:: --- END: Argument Parsing ---
+
 echo ===========================================
 echo == Setting up Hierarchos Environment...  ==
 echo ===========================================
+
+:: --- NEW: Vulkan Pre-check ---
+if "!BUILD_VULKAN!"=="ON" (
+    echo.
+    echo [INFO] Checking for Vulkan SDK...
+    if defined VULKAN_SDK (
+        echo   ✅ Found VULKAN_SDK environment variable: !VULKAN_SDK!
+        where glslc >nul 2>&1
+        if %errorlevel% neq 0 (
+            echo   ⚠️  Warning: 'glslc' compiler not found in PATH.
+            echo   Please ensure !VULKAN_SDK!\Bin is in your system PATH.
+        ) else (
+            echo   ✅ Found 'glslc' compiler in PATH.
+        )
+    ) else (
+        echo   ❌ VULKAN_SDK environment variable not set.
+        echo   Please install the Vulkan SDK from https://vulkan.lunarg.com/
+        echo   and ensure VULKAN_SDK is set, or 'glslc' is in your PATH.
+        echo   The build may fail if CMake cannot find Vulkan components.
+        pause
+    )
+)
+:: --- END: Vulkan Pre-check ---
 
 :: STEP 1 — CHECK PYTHON
 echo.
@@ -164,6 +200,11 @@ if %errorlevel% neq 0 (
 :: STEP 5 — BUILD HIERARCHOS KERNEL
 echo.
 echo [5/5] Building Hierarchos C++ kernel...
+
+:: --- NEW: Set environment variable for setup.py based on parsed args ---
+set "HIERARCHOS_BUILD_VULKAN=!BUILD_VULKAN!"
+echo INFO: Setting HIERARCHOS_BUILD_VULKAN=!HIERARCHOS_BUILD_VULKAN!
+
 pip install .
 if %errorlevel% neq 0 (
     echo ❌ Build failed. Try restarting your PC and re-running this script as Administrator.
@@ -174,7 +215,7 @@ if %errorlevel% neq 0 (
 echo.
 echo ==============================================================
 echo == ✅ Setup Complete!                                      ==
-echo == The Hierarchos kernel is built and ready to run.      ==
+echo == The Hierarchos kernel is built and ready to run.       ==
 echo ==============================================================
 echo.
 echo You can now launch Hierarchos like this:
@@ -182,4 +223,3 @@ echo   python hierarchos.py chat --model-path ./your_model
 echo.
 pause
 endlocal
-
