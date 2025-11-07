@@ -46,10 +46,20 @@ class CMakeBuild(build_ext):
         cmake_args = [
             f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}',
             f'-DPYTHON_EXECUTABLE={sys.executable}',
-            # --- KEY CHANGE: Pass the project root to CMake ---
             f'-DPROJECT_ROOT_DIR={project_root}',
             '-DCMAKE_BUILD_TYPE=Release'
         ]
+        
+        # --- NEW: Check environment variable for Vulkan build ---
+        # This is set by setup.bat or setup.sh
+        build_vulkan = os.environ.get('HIERARCHOS_BUILD_VULKAN', 'OFF').upper()
+        if build_vulkan in ('ON', 'TRUE', '1'):
+            print("--- Enabling Vulkan build ---")
+            cmake_args.append('-DHIERARCHOS_BUILD_VULKAN=ON')
+        else:
+            print("--- Disabling Vulkan build (CPU only) ---")
+            cmake_args.append('-DHIERARCHOS_BUILD_VULKAN=OFF')
+        # --- END NEW ---
         
         cmake_args.append(f"-Dpybind11_DIR={pybind11.get_cmake_dir()}")
 
@@ -70,10 +80,10 @@ class CMakeBuild(build_ext):
 # --- Main Setup ---
 setup(
     name='hierarchos_matmul',
-    version='0.1.0',
-    author='Your Name',
-    author_email='your.email@example.com',
-    description='Custom C++ kernel for the Chronos project',
+    version='0.2', # Incremented version
+    author='Makhi Burroughs', # Filled in
+    author_email='saltpepper312@gmail.com', # Placeholder
+    description='Custom C++ kernel with optional Vulkan support for the Hierarchos project',
     long_description='',
     ext_modules=[CMakeExtension('hierarchos_matmul', sourcedir='cpp')],
     cmdclass={'build_ext': CMakeBuild},
