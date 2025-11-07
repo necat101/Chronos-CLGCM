@@ -2,20 +2,12 @@ cmake_minimum_required(VERSION 3.16)
 project(hierarchos_matmul LANGUAGES CXX)
 
 option(FORCE_SCALAR "Force compilation without any SIMD intrinsics" OFF)
+option(HIERARCHOS_BUILD_VULKAN "Enable Vulkan support" OFF)
 
 find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 REQUIRED)
 
 find_package(OpenMP)
-find_package(Vulkan)
-if (Vulkan_FOUND)
-    message(STATUS "Vulkan found. Enabling GPU acceleration support.")
-    find_program(GLSLC_COMPILER glslc)
-    if (NOT GLSLC_COMPILER)
-        message(WARNING "glslc not found. Vulkan support disabled. Please install the Vulkan SDK.")
-        set(Vulkan_FOUND FALSE)
-    endif()
-endif()
 
 if(MSVC)
     string(REPLACE "/RTC1" "/O2" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
@@ -23,7 +15,28 @@ if(MSVC)
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}" CACHE STRING "Flags used by the C++ compiler during release builds." FORCE)
 endif()
 
-if(Vulkan_FOUND)
+# --- START Vulkan Optional Build ---
+if(HIERARCHOS_BUILD_VULKAN)
+    message(STATUS "Vulkan build requested. Searching for components...")
+    find_package(Vulkan)
+    if (Vulkan_FOUND)
+        message(STATUS "Vulkan libraries found.")
+        find_program(GLSLC_COMPILER glslc)
+        if (NOT GLSLC_COMPILER)
+            message(WARNING "glslc not found. Vulkan support disabled. Please install the Vulkan SDK and ensure glslc is in your PATH.")
+            set(Vulkan_FOUND FALSE)
+            set(HIERARCHOS_BUILD_VULKAN FALSE)
+        else()
+            message(STATUS "Vulkan shader compiler (glslc) found.")
+        endif()
+    else()
+        message(WARNING "Vulkan libraries not found. Vulkan support disabled. Please install the Vulkan SDK.")
+        set(HIERARCHOS_BUILD_VULKAN FALSE)
+    endif()
+endif()
+
+if(HIERARCHOS_BUILD_VULKAN AND Vulkan_FOUND)
+    message(STATUS "Vulkan support is ENABLED.")
     set(HIERARCHOS_USE_VULKAN TRUE)
     file(GLOB SHADER_SOURCES "shaders/*.comp")
 
@@ -41,14 +54,18 @@ if(Vulkan_FOUND)
     endforeach()
 
     add_custom_target(Shaders ALL DEPENDS ${SHADER_SPIRV_FILES})
+else()
+    message(STATUS "Vulkan support is DISABLED.")
 endif()
+# --- END Vulkan Optional Build ---
+
 
 pybind11_add_module(hierarchos_matmul
     hierarchos_matmul.cpp
     bindings.cpp
 )
 
-if(Vulkan_FOUND)
+if(HIERARCHOS_BUILD_VULKAN AND Vulkan_FOUND)
     target_sources(hierarchos_matmul PRIVATE hierarchos_vulkan.cpp)
     target_link_libraries(hierarchos_matmul PRIVATE Vulkan::Vulkan)
     target_compile_definitions(hierarchos_matmul PRIVATE HIERARCHOS_USE_VULKAN)
