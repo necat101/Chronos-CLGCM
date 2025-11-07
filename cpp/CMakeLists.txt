@@ -21,16 +21,20 @@ if(HIERARCHOS_BUILD_VULKAN)
     find_package(Vulkan)
     if (Vulkan_FOUND)
         message(STATUS "Vulkan libraries found.")
-        find_program(GLSLC_COMPILER glslc)
+        
+        # --- Find glslangValidator first, then glslc ---
+        find_program(GLSLC_COMPILER NAMES glslangValidator glslc)
+
         if (NOT GLSLC_COMPILER)
-            message(WARNING "glslc not found. Vulkan support disabled. Please install the Vulkan SDK and ensure glslc is in your PATH.")
+            message(WARNING "Vulkan shader compiler (glslangValidator or glslc) not found. Vulkan support disabled.")
+            message(WARNING "Please install 'glslang-tools' or the Vulkan SDK and ensure the compiler is in your PATH.")
             set(Vulkan_FOUND FALSE)
             set(HIERARCHOS_BUILD_VULKAN FALSE)
         else()
-            message(STATUS "Vulkan shader compiler (glslc) found.")
+            message(STATUS "Vulkan shader compiler found: ${GLSLC_COMPILER}")
         endif()
     else()
-        message(WARNING "Vulkan libraries not found. Vulkan support disabled. Please install the Vulkan SDK.")
+        message(WARNING "Vulkan libraries not found. Vulkan support disabled. Please install 'libvulkan-dev' or the Vulkan SDK.")
         set(HIERARCHOS_BUILD_VULKAN FALSE)
     endif()
 endif()
@@ -40,15 +44,31 @@ if(HIERARCHOS_BUILD_VULKAN AND Vulkan_FOUND)
     set(HIERARCHOS_USE_VULKAN TRUE)
     file(GLOB SHADER_SOURCES "shaders/*.comp")
 
+    # Create the output directory for the compiled shaders
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+
+    # --- ❗️❗️❗️ BEGIN FIX ❗️❗️❗️ ---
+    # Conditionally add the -V flag based on the compiler's name
+    get_filename_component(COMPILER_NAME ${GLSLC_COMPILER} NAME) # Gets "glslangValidator" or "glslc.exe" etc.
+    set(GLSLC_ARGS "")
+    if(COMPILER_NAME MATCHES "glslangValidator") # Check if the name *contains* glslangValidator
+        message(STATUS "Using glslangValidator. Adding -V flag.")
+        set(GLSLC_ARGS "-V")
+    else()
+        message(STATUS "Using glslc. Not adding -V flag.")
+    endif()
+    # --- ❗️❗️❗️ END FIX ❗️❗️❗️ ---
+
     foreach(SHADER_SOURCE ${SHADER_SOURCES})
         get_filename_component(SHADER_NAME ${SHADER_SOURCE} NAME_WE)
         set(SHADER_SPIRV "${CMAKE_CURRENT_BINARY_DIR}/shaders/${SHADER_NAME}.spv")
 
         add_custom_command(
             OUTPUT ${SHADER_SPIRV}
-            COMMAND ${GLSLC_COMPILER} -O -o ${SHADER_SPIRV} ${SHADER_SOURCE}
+            # --- Use the conditional args variable ---
+            COMMAND ${GLSLC_COMPILER} ${GLSLC_ARGS} -o ${SHADER_SPIRV} ${SHADER_SOURCE}
             DEPENDS ${SHADER_SOURCE}
-            COMMENT "Compiling ${SHADER_NAME}.comp to SPIR-V"
+            COMMENT "Compiling ${SHADER_NAME}.comp to SPIR-V using ${GLSLC_COMPILER}"
         )
         list(APPEND SHADER_SPIRV_FILES ${SHADER_SPIRV})
     endforeach()
