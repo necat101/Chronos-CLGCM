@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e # Exit immediately if a command exits with a non-zero status.
 
-# --- NEW: Argument Parsing ---
+# --- Argument Parsing ---
 BUILD_VULKAN="OFF"
 for arg in "$@"; do
     case $arg in
@@ -20,17 +20,17 @@ echo "============================================"
 
 # STEP 1: Check Core Dependencies
 echo ""
-echo "[1/5] Checking for Core Dependencies..."
+echo "[1/4] Checking for Core Dependencies..."
 if ! command -v python3 &> /dev/null || ! command -v pip3 &> /dev/null; then
     echo "❌ Python 3 (python3) or pip3 not found. Please install them."
-    echo "   (e.g., 'sudo apt install python3 python3-pip python3-venv')"
+    echo "   (e.g., 'sudo apt install python3 python3-pip')"
     exit 1
 fi
 echo "✅ Found python3 and pip3."
 
 # STEP 2: Check Build Tools
 echo ""
-echo "[2/5] Checking for C++ Build Tools..."
+echo "[2/4] Checking for C++ Build Tools..."
 if ! command -v cmake &> /dev/null; then
     echo "❌ CMake not found. Please install it (e.g., 'sudo apt install cmake')."
     exit 1
@@ -41,54 +41,65 @@ if ! command -v g++ &> /dev/null && ! command -v clang++ &> /dev/null; then
 fi
 echo "✅ Found CMake and a C++ compiler."
 
-# --- NEW: Vulkan Pre-check ---
+# --- Vulkan Pre-check and Auto-Install ---
 if [ "$BUILD_VULKAN" == "ON" ]; then
     echo ""
     echo "[INFO] Checking for Vulkan SDK..."
-    if [ -z "$VULKAN_SDK" ]; then
-        echo "   ⚠️  Warning: VULKAN_SDK environment variable not set."
-        echo "   Will check for 'glslc' in PATH instead..."
-    else
-        echo "   ✅ Found VULKAN_SDK environment variable: $VULKAN_SDK"
-    fi
     
-    if ! command -v glslc &> /dev/null; then
-        echo "   ❌ 'glslc' compiler not found in PATH."
-        echo "   Please install the Vulkan SDK from https://vulkan.lunarg.com/"
-        echo "   (e.g., 'sudo apt install vulkan-sdk' or download from website)"
-        echo "   and ensure 'glslc' is in your PATH."
-        exit 1
+    # --- MODIFIED CHECK: Look for 'glslangValidator' ---
+    if command -v glslangValidator &> /dev/null; then
+        echo "   ✅ Found 'glslangValidator' compiler in PATH."
     else
-        echo "   ✅ Found 'glslc' compiler in PATH."
+        echo "   ❌ 'glslangValidator' compiler not found in PATH."
+        echo "   Attempting to automatically install Vulkan build tools (glslang-tools, libvulkan-dev)..."
+        echo "   This will require superuser (sudo) permission."
+        
+        # Set frontend to noninteractive to suppress debconf dialog warnings
+        export DEBIAN_FRONTEND=noninteractive
+        sudo apt update
+        sudo apt install -y glslang-tools libvulkan-dev
+        
+        # Clear the shell's command cache
+        hash -r
+        
+        # Check again
+        if command -v glslangValidator &> /dev/null; then
+            echo "   ✅ Successfully installed and found 'glslangValidator' in PATH."
+        elif [ -f /usr/bin/glslangValidator ]; then
+            echo "   ⚠️  WARNING: 'glslangValidator' was found at /usr/bin/glslangValidator but is NOT in your PATH."
+            echo "   This suggests a problem with your shell's environment setup."
+            echo "   Continuing anyway, as CMake can often find it directly."
+        else
+            echo "   ❌ ERROR: Install ran, but 'glslangValidator' could not be found."
+            echo "   Please install 'glslang-tools' manually and ensure 'glslangValidator' is in your PATH."
+            exit 1
+        fi
     fi
+    # --- END: Modified Check ---
 fi
 # --- END: Vulkan Pre-check ---
 
-# STEP 3: Setup Virtual Environment
+# STEP 3: Install Python Dependencies (No Venv)
 echo ""
-echo "[3/5] Creating/Activating Python virtual environment (./venv)..."
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-fi
-source venv/bin/activate
-echo "✅ Activated virtual environment."
-
-# STEP 4: Install Python Dependencies
-echo ""
-echo "[4/5] Installing Python dependencies..."
+echo "[3/4] Installing Python dependencies..."
 pip3 install --upgrade pip
 pip3 install -r requirements_kernel.txt
+if [ $? -ne 0 ]; then echo "❌ Failed to install python dependencies." && exit 1; fi
 echo "✅ Python dependencies installed."
 
-# STEP 5: Build Hierarchos Kernel
+# STEP 4: Build Hierarchos Kernel (No Venv)
 echo ""
-echo "[5/5] Building Hierarchos C++ kernel..."
+echo "[4/4] Compiling and building the Hierarchos C++ kernel..."
 
-# --- NEW: Set environment variable for setup.py ---
+# Set environment variable for setup.py
 export HIERARCHOS_BUILD_VULKAN="$BUILD_VULKAN"
 echo "INFO: Setting HIERARCHOS_BUILD_VULKAN=$HIERARCHOS_BUILD_VULKAN"
 
-pip3 install .
+# --- MODIFICATION: Added -v (verbose) flag to show the real error ---
+pip3 install -v .
+# --- END MODIFICATION ---
+
+if [ $? -ne 0 ]; then echo "❌ Kernel build failed." && exit 1; fi
 echo "✅ Build complete."
 
 echo ""
@@ -97,9 +108,6 @@ echo "== ✅ Setup Complete!                                      =="
 echo "== The Hierarchos kernel is built and ready to run.         =="
 echo "=============================================================="
 echo ""
-echo "To activate the environment in your shell, run:"
-echo "  source venv/bin/activate"
-echo ""
-echo "Then you can launch Hierarchos like this:"
+echo "You can now run the program directly, for example:"
 echo "  python3 hierarchos.py chat --model-path ./your_model"
 echo ""
