@@ -776,14 +776,21 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                 labels = ([-100] * len(prompt_context_tokens)) + thought_tokens + output_tokens + [tokenizer.eos_token_id]
 
             else:
-                # --- Standard Format ---
-                prompt_text = text_dict.get(prompt_column, "")
+                # --- Standard Format (Modified for Alpaca) ---
+                instruction_text = text_dict.get(prompt_column, "")
+                # Check for an 'input' column, which is common in Alpaca
+                input_text = text_dict.get('input', "") 
                 completion_text = text_dict.get(completion_column, "")
-                if not isinstance(prompt_text, str): prompt_text = str(prompt_text)
+
+                if not isinstance(instruction_text, str): instruction_text = str(instruction_text)
+                if not isinstance(input_text, str): input_text = str(input_text)
                 if not isinstance(completion_text, str): completion_text = str(completion_text)
 
-                # Format like Alpaca
-                prompt_formatted = f"### Instruction:\n{prompt_text}\n\n### Response:\n"
+                # Combine instruction and input if input exists
+                if input_text:
+                    prompt_formatted = f"### Instruction:\n{instruction_text}\n\n### Input:\n{input_text}\n\n### Response:\n"
+                else:
+                    prompt_formatted = f"### Instruction:\n{instruction_text}\n\n### Response:\n"
 
                 prompt_tokens = tokenizer.encode(prompt_formatted, add_special_tokens=True)
                 completion_tokens = tokenizer.encode(completion_text, add_special_tokens=False)
