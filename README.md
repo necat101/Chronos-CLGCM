@@ -1,6 +1,6 @@
 -----
 
-# Hierarchos v0.8.5 (alpha): A Hybrid Memory-Reasoning Architecture
+# Hierarchos v0.8.6 (alpha): A Hybrid Memory-Reasoning Architecture
 
 A novel AI architecture that synergistically integrates Google's Titans memory system with a Hierarchical Reasoning Model (HRM) to move beyond the limitations of scale and take a decisive step on the path to AGI.
 
@@ -467,6 +467,10 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **PyTorch Team** for `torch.compile` and gradient checkpointing functionality.
 
 ## Changelog
+### v0.8.6 (alpha)
+
+  * **Improved alpaca dataset handling**:
+      * "Instruction" and "input" are now merged during training as needed to follow the alpaca dataset format!
 
 ### v0.8.5 (alpha)
 
