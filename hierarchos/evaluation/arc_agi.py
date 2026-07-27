@@ -13,7 +13,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 
-from ..inference.chat import boundary_drift_seed, resolve_inference_prefill_chunk_size
+from ..inference.chat import (
+    boundary_drift_seed,
+    resolve_inference_prefill_chunk_size,
+    uses_full_sample_inference_recurrence,
+)
 
 
 Grid = List[List[int]]
@@ -167,10 +171,7 @@ def generate_text(
     ltm_state = None
     model_config = getattr(model, "config", None)
     prefill_chunk_size = resolve_inference_prefill_chunk_size(model_config)
-    exact_full_sample = bool(
-        getattr(model_config, "full_sample_bptt", False)
-        or getattr(model_config, "inference_logit_parity", False)
-    )
+    exact_full_sample = uses_full_sample_inference_recurrence(model_config)
     total_tokens_seen = 0
 
     model.eval()

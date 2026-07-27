@@ -534,18 +534,57 @@ def tbptt_chunk_ranges(length, chunk_size, global_offset=0):
     return ranges
 
 
+def uses_full_sample_inference_recurrence(config) -> bool:
+    """Return whether inference should use uninterrupted sample recurrence.
+
+    New checkpoints persist ``inference_recurrence_mode`` so recurrence geometry
+    is independent from ``inference_logit_parity``.  The latter still controls
+    training-equivalent Manager/Worker refinement during evaluation, but a model
+    resumed under TBPTT must retain TBPTT chunk-boundary drift semantics.
+
+    Older checkpoints predate the explicit geometry field.  An explicitly
+    persisted ``full_sample_bptt`` value is still authoritative: in particular,
+    a TBPTT checkpoint may independently enable inference_logit_parity so eval
+    uses the training Manager/Worker refinement policy.  Only checkpoints that
+    lack both geometry fields fall back to the historical
+    ``inference_logit_parity`` behavior.
+    """
+    if isinstance(config, dict):
+        recurrence_mode = config.get("inference_recurrence_mode")
+        has_full_sample_bptt = "full_sample_bptt" in config
+        full_sample_bptt = config.get("full_sample_bptt", False)
+        inference_logit_parity = config.get("inference_logit_parity", False)
+    else:
+        recurrence_mode = getattr(config, "inference_recurrence_mode", None)
+        has_full_sample_bptt = hasattr(config, "full_sample_bptt")
+        full_sample_bptt = getattr(config, "full_sample_bptt", False)
+        inference_logit_parity = getattr(config, "inference_logit_parity", False)
+
+    if recurrence_mode is not None:
+        normalized = str(recurrence_mode).strip().lower().replace("_", "-")
+        if normalized == "full-sample":
+            return True
+        if normalized == "tbptt":
+            return False
+
+    if has_full_sample_bptt:
+        return bool(full_sample_bptt)
+    return bool(inference_logit_parity)
+
+
 def resolve_inference_prefill_chunk_size(config, requested=None):
     """Choose the prefill geometry that matches the checkpoint's training graph."""
     if requested is not None:
         return max(0, int(requested or 0))
-    if bool(
-        getattr(config, "full_sample_bptt", False)
-        or getattr(config, "inference_logit_parity", False)
-    ):
+    if uses_full_sample_inference_recurrence(config):
         # training_chunk_size is retained by exact-BPTT training for token-cache,
         # ROSA, LTM-decay, and compile metadata.  It is not a forward boundary.
         return 0
-    return max(0, int(getattr(config, "training_chunk_size", 0) or 0))
+    if isinstance(config, dict):
+        training_chunk_size = config.get("training_chunk_size", 0)
+    else:
+        training_chunk_size = getattr(config, "training_chunk_size", 0)
+    return max(0, int(training_chunk_size or 0))
 
 
 def boundary_drift_seed(
@@ -734,10 +773,7 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
     drift_state = None
     ltm_state = None
     model_config = getattr(model, "config", None)
-    exact_full_sample = bool(
-        getattr(model_config, "full_sample_bptt", False)
-        or getattr(model_config, "inference_logit_parity", False)
-    )
+    exact_full_sample = uses_full_sample_inference_recurrence(model_config)
     prefill_chunk_size = resolve_inference_prefill_chunk_size(model_config)
     total_tokens_generated = 0
 
@@ -1407,10 +1443,7 @@ def chat(args, device, tokenizer):
             config,
             requested_prefill_chunk,
         )
-        exact_inference_recurrence = bool(
-            getattr(config, "full_sample_bptt", False)
-            or getattr(config, "inference_logit_parity", False)
-        )
+        exact_inference_recurrence = uses_full_sample_inference_recurrence(config)
         chat_turn_history = []
         if alpaca_chat_format:
             if chat_input_history_turns > 0 and chat_input_history_chars > 0:
@@ -1436,6 +1469,22 @@ def chat(args, device, tokenizer):
                 print(f"Chat prefill chunking: {chat_prefill_chunk_size} tokens (TBPTT train-parity mode).")
         else:
             print("Chat prefill chunking: OFF (single full prompt forward).")
+        print(
+            "Chat decoding: "
+            f"temperature={float(getattr(args, 'temperature', 1.0)):.2f}, "
+            f"top-k={int(getattr(args, 'top_k', 0) or 0)}, "
+            f"top-p={float(getattr(args, 'top_p', 1.0)):.2f}, "
+            f"repetition-penalty={float(getattr(args, 'repetition_penalty', 1.0)):.2f}"
+        )
+        if (
+            float(getattr(args, "temperature", 1.0)) > 0.0
+            or float(getattr(args, "repetition_penalty", 1.0)) != 1.0
+        ):
+            print(
+                "Chat decoding transforms/samples the raw model logits. For deterministic "
+                "raw-logit decoding use --temperature 0 --top-k 0 --top-p 1 "
+                "--repetition-penalty 1."
+            )
 
         # =================================================================
         # 6. STATE INITIALIZATION
@@ -1526,9 +1575,12 @@ def chat(args, device, tokenizer):
                 _entropy = -((_diag_probs * torch.log(_diag_probs + 1e-10)).sum(-1)).item()
                 print(f"  Logit entropy: {_entropy:.2f} (random={math.log(config.vocab_size):.2f})")
                 if _entropy > math.log(config.vocab_size) * 0.8:
-                    print("  ⚠️  HIGH ENTROPY — model may have failed to load weights correctly!")
+                    print("  WARNING: High entropy; model weights or runtime configuration may be invalid.")
                 else:
-                    print("  ✓ Entropy looks reasonable — weights appear loaded.")
+                    print(
+                        "  OK: Load smoke test passed. This fixed easy prompt does not "
+                        "measure response quality or calibration."
+                    )
         except Exception as e:
             print(f"  Diagnostic failed: {e}")
 

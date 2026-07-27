@@ -384,6 +384,18 @@ def _infer_arch_flags_from_state_dict(config_dict: Dict[str, Any], state_dict: D
     if "rwkv_channel_mix_deepembed_clamp" not in config_dict:
         config_dict["rwkv_channel_mix_deepembed_clamp"] = 4.0
 
+    # Refinement parity and recurrent geometry are independent. Some TBPTT
+    # exports persisted full_sample_bptt=False and inference_logit_parity=True
+    # before the explicit recurrence field was introduced; treating the parity
+    # flag as full-sample recurrence silently disabled their training boundaries.
+    if (
+        "inference_recurrence_mode" not in config_dict
+        and "full_sample_bptt" in config_dict
+    ):
+        config_dict["inference_recurrence_mode"] = (
+            "full-sample" if bool(config_dict["full_sample_bptt"]) else "tbptt"
+        )
+
 
 def load_full_model_with_config(model_path: str, device):
     """Loads a full-precision model from a directory or direct .pt file."""

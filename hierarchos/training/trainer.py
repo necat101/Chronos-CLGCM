@@ -279,6 +279,7 @@ _RUNTIME_MODEL_CONFIG_KEYS = (
     "full_sample_activation_checkpointing",
     "full_sample_checkpoint_segment_size",
     "inference_logit_parity",
+    "inference_recurrence_mode",
     "h_halt_thresh",
     "gradient_checkpointing",
     "debug_numerics",
@@ -328,6 +329,12 @@ def configure_full_sample_bptt(args, config=None, *, announce=False):
     saved activations without truncating the gradient horizon.
     """
     enabled = bool(getattr(args, "full_sample_bptt", False))
+    inference_recurrence_mode = "full-sample" if enabled else "tbptt"
+    args.inference_recurrence_mode = inference_recurrence_mode
+    # Training always uses the fixed Manager/Worker refinement policy.  Keep
+    # that policy at inference independently from whether recurrent gradients
+    # were full-sample or truncated at training_chunk_size boundaries.
+    args.inference_logit_parity = True
     checkpoint_enabled = getattr(
         args,
         "full_sample_activation_checkpointing",
@@ -345,11 +352,6 @@ def configure_full_sample_bptt(args, config=None, *, announce=False):
         args.persist_state = False
         args.full_sample_activation_checkpointing = checkpoint_enabled
         args.full_sample_checkpoint_segment_size = checkpoint_segment_size
-        # Persist the execution contract needed by chat/eval: no inference-only
-        # early exits or artificial-boundary drift seeding may change logits from
-        # the dynamics optimized by exact full-sample training.
-        args.inference_logit_parity = True
-
         # With one isolated forward, the legacy Titans write happens only after
         # backward and cannot affect the sample that produced it. The next sample
         # resets working memory, so retaining every raw retrieval gradient and
@@ -404,10 +406,10 @@ def configure_full_sample_bptt(args, config=None, *, announce=False):
 
     if config is not None:
         config.full_sample_bptt = enabled
+        config.inference_recurrence_mode = inference_recurrence_mode
+        config.inference_logit_parity = True
         config.full_sample_activation_checkpointing = bool(checkpoint_enabled)
         config.full_sample_checkpoint_segment_size = checkpoint_segment_size
-        if enabled:
-            config.inference_logit_parity = True
         config.detach_every_n_steps = _normalize_detach_every_n_steps(
             getattr(args, "detach_every_n_steps", None)
         )

@@ -9,7 +9,11 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 
-from ..inference.chat import boundary_drift_seed, resolve_inference_prefill_chunk_size
+from ..inference.chat import (
+    boundary_drift_seed,
+    resolve_inference_prefill_chunk_size,
+    uses_full_sample_inference_recurrence,
+)
 
 try:
     from lm_eval.api.model import LM
@@ -167,10 +171,7 @@ class HierarchosLM(LM):
             ltm_state = None
             logits_parts = []
             model_config = getattr(self.model, "config", None)
-            exact_full_sample = bool(
-                getattr(model_config, "full_sample_bptt", False)
-                or getattr(model_config, "inference_logit_parity", False)
-            )
+            exact_full_sample = uses_full_sample_inference_recurrence(model_config)
 
             for start in range(0, input_ids.shape[1], chunk_size):
                 outputs = self.model(
@@ -374,10 +375,7 @@ class HierarchosLM(LM):
             ltm_state = None
             model_config = getattr(self.model, "config", None)
             prefill_chunk_size = resolve_inference_prefill_chunk_size(model_config)
-            exact_full_sample = bool(
-                getattr(model_config, "full_sample_bptt", False)
-                or getattr(model_config, "inference_logit_parity", False)
-            )
+            exact_full_sample = uses_full_sample_inference_recurrence(model_config)
             total_tokens_seen = 0
             
             with torch.no_grad():

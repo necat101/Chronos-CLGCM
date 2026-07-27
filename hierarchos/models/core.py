@@ -285,9 +285,12 @@ class WorkerLoop:
         else:
             commitment_cost_static = None
             if self.compile_static_worker_loop:
-                active = torch.ones((), device=enc.device, dtype=enc.dtype)
+                # Convergence must be sample-local. A scalar active flag coupled
+                # every row in the batch, so a padded/easy peer could change a
+                # valid row's refinement depth and logits.
+                active = torch.ones(enc.shape[0], device=enc.device, dtype=enc.dtype)
                 drift_cost_sum = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
-                drift_cost_count = torch.zeros((), device=enc.device, dtype=enc.dtype)
+                drift_cost_count = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
 
                 for step_idx in range(self.max_l_steps):
                     prev_shadow = shadow_l_state
@@ -311,13 +314,15 @@ class WorkerLoop:
                     candidate_input_vec = torch.cat([current_enc, candidate_dynamic], dim=-1)
                     candidate_l_input = _finite_clamp(self.l_input_proj(candidate_input_vec), self.recurrent_state_clamp)
 
-                    keep2 = active.view(1, 1)
-                    keep3 = active.view(1, 1, 1)
+                    keep2 = active.unsqueeze(-1)
+                    keep3 = active.view(-1, 1, 1)
                     shadow_l_state = candidate_shadow * keep3 + prev_shadow * (1.0 - keep3)
                     current_drift = candidate_drift * keep2 + prev_drift * (1.0 - keep2)
                     l_input = candidate_l_input * keep2 + prev_l_input * (1.0 - keep2)
 
-                    still_active = (torch.mean(torch.abs(drift_delta)) >= self.l_conv_atol).to(dtype=enc.dtype)
+                    still_active = (
+                        torch.mean(torch.abs(drift_delta), dim=-1) >= self.l_conv_atol
+                    ).to(dtype=enc.dtype)
                     active = active * still_active
 
                 commitment_cost_static = drift_cost_sum / torch.clamp(drift_cost_count, min=1.0)
