@@ -207,8 +207,33 @@ def test_full_sample_configuration_is_exact_and_cache_compatible():
     assert config.detach_every_n_steps is None
     assert config.persist_state is False
     assert config.full_sample_bptt is True
+    assert args.inference_recurrence_mode == "full-sample"
+    assert config.inference_recurrence_mode == "full-sample"
     assert config.full_sample_activation_checkpointing is True
     assert config.ltm_training_mode == "read-only"
+
+
+def test_tbptt_configuration_decouples_recurrence_from_refinement_parity():
+    args = SimpleNamespace(
+        full_sample_bptt=False,
+        full_sample_activation_checkpointing=False,
+        full_sample_checkpoint_segment_size=224,
+        training_chunk_size=256,
+        detach_every_n_steps=0,
+        persist_state=False,
+        ltm_training_mode="read-only",
+    )
+    config = AttrDict(vars(args))
+
+    assert configure_full_sample_bptt(args, config) is False
+
+    assert args.inference_recurrence_mode == "tbptt"
+    assert config.inference_recurrence_mode == "tbptt"
+    # Training-equivalent Manager/Worker refinement remains enabled even though
+    # inference now follows the resumed 256-token TBPTT boundary geometry.
+    assert args.inference_logit_parity is True
+    assert config.inference_logit_parity is True
+    assert config.full_sample_bptt is False
 
 
 def test_full_sample_train_step_uses_one_trimmed_graph_despite_small_chunk_metadata():
