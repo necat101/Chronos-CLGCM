@@ -14,8 +14,26 @@ from torch.utils.checkpoint import checkpoint
 
 from .rwkv_cell import RWKVCell
 from .ltm import LTMModule
+from .act import (
+    hard_act_depth_straight_through,
+    hard_act_selection,
+    normalized_act_weights,
+)
+from .revisions import apply_architecture_revision_defaults
+from .shared_adapters import (
+    SharedTokenAdapter,
+    resolve_adapter_rank,
+    resolve_token_adapter_modes,
+    shared_token_lookup,
+)
 from ..utils.device import setup_msvc_environment, is_directml_device
-from ..utils.rosa import ROSA, rosa_async_pipeline, ROSAState
+from ..utils.rosa import (
+    ROSA,
+    ROSAState,
+    ROSA_BOUNDED_CONTEXT_MODE,
+    ROSA_UNBOUNDED_CONTEXT_MODE,
+    rosa_async_pipeline,
+)
 
 
 def _config_value(config, name: str, default=None):
@@ -59,8 +77,142 @@ def _positive_config_int(config, name: str, default=None) -> int:
     return value
 
 
+def _resolve_recurrence_contract(config) -> int:
+    """
+    Resolve stateful behavior without silently changing historical checkpoints.
+
+    Checkpoints written before this contract existed have no version field and
+    therefore remain on version 1. New training runs must opt into version 2 to
+    get chunk-invariant drift seeding, an explicit RWKV output readout, and an
+    ACT-consistent manager-state transition.
+    """
+    raw_version = _config_value(config, "core_recurrence_version", 1)
+    try:
+        version = int(raw_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"core_recurrence_version must be 1 or 2, got {raw_version!r}"
+        ) from exc
+    if version not in (1, 2):
+        raise ValueError(f"core_recurrence_version must be 1 or 2, got {version!r}")
+
+    defaults = {
+        "drift_recurrence_mode": (
+            "legacy-chunk-seeded" if version == 1 else "state-derived"
+        ),
+        "rwkv_state_readout_mode": (
+            "legacy-input-cache" if version == 1 else "explicit-output"
+        ),
+        "manager_state_commit_mode": (
+            "legacy-real-step" if version == 1 else "act-weighted"
+        ),
+        "commitment_cost_mode": (
+            "sum-square" if version == 1 else "mean-square"
+        ),
+    }
+    allowed = {
+        "drift_recurrence_mode": {"legacy-chunk-seeded", "state-derived"},
+        "rwkv_state_readout_mode": {"legacy-input-cache", "explicit-output"},
+        "manager_state_commit_mode": {
+            "legacy-real-step",
+            "act-weighted",
+            "last-shadow",
+            "hard-selected",
+        },
+        "commitment_cost_mode": {"sum-square", "mean-square"},
+    }
+    _set_config_value(config, "core_recurrence_version", version)
+    for name, default in defaults.items():
+        value = str(_config_value(config, name, default) or default)
+        if value not in allowed[name]:
+            choices = ", ".join(sorted(allowed[name]))
+            raise ValueError(
+                f"Hierarchos config '{name}' must be one of {choices}; got {value!r}"
+            )
+        _set_config_value(config, name, value)
+
+    manager_compute_mode = str(
+        _config_value(config, "manager_compute_mode", "soft-act") or "soft-act"
+    ).strip().lower().replace("_", "-")
+    if manager_compute_mode not in {"soft-act", "hard-masked"}:
+        raise ValueError(
+            "Hierarchos config 'manager_compute_mode' must be 'soft-act' or "
+            f"'hard-masked'; got {manager_compute_mode!r}"
+        )
+    _set_config_value(config, "manager_compute_mode", manager_compute_mode)
+    manager_state_commit_mode = _config_value(
+        config,
+        "manager_state_commit_mode",
+        "legacy-real-step",
+    )
+    if (
+        manager_compute_mode == "hard-masked"
+        and manager_state_commit_mode != "hard-selected"
+    ):
+        raise ValueError(
+            "manager_compute_mode='hard-masked' requires "
+            "manager_state_commit_mode='hard-selected' so the recurrent state "
+            "matches the selected manager output"
+        )
+    try:
+        halt_threshold = float(_config_value(config, "h_halt_thresh", 0.9))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "h_halt_thresh must be a finite probability in [0, 1]"
+        ) from exc
+    if not math.isfinite(halt_threshold) or not 0.0 <= halt_threshold <= 1.0:
+        raise ValueError(
+            "h_halt_thresh must be a finite probability in [0, 1], "
+            f"got {halt_threshold!r}"
+        )
+    _set_config_value(config, "h_halt_thresh", halt_threshold)
+
+    try:
+        act_depth_temperature = float(
+            _config_value(config, "act_depth_temperature", 0.05)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "act_depth_temperature must be a finite positive number"
+        ) from exc
+    if (
+        not math.isfinite(act_depth_temperature)
+        or act_depth_temperature <= 0.0
+    ):
+        raise ValueError(
+            "act_depth_temperature must be a finite positive number, "
+            f"got {act_depth_temperature!r}"
+        )
+    _set_config_value(
+        config,
+        "act_depth_temperature",
+        act_depth_temperature,
+    )
+
+    inference_logit_clamp = _config_value(
+        config,
+        "inference_logit_clamp",
+        30.0 if version == 1 else 0.0,
+    )
+    try:
+        inference_logit_clamp = float(inference_logit_clamp)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "inference_logit_clamp must be a finite non-negative number, "
+            f"got {inference_logit_clamp!r}"
+        ) from exc
+    if not math.isfinite(inference_logit_clamp) or inference_logit_clamp < 0.0:
+        raise ValueError(
+            "inference_logit_clamp must be a finite non-negative number, "
+            f"got {inference_logit_clamp!r}"
+        )
+    _set_config_value(config, "inference_logit_clamp", inference_logit_clamp)
+    return version
+
+
 def _validate_architecture_config(config) -> None:
     """Fail before allocation when a requested geometry cannot execute coherently."""
+    _resolve_recurrence_contract(config)
     context_dim = _positive_config_int(config, "context_dim")
     defaults = {
         "vocab_size": None,
@@ -79,6 +231,12 @@ def _validate_architecture_config(config) -> None:
         name: _positive_config_int(config, name, default)
         for name, default in defaults.items()
     }
+    min_h_steps = _positive_config_int(config, "min_h_steps", 1)
+    if min_h_steps > values["max_h_steps"]:
+        raise ValueError(
+            "Hierarchos config 'min_h_steps' cannot exceed max_h_steps; "
+            f"got min_h_steps={min_h_steps}, max_h_steps={values['max_h_steps']}"
+        )
 
     # The manager input is enc + l_feedback and therefore has context_dim
     # features. Supporting a different manager width would require a new learned
@@ -90,19 +248,36 @@ def _validate_architecture_config(config) -> None:
             f"and context_dim={values['context_dim']}."
         )
 
-    requested_head = _config_value(config, "rwkv_head_size", None)
-    if requested_head not in (None, 0, "", "auto"):
+    shared_requested_head = _config_value(config, "rwkv_head_size", None)
+    for cell_prefix, width_name in (
+        ("h", "h_hidden"),
+        ("l", "l_hidden"),
+    ):
+        field_name = f"{cell_prefix}_rwkv_head_size"
+        requested_head = _config_value(
+            config,
+            field_name,
+            shared_requested_head,
+        )
+        if requested_head in (None, 0, "", "auto"):
+            continue
         try:
             requested_head = int(requested_head)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"rwkv_head_size must be a positive divisor or auto, got {requested_head!r}") from exc
+            raise ValueError(
+                f"{field_name} must be a positive divisor or auto, "
+                f"got {requested_head!r}"
+            ) from exc
         if requested_head <= 0:
-            raise ValueError(f"rwkv_head_size must be a positive divisor or auto, got {requested_head!r}")
-        for width_name in ("h_hidden", "l_hidden"):
-            if values[width_name] % requested_head != 0:
-                raise ValueError(
-                    f"rwkv_head_size={requested_head} does not divide {width_name}={values[width_name]}."
-                )
+            raise ValueError(
+                f"{field_name} must be a positive divisor or auto, "
+                f"got {requested_head!r}"
+            )
+        if values[width_name] % requested_head != 0:
+            raise ValueError(
+                f"{field_name}={requested_head} does not divide "
+                f"{width_name}={values[width_name]}."
+            )
 
     _normalize_detach_frequency(config)
 
@@ -129,14 +304,179 @@ def _config_nonnegative_float(config, name: str, default: float) -> float:
     return value if math.isfinite(value) and value >= 0.0 else default
 
 def _finite_clamp(tensor: torch.Tensor, max_abs: float, *, nan: float = 0.0) -> torch.Tensor:
+    """Clamp finite values without concealing NaN/Inf trajectories.
+
+    Earlier revisions converted non-finite intermediates to ordinary numbers,
+    which could let a corrupted recurrent trajectory reach the optimizer as if
+    it were valid. Preserve non-finites so the raw-logit/loss guards can reject
+    the batch. This is identical to the historical clamp for every finite input.
+    """
     if tensor is None or not torch.is_tensor(tensor) or not tensor.is_floating_point():
         return tensor
     max_abs = float(max_abs)
-    return torch.clamp(
-        torch.nan_to_num(tensor, nan=nan, posinf=max_abs, neginf=-max_abs),
+    clamped = torch.clamp(
+        tensor,
         min=-max_abs,
         max=max_abs,
     )
+    return torch.where(torch.isfinite(tensor), clamped, tensor)
+
+
+def _validate_sequence_mask_contract(
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    labels: Optional[torch.Tensor],
+    loss_weights: Optional[torch.Tensor],
+) -> None:
+    """
+    Validate the recurrence-safe padding contract.
+
+    The recurrent core currently advances every row at every tensor column.
+    Consequently only right padding is coherent: a masked token may never be
+    followed by an active token in the same call. Masked labels/weights must
+    also be inert so padding cannot contribute a language-model gradient.
+    """
+    batch_size, sequence_length = input_ids.shape
+    if attention_mask is not None:
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                f"attention_mask shape {tuple(attention_mask.shape)} does not match "
+                f"input_ids shape {tuple(input_ids.shape)}"
+            )
+        binary_mask = (attention_mask == 0) | (attention_mask == 1)
+        if not bool(binary_mask.all().item()):
+            raise ValueError("attention_mask must contain only 0/1 values")
+        active = attention_mask.to(dtype=torch.bool)
+        if sequence_length > 1:
+            masked_then_active = (~active[:, :-1]) & active[:, 1:]
+            if bool(masked_then_active.any().item()):
+                raise ValueError(
+                    "Hierarchos recurrence accepts right padding only; left padding "
+                    "or holes in attention_mask would advance hidden state through "
+                    "masked tokens before later active tokens"
+                )
+    else:
+        active = None
+
+    if labels is not None:
+        if labels.ndim != 2 or labels.shape[0] != batch_size:
+            raise ValueError(
+                f"labels shape {tuple(labels.shape)} is incompatible with "
+                f"input_ids shape {tuple(input_ids.shape)}"
+            )
+        if labels.shape[1] > sequence_length + 1:
+            raise ValueError(
+                "labels may be at most one token longer than input_ids for "
+                "chunk-boundary lookahead loss"
+            )
+        if active is not None:
+            checked_columns = min(sequence_length, labels.shape[1])
+            invalid_masked_labels = (
+                (~active[:, :checked_columns])
+                & (labels[:, :checked_columns] != -100)
+            )
+            if bool(invalid_masked_labels.any().item()):
+                raise ValueError(
+                    "labels at attention_mask=0 positions must use ignore_index=-100"
+                )
+            if labels.shape[1] == sequence_length + 1:
+                invalid_lookahead = (
+                    (~active[:, -1])
+                    & (labels[:, sequence_length] != -100)
+                )
+                if bool(invalid_lookahead.any().item()):
+                    raise ValueError(
+                        "lookahead labels after a masked final input token must "
+                        "use ignore_index=-100"
+                    )
+
+    if loss_weights is not None:
+        if loss_weights.ndim != 2 or loss_weights.shape[0] != batch_size:
+            raise ValueError(
+                f"loss_weights shape {tuple(loss_weights.shape)} is incompatible with "
+                f"input_ids shape {tuple(input_ids.shape)}"
+            )
+        if loss_weights.shape[1] > sequence_length + 1:
+            raise ValueError(
+                "loss_weights may be at most one token longer than input_ids"
+            )
+        if labels is not None and loss_weights.shape[1] < min(
+            sequence_length,
+            labels.shape[1],
+        ):
+            raise ValueError(
+                "loss_weights must cover every in-chunk label column"
+            )
+        if not bool(torch.isfinite(loss_weights).all().item()):
+            raise ValueError("loss_weights must be finite")
+        if bool((loss_weights < 0).any().item()):
+            raise ValueError("loss_weights must be non-negative")
+        if active is not None:
+            checked_columns = min(sequence_length, loss_weights.shape[1])
+            invalid_masked_weights = (
+                (~active[:, :checked_columns])
+                & (loss_weights[:, :checked_columns] != 0)
+            )
+            if bool(invalid_masked_weights.any().item()):
+                raise ValueError(
+                    "loss_weights at attention_mask=0 positions must be zero"
+                )
+            if loss_weights.shape[1] == sequence_length + 1:
+                invalid_lookahead_weight = (
+                    (~active[:, -1])
+                    & (loss_weights[:, sequence_length] != 0)
+                )
+                if bool(invalid_lookahead_weight.any().item()):
+                    raise ValueError(
+                        "lookahead loss_weights after a masked final input token "
+                        "must be zero"
+                    )
+
+
+def _logit_numerics(
+    logits: torch.Tensor,
+    saturation_threshold: float,
+) -> dict:
+    """Detached raw-logit health metrics; never sanitize the training graph."""
+    raw = logits.detach().float()
+    finite = torch.isfinite(raw)
+    finite_abs = torch.where(finite, raw.abs(), torch.zeros_like(raw))
+    if finite_abs.numel() == 0:
+        max_abs = torch.zeros((), device=raw.device, dtype=torch.float32)
+        saturation_fraction = torch.zeros(
+            (),
+            device=raw.device,
+            dtype=torch.float32,
+        )
+    else:
+        max_abs = finite_abs.amax()
+        saturation_fraction = (
+            finite_abs >= float(saturation_threshold)
+        ).float().mean()
+    return {
+        "raw_logit_max_abs": max_abs,
+        "raw_logit_nonfinite_count": (~finite).sum(),
+        "raw_logit_saturation_fraction": saturation_fraction,
+        "raw_logit_saturation_threshold": torch.tensor(
+            float(saturation_threshold),
+            device=raw.device,
+            dtype=torch.float32,
+        ),
+    }
+
+
+def _keep_active_rows(
+    updated: torch.Tensor,
+    previous: torch.Tensor,
+    active_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Commit ``updated`` only for active batch rows."""
+    row_mask = active_rows.view(
+        active_rows.shape[0],
+        *([1] * (updated.ndim - 1)),
+    )
+    return torch.where(row_mask, updated, previous)
+
 
 def _l2_norm_clamp(tensor: torch.Tensor, max_norm: float) -> torch.Tensor:
     if (
@@ -220,6 +560,11 @@ class WorkerLoop:
         self.max_l_steps = config.max_l_steps
         self.l_conv_atol = getattr(config, 'l_conv_atol', 0.01)
         self.commitment_threshold = getattr(config, 'commitment_threshold', 0.1)
+        self.commitment_cost_mode = getattr(
+            config,
+            'commitment_cost_mode',
+            'sum-square',
+        )
         self.recurrent_state_clamp = _config_float(config, 'recurrent_state_clamp', 50.0)
         self.context_state_clamp = _config_float(config, 'context_state_clamp', 50.0)
         self.drift_state_clamp = _config_float(config, 'drift_state_clamp', 5.0)
@@ -241,8 +586,12 @@ class WorkerLoop:
         static_context = _finite_clamp(static_context, self.context_state_clamp)
         l_state = _finite_clamp(l_state, self.recurrent_state_clamp)
         current_drift = _l2_norm_clamp(_finite_clamp(initial_drift, self.drift_state_clamp), self.drift_norm_clamp)
-        drift_costs = [] 
         current_enc = enc
+        effective_l_steps = torch.zeros(
+            enc.shape[0],
+            device=enc.device,
+            dtype=enc.dtype,
+        )
 
         # Shadow state for exploration (pondering)
         shadow_l_state = l_state.clone()
@@ -268,6 +617,7 @@ class WorkerLoop:
         if not use_training_refinement:
             prev_shadow = shadow_l_state.clone()
             for step_idx in range(self.max_l_steps):
+                effective_l_steps = effective_l_steps + 1.0
                 l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=-(step_idx+1), deepemb_vec=l_deepemb_vec)
                 l_out = _finite_clamp(l_out, self.activation_clamp)
                 shadow_l_state = _finite_clamp(shadow_l_state, self.recurrent_state_clamp)
@@ -283,72 +633,73 @@ class WorkerLoop:
                 if drift_converged or state_converged: break
                 prev_shadow = shadow_l_state.clone()
         else:
-            commitment_cost_static = None
-            if self.compile_static_worker_loop:
-                # Convergence must be sample-local. A scalar active flag coupled
-                # every row in the batch, so a padded/easy peer could change a
-                # valid row's refinement depth and logits.
-                active = torch.ones(enc.shape[0], device=enc.device, dtype=enc.dtype)
-                drift_cost_sum = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
-                drift_cost_count = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
+            # One canonical training/parity policy is used in eager and compiled
+            # execution. Convergence is row-local and converged rows are frozen;
+            # no row may change a peer's refinement depth through a batch mean.
+            active = torch.ones(enc.shape[0], device=enc.device, dtype=enc.dtype)
+            drift_cost_sum = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
+            drift_cost_count = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
 
-                for step_idx in range(self.max_l_steps):
-                    prev_shadow = shadow_l_state
-                    prev_drift = current_drift
-                    prev_l_input = l_input
-
-                    l_out, candidate_shadow = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
-                    l_out = _finite_clamp(l_out, self.activation_clamp)
-                    candidate_shadow = _finite_clamp(candidate_shadow, self.recurrent_state_clamp)
-
-                    drift_delta = torch.tanh(self.context_drift_proj(l_out)) * self.drift_delta_scale
-                    candidate_drift = _l2_norm_clamp(_finite_clamp(current_drift + drift_delta, self.drift_state_clamp), self.drift_norm_clamp)
-                    drift_sq = torch.sum(candidate_drift ** 2, dim=-1)
-                    hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
-                    hinge_cost = torch.clamp(hinge_cost, max=100.0)
-
-                    drift_cost_sum = drift_cost_sum + hinge_cost * active
-                    drift_cost_count = drift_cost_count + active
-
-                    candidate_dynamic = static_context + candidate_drift
-                    candidate_input_vec = torch.cat([current_enc, candidate_dynamic], dim=-1)
-                    candidate_l_input = _finite_clamp(self.l_input_proj(candidate_input_vec), self.recurrent_state_clamp)
-
-                    keep2 = active.unsqueeze(-1)
-                    keep3 = active.view(-1, 1, 1)
-                    shadow_l_state = candidate_shadow * keep3 + prev_shadow * (1.0 - keep3)
-                    current_drift = candidate_drift * keep2 + prev_drift * (1.0 - keep2)
-                    l_input = candidate_l_input * keep2 + prev_l_input * (1.0 - keep2)
-
-                    still_active = (
-                        torch.mean(torch.abs(drift_delta), dim=-1) >= self.l_conv_atol
-                    ).to(dtype=enc.dtype)
-                    active = active * still_active
-
-                commitment_cost_static = drift_cost_sum / torch.clamp(drift_cost_count, min=1.0)
-            else:
-                commitment_cost_static = None
-
-        if use_training_refinement and not self.compile_static_worker_loop:
             for step_idx in range(self.max_l_steps):
-                l_out, shadow_l_state = self.l_rnn(l_input, shadow_l_state, timestep=None, deepemb_vec=l_deepemb_vec)
+                prev_shadow = shadow_l_state
+                prev_drift = current_drift
+                prev_l_input = l_input
+                effective_l_steps = effective_l_steps + active
+
+                l_out, candidate_shadow = self.l_rnn(
+                    l_input,
+                    shadow_l_state,
+                    timestep=None,
+                    deepemb_vec=l_deepemb_vec,
+                )
                 l_out = _finite_clamp(l_out, self.activation_clamp)
-                shadow_l_state = _finite_clamp(shadow_l_state, self.recurrent_state_clamp)
-                
+                candidate_shadow = _finite_clamp(
+                    candidate_shadow,
+                    self.recurrent_state_clamp,
+                )
+
                 drift_delta = torch.tanh(self.context_drift_proj(l_out)) * self.drift_delta_scale
-                current_drift = _l2_norm_clamp(_finite_clamp(current_drift + drift_delta, self.drift_state_clamp), self.drift_norm_clamp)
-                drift_sq = torch.sum(current_drift ** 2, dim=-1)
+                candidate_drift = _l2_norm_clamp(
+                    _finite_clamp(
+                        current_drift + drift_delta,
+                        self.drift_state_clamp,
+                    ),
+                    self.drift_norm_clamp,
+                )
+                if self.commitment_cost_mode == 'mean-square':
+                    drift_sq = torch.mean(candidate_drift ** 2, dim=-1)
+                else:
+                    drift_sq = torch.sum(candidate_drift ** 2, dim=-1)
                 hinge_cost = torch.relu(drift_sq - self.commitment_threshold)
                 hinge_cost = torch.clamp(hinge_cost, max=100.0)
-                drift_costs.append(hinge_cost)
-                
-                # Update dynamic_context BEFORE convergence check (matches inference path)
-                dynamic_context = static_context + current_drift
-                l_input_vec = torch.cat([current_enc, dynamic_context], dim=-1)
-                l_input = _finite_clamp(self.l_input_proj(l_input_vec), self.recurrent_state_clamp)
-                
-                if torch.mean(torch.abs(drift_delta)) < self.l_conv_atol:
-                   break
+                drift_cost_sum = drift_cost_sum + hinge_cost * active
+                drift_cost_count = drift_cost_count + active
+
+                candidate_dynamic = static_context + candidate_drift
+                candidate_input_vec = torch.cat(
+                    [current_enc, candidate_dynamic],
+                    dim=-1,
+                )
+                candidate_l_input = _finite_clamp(
+                    self.l_input_proj(candidate_input_vec),
+                    self.recurrent_state_clamp,
+                )
+
+                keep2 = active.unsqueeze(-1)
+                keep3 = active.view(-1, 1, 1)
+                shadow_l_state = candidate_shadow * keep3 + prev_shadow * (1.0 - keep3)
+                current_drift = candidate_drift * keep2 + prev_drift * (1.0 - keep2)
+                l_input = candidate_l_input * keep2 + prev_l_input * (1.0 - keep2)
+
+                still_active = (
+                    torch.mean(torch.abs(drift_delta), dim=-1) >= self.l_conv_atol
+                ).to(dtype=enc.dtype)
+                active = active * still_active
+
+            commitment_cost_static = drift_cost_sum / torch.clamp(
+                drift_cost_count,
+                min=1.0,
+            )
 
         # Use original l_state (not shadow) for the actual state update
         ts = timestep if timestep is not None else 0
@@ -365,13 +716,14 @@ class WorkerLoop:
         final_enc = current_enc + self.l_to_out(final_l_out)
         final_enc = _finite_clamp(final_enc, self.activation_clamp)
         commitment_cost = torch.zeros(enc.shape[0], device=enc.device, dtype=enc.dtype)
-        if use_training_refinement and self.compile_static_worker_loop and commitment_cost_static is not None:
+        if use_training_refinement:
             commitment_cost = commitment_cost_static
-        elif len(drift_costs) > 0:
-            commitment_cost = torch.stack(drift_costs, dim=0).mean(dim=0)
 
         final_drift = _l2_norm_clamp(_finite_clamp(current_drift, self.drift_state_clamp), self.drift_norm_clamp)
-        return final_enc, next_l_state, commitment_cost, final_drift
+        # The committed worker transition is one additional recurrent step after
+        # refinement, even when the row converged immediately.
+        effective_l_steps = effective_l_steps + 1.0
+        return final_enc, next_l_state, commitment_cost, final_drift, effective_l_steps
 
 
 class HierarchosCore(nn.Module):
@@ -385,6 +737,11 @@ class HierarchosCore(nn.Module):
 
     def refresh_runtime_config(self):
         detach_freq = _normalize_detach_frequency(self.config)
+        rwkv_state_clamp = _config_float(
+            self.config,
+            'recurrent_state_clamp',
+            50.0,
+        )
         rwkv_channel_mix_key_clamp = _config_nonnegative_float(
             self.config,
             'rwkv_channel_mix_key_clamp',
@@ -399,6 +756,7 @@ class HierarchosCore(nn.Module):
             cell = getattr(self, cell_name, None)
             if cell is not None:
                 cell.detach_every_n_steps = detach_freq
+                cell.state_clamp = rwkv_state_clamp
                 if hasattr(cell, "channel_mix_key_clamp"):
                     cell.channel_mix_key_clamp = rwkv_channel_mix_key_clamp
                 if hasattr(cell, "channel_mix_deepembed_clamp"):
@@ -413,8 +771,6 @@ class HierarchosCore(nn.Module):
                 self.memory_gate_warmup_step.fill_(float(max(0, int(step or 0))))
 
     def _apply_memory_gate_warmup(self, gate: torch.Tensor) -> torch.Tensor:
-        if not self.training:
-            return gate
         warmup_steps = float(getattr(self.config, 'memory_gate_warmup_steps', 0) or 0)
         warmup_floor = float(getattr(self.config, 'memory_gate_warmup_floor', 0.0) or 0.0)
         if warmup_steps <= 0.0 or warmup_floor <= 0.0:
@@ -428,6 +784,12 @@ class HierarchosCore(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        if _config_value(config, "architecture_revision", None) not in (
+            None,
+            "",
+            "auto",
+        ):
+            apply_architecture_revision_defaults(self.config)
         _validate_architecture_config(self.config)
         
         # Tokenizer-dependent
@@ -436,21 +798,63 @@ class HierarchosCore(nn.Module):
             
         self.tok_emb = nn.Embedding(config.vocab_size, config.context_dim)
         
-        # V8 DeepEmbed (4x scale) - default to True
-        self.use_deepembed = getattr(config, 'use_deepembed', True)
-        if self.use_deepembed:
+        # Historical checkpoints retain their vocabulary-sized auxiliary
+        # tables. Coherent-v9 reuses the tied token embedding through
+        # neutral-initialized low-rank adapters.
+        self.deepembed_mode, self.rosa_embedding_mode = resolve_token_adapter_modes(
+            self.config
+        )
+        self.use_deepembed = self.deepembed_mode != "off"
+        self.use_rosa = self.rosa_embedding_mode != "off"
+        adapter_rank = None
+        if (
+            self.deepembed_mode == "shared-factorized"
+            or self.rosa_embedding_mode == "shared-factorized"
+        ):
+            adapter_rank = resolve_adapter_rank(
+                self.config,
+                input_dim=config.context_dim,
+            )
+
+        if self.deepembed_mode == "legacy-table":
             self.h_deepemb = nn.Embedding(config.vocab_size, config.h_hidden * 4)
             self.l_deepemb = nn.Embedding(config.vocab_size, config.l_hidden * 4)
             nn.init.ones_(self.h_deepemb.weight)
             nn.init.ones_(self.l_deepemb.weight)
+        elif self.deepembed_mode == "shared-factorized":
+            self.h_deepembed_adapter = SharedTokenAdapter(
+                config.context_dim,
+                config.h_hidden * 4,
+                adapter_rank,
+                output_bias=1.0,
+            )
+            self.l_deepembed_adapter = SharedTokenAdapter(
+                config.context_dim,
+                config.l_hidden * 4,
+                adapter_rank,
+                output_bias=1.0,
+            )
         
-        # V8 ROSA Embed - default to True
         self.memory_token_routers = bool(getattr(config, 'memory_token_routers', True))
-        self.register_buffer("memory_gate_warmup_step", torch.zeros((), dtype=torch.float32), persistent=False)
-        self.use_rosa = getattr(config, 'use_rosa', True)
+        # This schedule position is part of the forward function. Persist it so
+        # an early checkpoint produces identical gates in training, evaluation,
+        # and chat instead of appearing to "warm up again" after reload.
+        self.register_buffer(
+            "memory_gate_warmup_step",
+            torch.zeros((), dtype=torch.float32),
+            persistent=True,
+        )
         if self.use_rosa:
-            self.rosa_emb = nn.Embedding(config.vocab_size + 1, config.context_dim)
-            nn.init.zeros_(self.rosa_emb.weight)
+            if self.rosa_embedding_mode == "legacy-table":
+                self.rosa_emb = nn.Embedding(config.vocab_size + 1, config.context_dim)
+                nn.init.zeros_(self.rosa_emb.weight)
+            else:
+                self.rosa_adapter = SharedTokenAdapter(
+                    config.context_dim,
+                    config.context_dim,
+                    adapter_rank,
+                    output_bias=0.0,
+                )
             # Learnable gate: sigmoid(-1.0) ≈ 0.27 initial injection strength
             self.rosa_gate_logit = nn.Parameter(torch.tensor(-1.0))
             if self.memory_token_routers:
@@ -496,6 +900,16 @@ class HierarchosCore(nn.Module):
         nn.init.normal_(self.l_feedback_proj.weight, mean=0.0, std=0.01)
 
         rwkv_head_size = getattr(config, 'rwkv_head_size', None)
+        h_rwkv_head_size = getattr(
+            config,
+            "h_rwkv_head_size",
+            rwkv_head_size,
+        )
+        l_rwkv_head_size = getattr(
+            config,
+            "l_rwkv_head_size",
+            rwkv_head_size,
+        )
         rwkv_channel_mix_key_clamp = _config_nonnegative_float(
             config,
             'rwkv_channel_mix_key_clamp',
@@ -506,15 +920,32 @@ class HierarchosCore(nn.Module):
             'rwkv_channel_mix_deepembed_clamp',
             4.0,
         )
+        rwkv_state_clamp = _config_float(
+            config,
+            'recurrent_state_clamp',
+            50.0,
+        )
+        rwkv_state_readout_mode = _config_value(
+            config,
+            'rwkv_state_readout_mode',
+            'legacy-input-cache',
+        )
         self.config.rwkv_channel_mix_key_clamp = rwkv_channel_mix_key_clamp
         self.config.rwkv_channel_mix_deepembed_clamp = rwkv_channel_mix_deepembed_clamp
         self.h_rnn = RWKVCell(
             config.h_hidden,
-            head_size=rwkv_head_size,
+            head_size=h_rwkv_head_size,
             layer_id=0,
             n_layer=getattr(config, 'rwkv_n_layer_hint', 2),
             channel_mix_key_clamp=rwkv_channel_mix_key_clamp,
             channel_mix_deepembed_clamp=rwkv_channel_mix_deepembed_clamp,
+            state_readout_mode=rwkv_state_readout_mode,
+            state_clamp=rwkv_state_clamp,
+        )
+        _set_config_value(
+            config,
+            "h_rwkv_head_size",
+            int(self.h_rnn.head_size),
         )
         self.h_to_context = nn.Linear(config.h_hidden, config.context_dim)
         self.h_halt_proj = nn.Linear(config.h_hidden, 1)
@@ -529,11 +960,29 @@ class HierarchosCore(nn.Module):
         self.l_input_proj = nn.Linear(config.context_dim * 2, config.l_hidden)
         self.l_rnn = RWKVCell(
             config.l_hidden,
-            head_size=rwkv_head_size,
+            head_size=l_rwkv_head_size,
             layer_id=0,
             n_layer=getattr(config, 'rwkv_n_layer_hint', 2),
             channel_mix_key_clamp=rwkv_channel_mix_key_clamp,
             channel_mix_deepembed_clamp=rwkv_channel_mix_deepembed_clamp,
+            state_readout_mode=rwkv_state_readout_mode,
+            state_clamp=rwkv_state_clamp,
+        )
+        _set_config_value(
+            config,
+            "l_rwkv_head_size",
+            int(self.l_rnn.head_size),
+        )
+        # Preserve the historical shared field when both cells really share
+        # geometry; explicit per-cell fields make asymmetric widths unambiguous.
+        _set_config_value(
+            config,
+            "rwkv_head_size",
+            (
+                int(self.h_rnn.head_size)
+                if self.h_rnn.head_size == self.l_rnn.head_size
+                else None
+            ),
         )
         
         # Configure truncated BPTT for RWKV cells
@@ -646,7 +1095,8 @@ class HierarchosCore(nn.Module):
                 h_state=None, l_state=None, 
                 prev_context=None, target_context=None,
                 drift_state=None, ltm_memory_state=None,
-                global_pos_offset=0, min_timestamp=0.0, source_filter=None, **kwargs):
+                global_pos_offset=0, min_timestamp=0.0, source_filter=None,
+                min_wallclock_timestamp=0.0, **kwargs):
         """
         Full forward method - direct port from hierarchos.py for exact parity.
         """
@@ -674,7 +1124,34 @@ class HierarchosCore(nn.Module):
         return_topk_indices = kwargs.pop("return_topk_indices", True)
         compute_ltm_value_alignment = bool(kwargs.pop("compute_ltm_value_alignment", False))
         cached_rosa_ids = kwargs.pop("rosa_ids", None)
+        cached_rosa_context_mode = kwargs.pop("rosa_ids_context_mode", None)
         loss_weights = kwargs.pop("loss_weights", None)
+        _validate_sequence_mask_contract(
+            input_ids,
+            attention_mask,
+            labels,
+            loss_weights,
+        )
+        if (
+            not self.training
+            and self.use_rosa
+            and attention_mask is not None
+            and bool((attention_mask == 0).any().item())
+        ):
+            raise ValueError(
+                "Padded stateful inference with ROSA is not coherent because its "
+                "suffix-automaton history is rectangular and would persist pad "
+                "tokens. Group inference rows by equal active length (or disable "
+                "ROSA) instead."
+            )
+        memory_write_source = int(
+            kwargs.pop("memory_write_source", self.ltm.SRC_USER_INTERACTION)
+        )
+        memory_write_timestamp = kwargs.pop("memory_write_timestamp", None)
+        memory_write_wallclock_timestamp = kwargs.pop(
+            "memory_write_wallclock_timestamp",
+            None,
+        )
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
         hebbian_writer_ready = bool(getattr(self.config, "val_proj_trained", False))
         allow_untrained_writer = bool(
@@ -691,6 +1168,7 @@ class HierarchosCore(nn.Module):
         rosa_states = None
         memory_timestamps = None
         memory_sources = None
+        memory_wallclock_timestamps = None
         if ltm_memory_state is None:
             isolate_batch_ltm = getattr(self.config, 'isolate_batch_ltm', True)
             isolate_runtime_ltm = isolate_batch_ltm and (self.training or B > 1)
@@ -699,14 +1177,28 @@ class HierarchosCore(nn.Module):
                 curr_mom_vals = self.ltm._mom_vals.unsqueeze(0).expand(B, -1, -1).clone()
                 memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(B, -1).clone()
                 memory_sources = self.ltm.sources.unsqueeze(0).expand(B, -1).clone()
+                memory_wallclock_timestamps = (
+                    self.ltm.wallclock_timestamps.unsqueeze(0).expand(B, -1).clone()
+                )
             else:
                 curr_fast_vals = self.ltm.fast_vals
                 curr_mom_vals = self.ltm._mom_vals
                 memory_timestamps = self.ltm.timestamps
                 memory_sources = self.ltm.sources
+                memory_wallclock_timestamps = self.ltm.wallclock_timestamps
             past_tokens = None
         else:
-            if len(ltm_memory_state) >= 6:
+            if len(ltm_memory_state) >= 7:
+                (
+                    curr_fast_vals,
+                    curr_mom_vals,
+                    past_tokens,
+                    rosa_states,
+                    memory_timestamps,
+                    memory_sources,
+                    memory_wallclock_timestamps,
+                ) = ltm_memory_state[:7]
+            elif len(ltm_memory_state) >= 6:
                 curr_fast_vals, curr_mom_vals, past_tokens, rosa_states, memory_timestamps, memory_sources = ltm_memory_state[:6]
             elif len(ltm_memory_state) >= 4:
                 curr_fast_vals, curr_mom_vals, past_tokens, rosa_states = ltm_memory_state[:4]
@@ -719,9 +1211,24 @@ class HierarchosCore(nn.Module):
                 if curr_fast_vals.dim() == 3:
                     memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
                     memory_sources = self.ltm.sources.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                    memory_wallclock_timestamps = (
+                        self.ltm.wallclock_timestamps.unsqueeze(0)
+                        .expand(curr_fast_vals.shape[0], -1)
+                        .clone()
+                    )
                 else:
                     memory_timestamps = self.ltm.timestamps
                     memory_sources = self.ltm.sources
+                    memory_wallclock_timestamps = self.ltm.wallclock_timestamps
+            elif memory_wallclock_timestamps is None:
+                if curr_fast_vals.dim() == 3:
+                    memory_wallclock_timestamps = (
+                        self.ltm.wallclock_timestamps.unsqueeze(0)
+                        .expand(curr_fast_vals.shape[0], -1)
+                        .clone()
+                    )
+                else:
+                    memory_wallclock_timestamps = self.ltm.wallclock_timestamps
 
         # V8 ROSA Precomputation (only when enabled). Launch this before the
         # embedding lookup so CPU suffix-automaton work can overlap CUDA kernels.
@@ -729,6 +1236,26 @@ class HierarchosCore(nn.Module):
         rosa_finalize = None
         if self.use_rosa:
             rosa_max_ctx = getattr(self.config, 'rosa_max_context', 512)
+            enforce_rosa_max_context = bool(
+                getattr(self.config, "enforce_rosa_max_context", False)
+            )
+            expected_rosa_context_mode = (
+                ROSA_BOUNDED_CONTEXT_MODE
+                if enforce_rosa_max_context
+                else ROSA_UNBOUNDED_CONTEXT_MODE
+            )
+            actual_rosa_context_mode = (
+                cached_rosa_context_mode
+                or ROSA_UNBOUNDED_CONTEXT_MODE
+            )
+            if (
+                cached_rosa_ids is not None
+                and actual_rosa_context_mode != expected_rosa_context_mode
+            ):
+                # Existing caches without a marker are legacy-unbounded. Any
+                # cache/config semantic mismatch is recomputed rather than
+                # silently changing the model's exact-memory input.
+                cached_rosa_ids = None
 
             if cached_rosa_ids is None:
                 # --- Datacenter-Optimized Async ROSA Pipeline ---
@@ -742,6 +1269,7 @@ class HierarchosCore(nn.Module):
                     vocab_size=self.config.vocab_size,
                     device=device,
                     rosa_max_ctx=rosa_max_ctx,
+                    enforce_max_context=enforce_rosa_max_context,
                 )
             else:
                 if cached_rosa_ids.shape != input_ids.shape:
@@ -758,6 +1286,7 @@ class HierarchosCore(nn.Module):
                 )
 
         x = self.tok_emb(input_ids)
+        shared_token_features = x
 
         if self.use_rosa:
             if cached_rosa_ids is None:
@@ -778,9 +1307,39 @@ class HierarchosCore(nn.Module):
                     new_past_tokens = torch.cat([past_tokens_cpu, input_ids_cpu], dim=1)
                 else:
                     new_past_tokens = input_ids_cpu
-                new_rosa_states = rosa_states
+                if enforce_rosa_max_context and int(rosa_max_ctx or 0) > 0:
+                    context_cap = int(rosa_max_ctx)
+                    combined_length = int(new_past_tokens.shape[1])
+                    active_length = (
+                        ((combined_length - 1) % context_cap) + 1
+                        if combined_length > 0
+                        else 0
+                    )
+                    new_past_tokens = new_past_tokens[
+                        :,
+                        -active_length:,
+                    ].contiguous()
+                    # Cached IDs advance no Python automaton. Force a checked
+                    # rebuild from the bounded active token segment if a later
+                    # call switches back to live ROSA.
+                    new_rosa_states = None
+                else:
+                    new_rosa_states = rosa_states
 
-            rosa_embs = self.rosa_emb(rosa_batch_tensor)
+            if self.rosa_embedding_mode == "legacy-table":
+                rosa_embs = self.rosa_emb(rosa_batch_tensor)
+                if bool(getattr(self.config, "rosa_zero_no_prediction", False)):
+                    rosa_valid = (
+                        rosa_batch_tensor != int(self.config.vocab_size)
+                    ).unsqueeze(-1)
+                    rosa_embs = rosa_embs * rosa_valid.to(dtype=rosa_embs.dtype)
+            else:
+                rosa_features, rosa_valid = shared_token_lookup(
+                    rosa_batch_tensor,
+                    self.tok_emb.weight,
+                    vocab_size=int(self.config.vocab_size),
+                )
+                rosa_embs = self.rosa_adapter(rosa_features) * rosa_valid
             # Per-token router controls exact-memory injection without branching.
             if self.memory_token_routers and hasattr(self, "rosa_router"):
                 rosa_gate_logits = self.rosa_gate_logit + self.rosa_router(x)
@@ -792,10 +1351,25 @@ class HierarchosCore(nn.Module):
         else:
             new_past_tokens = None
 
+        # DeepEmbed is token-local, so compute it as two batched GEMMs/lookups
+        # instead of launching two tiny kernels inside every recurrent token
+        # iteration. The shared adapters intentionally consume the raw tied
+        # embedding, before ROSA modifies ``x``.
+        if self.deepembed_mode == "legacy-table":
+            h_deepemb_all = self.h_deepemb(input_ids)
+            l_deepemb_all = self.l_deepemb(input_ids)
+        elif self.deepembed_mode == "shared-factorized":
+            h_deepemb_all = self.h_deepembed_adapter(shared_token_features)
+            l_deepemb_all = self.l_deepembed_adapter(shared_token_features)
+        else:
+            h_deepemb_all = None
+            l_deepemb_all = None
+
 
         # ==================================================================
         # 1. STATE INITIALIZATION (With Context Recovery)
         # ==================================================================
+        l_state_was_provided = l_state is not None
         if h_state is None:
             h_state = self.h_rnn.initial_state(B, device=device)
             prev_context = torch.zeros(B, self.config.context_dim, device=device)
@@ -827,6 +1401,7 @@ class HierarchosCore(nn.Module):
             curr_mom_vals = curr_mom_vals.to(device)
             memory_timestamps = memory_timestamps.to(device)
             memory_sources = memory_sources.to(device)
+            memory_wallclock_timestamps = memory_wallclock_timestamps.to(device)
 
         drift_seed = None
         if drift_state is not None:
@@ -850,6 +1425,11 @@ class HierarchosCore(nn.Module):
         all_topk_vals = []
         all_topk_idx = []
         aux_attention_mask = attention_mask.to(device=device, dtype=torch.float32) if attention_mask is not None else None
+        all_token_rows_active = torch.ones(B, device=device, dtype=torch.bool)
+        mask_has_any_padding = (
+            aux_attention_mask is not None
+            and bool((aux_attention_mask == 0).any().item())
+        )
 
         ltm_value_readout = None
         if compute_ltm_value_alignment:
@@ -874,17 +1454,85 @@ class HierarchosCore(nn.Module):
 
         stride = self.config.h_stride
         final_drift = None
+        detach_freq = getattr(self.config, 'detach_every_n_steps', 32)
+        drift_recurrence_mode = getattr(
+            self.config,
+            'drift_recurrence_mode',
+            'legacy-chunk-seeded',
+        )
+        manager_state_commit_mode = getattr(
+            self.config,
+            'manager_state_commit_mode',
+            'legacy-real-step',
+        )
+        manager_compute_mode = getattr(
+            self.config,
+            'manager_compute_mode',
+            'soft-act',
+        )
+        h_halt_threshold = float(getattr(self.config, 'h_halt_thresh', 0.9))
+        min_h_steps = int(getattr(self.config, 'min_h_steps', 1))
+        h_effective_steps = []
+        l_effective_steps = []
 
         # ==================================================================
         # 2. MAIN TIME LOOP
         # ==================================================================
         for t in range(T):
-            token_x_idx = input_ids[:, t]
+            if (
+                self.training
+                and detach_freq is not None
+                and t > 0
+                and t % detach_freq == 0
+            ):
+                # This is the temporal graph boundary. Cut every recurrent
+                # carrier before it participates in the boundary token, rather
+                # than detaching H and L after feedback/drift already consumed
+                # their old graphs.
+                h_state = h_state.detach()
+                l_state = l_state.detach()
+                prev_context = prev_context.detach()
+                target_context = target_context.detach()
+                if final_drift is not None:
+                    final_drift = final_drift.detach()
+
+            if not mask_has_any_padding:
+                token_active_rows = all_token_rows_active
+            else:
+                token_active_rows = aux_attention_mask[:, t].to(
+                    device=device,
+                    dtype=torch.bool,
+                )
+            # If the batch contains any padding, use the row mask
+            # unconditionally. This avoids a device-to-host synchronization at
+            # every token while preserving exact state freezing.
+            has_inactive_rows = mask_has_any_padding
+            if has_inactive_rows:
+                previous_h_state = h_state
+                previous_l_state = l_state
+                previous_prev_context = prev_context
+                previous_target_context = target_context
+                if final_drift is not None:
+                    previous_drift = final_drift
+                elif drift_seed is not None:
+                    previous_drift = drift_seed
+                else:
+                    previous_drift = torch.zeros(
+                        B,
+                        self.config.context_dim,
+                        device=device,
+                        dtype=prev_context.dtype,
+                    )
+
             token_x = x[:, t]
             abs_t = global_pos_offset + t
             
-            h_deepemb_vec = self.h_deepemb(token_x_idx) if self.use_deepembed else None
-            l_deepemb_vec = self.l_deepemb(token_x_idx) if self.use_deepembed else None
+            if h_deepemb_all is not None:
+                h_deepemb_vec = h_deepemb_all[:, t]
+                l_deepemb_vec = l_deepemb_all[:, t]
+            else:
+                h_deepemb_vec = None
+                l_deepemb_vec = None
             
             # --- LTM Retrieval ---
             p = self.persistent.unsqueeze(0).expand(B, -1)
@@ -893,8 +1541,13 @@ class HierarchosCore(nn.Module):
             
             topk_vals, topk_idx, topk_ts = self.ltm.retrieve_topk(
                 q, self.config.ltm_topk, min_timestamp, source_filter, fast_vals=curr_fast_vals,
-                timestamps=memory_timestamps, sources=memory_sources
+                timestamps=memory_timestamps, sources=memory_sources,
+                min_wallclock_timestamp=min_wallclock_timestamp,
+                wallclock_timestamps=memory_wallclock_timestamps,
             )
+            topk_vals = topk_vals + (
+                q.sum(dim=-1, keepdim=True) * 0.0
+            ).unsqueeze(-1)
             
             if return_topk_values or return_raw_topk_values:
                 all_topk_vals.append(topk_vals)
@@ -906,7 +1559,8 @@ class HierarchosCore(nn.Module):
             pe = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
             if self.config.ltm_val_dim % 2 == 1:
                 pe = torch.cat([pe, pe.new_zeros(*pe.shape[:-1], 1)], dim=-1)
-            topk_vals = topk_vals + pe
+            valid_memory = (topk_idx >= 0).unsqueeze(-1)
+            topk_vals = (topk_vals + pe) * valid_memory.to(dtype=topk_vals.dtype)
             
             if self.memory_token_routers and hasattr(self, "ltm_router"):
                 gate_input = self.ltm_gate_logit + self.ltm_router(token_x)
@@ -928,10 +1582,6 @@ class HierarchosCore(nn.Module):
             l_feedback = self.l_feedback_proj(self.l_rnn.state_hidden(l_state).to(device))
             enc_with_feedback = _finite_clamp(enc + l_feedback, activation_clamp)
 
-            detach_freq = getattr(self.config, 'detach_every_n_steps', 32)
-            if self.training and detach_freq is not None and t > 0 and t % detach_freq == 0:
-                h_state = h_state.detach()
-            
             h_out_real, h_state = self.h_rnn(enc_with_feedback, h_state, timestep=None, deepemb_vec=h_deepemb_vec)
             h_out_real = _finite_clamp(h_out_real, activation_clamp)
             h_state = _finite_clamp(h_state, recurrent_state_clamp)
@@ -940,6 +1590,11 @@ class HierarchosCore(nn.Module):
                 print(f"WARNING: NaN/Inf detected in h_out_real at step {t}")
             
             step_ponder_cost = torch.zeros(B, device=device, dtype=enc.dtype)
+            h_steps_this_token = torch.ones(
+                B,
+                device=device,
+                dtype=torch.float32,
+            )
             
             # PLANNING STEP (Strided with ACT)
             if abs_t % stride == 0:
@@ -947,61 +1602,141 @@ class HierarchosCore(nn.Module):
 
                 # Pondering on Shadow State
                 h_step_outputs = [h_out_real]
+                h_step_states = [h_state]
                 halt_logit = _finite_clamp(self.h_halt_proj(h_out_real).squeeze(-1), halt_logit_clamp)
                 h_halt_probs = [torch.sigmoid(halt_logit).clamp(1e-6, 1.0 - 1e-6)]
                 
                 shadow_h_state = _finite_clamp(h_state.clone(), recurrent_state_clamp)
                 current_enc_h = enc_with_feedback
+                hard_survival = 1.0 - h_halt_probs[0]
+                hard_halted = (
+                    (1.0 - hard_survival) >= h_halt_threshold
+                    if min_h_steps <= 1
+                    else torch.zeros_like(h_halt_probs[0], dtype=torch.bool)
+                )
 
                 inference_logit_parity = bool(
                     getattr(self.config, 'inference_logit_parity', False)
                     or getattr(self.config, 'full_sample_bptt', False)
                 )
                 for step_idx in range(self.config.max_h_steps - 1):
-                    if (
-                        not self.training
-                        and not inference_logit_parity
-                        and h_halt_probs[-1].mean() > getattr(self.config, 'h_halt_thresh', 0.9)
-                    ):
-                        break
+                    if not self.training:
+                        if not bool(token_active_rows.any().item()):
+                            break
+                        if manager_compute_mode == "hard-masked":
+                            # Hard selection is invariant to uncomputed later
+                            # candidates after every active row has selected a
+                            # state, so this eager exit preserves train logits.
+                            if bool(hard_halted[token_active_rows].all().item()):
+                                break
+                        elif (
+                            not inference_logit_parity
+                            and h_halt_probs[-1][token_active_rows].mean()
+                            > h_halt_threshold
+                        ):
+                            break
                     h_out_ponder, shadow_h_state = self.h_rnn(current_enc_h, shadow_h_state, timestep=None, deepemb_vec=h_deepemb_vec)
                     h_out_ponder = _finite_clamp(h_out_ponder, activation_clamp)
                     shadow_h_state = _finite_clamp(shadow_h_state, recurrent_state_clamp)
                     halt_logit = _finite_clamp(self.h_halt_proj(h_out_ponder).squeeze(-1), halt_logit_clamp)
                     h_step_outputs.append(h_out_ponder)
+                    h_step_states.append(shadow_h_state)
                     h_halt_probs.append(torch.sigmoid(halt_logit).clamp(1e-6, 1.0 - 1e-6))
+                    hard_survival = hard_survival * (1.0 - h_halt_probs[-1])
+                    completed_steps = step_idx + 2
+                    if completed_steps >= min_h_steps:
+                        hard_halted = hard_halted | (
+                            (1.0 - hard_survival) >= h_halt_threshold
+                        )
 
-                # BUG #4 FIX: Force ACT weighting to float32 for numerical stability.
-                # BFloat16's limited precision (~7 bits) causes underflow in cumprod chains,
-                # leading to NaN weights. Mirrors the autocast(enabled=False) pattern in rwkv_cell.py.
                 h_stack = torch.stack(h_step_outputs, dim=0).float()
                 halt_stack = torch.stack(h_halt_probs, dim=0).float()
-                halt_stack = torch.nan_to_num(halt_stack, nan=0.5, posinf=1.0 - 1e-6, neginf=1e-6)
-                halt_stack = halt_stack.clamp(1e-6, 1.0 - 1e-6)
-                remain = 1.0 - halt_stack
-                remain_shifted = torch.cat([torch.ones_like(remain[:1]), remain[:-1]], dim=0)
-                cum_remain = torch.cumprod(remain_shifted, dim=0)
-                
-                weights = halt_stack * cum_remain
-                remainder = cum_remain[-1] * (1.0 - halt_stack[-1])
-                total = weights.sum(dim=0) + remainder + 1e-8
-                weights = weights / total.unsqueeze(0)
-                remainder = remainder / total
-                final_h_out = (weights.unsqueeze(-1) * h_stack).sum(dim=0) + remainder.unsqueeze(-1) * h_stack[-1]
-                if torch.isnan(final_h_out).any() or torch.isinf(final_h_out).any():
-                    print(f"WARNING: Non-finite manager output at token step {abs_t}; clamping for stability.")
-                    final_h_out = torch.nan_to_num(final_h_out, nan=0.0, posinf=10.0, neginf=-10.0)
+                act = normalized_act_weights(halt_stack)
+                h_state_stack = torch.stack(h_step_states, dim=0)
+                if manager_compute_mode == "hard-masked":
+                    selection = hard_act_selection(
+                        h_stack,
+                        h_state_stack,
+                        halt_stack,
+                        threshold=h_halt_threshold,
+                        min_steps=min(min_h_steps, len(h_step_outputs)),
+                    )
+                    final_h_out = selection.output
+                    h_state = selection.state.to(dtype=h_step_states[0].dtype)
+                    h_steps_this_token = selection.executed_steps
+                    step_ponder_cost = hard_act_depth_straight_through(
+                        halt_stack,
+                        selection.executed_steps,
+                        threshold=h_halt_threshold,
+                        min_steps=min(
+                            min_h_steps,
+                            len(h_step_outputs),
+                        ),
+                        temperature=float(
+                            getattr(
+                                self.config,
+                                "act_depth_temperature",
+                                0.05,
+                            )
+                        ),
+                    ).to(enc.dtype)
+                else:
+                    final_h_out = (
+                        (act.weights.unsqueeze(-1) * h_stack).sum(dim=0)
+                        + act.remainder.unsqueeze(-1) * h_stack[-1]
+                    )
+                    step_ponder_cost = act.expected_steps.to(enc.dtype)
+                # ACT helpers defensively define a selection for malformed
+                # probabilities, but the model must not turn a NaN halt head
+                # into valid-looking logits. This zero-valued dependency keeps
+                # finite trajectories unchanged and propagates any non-finite
+                # halt value to the raw-logit rejection guard without a host
+                # synchronization.
+                final_h_out = final_h_out + (
+                    halt_stack.sum(dim=0) * 0.0
+                ).unsqueeze(-1)
+                if getattr(self.config, 'debug_numerics', False):
+                    if bool((~torch.isfinite(final_h_out)).any().item()):
+                        print(
+                            "WARNING: Non-finite manager output at token step "
+                            f"{abs_t}; preserving it for fail-closed rejection."
+                        )
                 final_h_out = _finite_clamp(final_h_out, activation_clamp).to(enc.dtype)  # Cast back to working precision
+
+                if manager_state_commit_mode == 'act-weighted':
+                    h_state_stack_float = h_state_stack.float()
+                    state_weights = act.weights.unsqueeze(-1).unsqueeze(-1)
+                    state_remainder = act.remainder.unsqueeze(-1).unsqueeze(-1)
+                    h_state = (
+                        (state_weights * h_state_stack_float).sum(dim=0)
+                        + state_remainder * h_state_stack_float[-1]
+                    ).to(dtype=h_step_states[0].dtype)
+                    h_state = _finite_clamp(h_state, recurrent_state_clamp)
+                elif manager_state_commit_mode == 'last-shadow':
+                    h_state = _finite_clamp(
+                        h_step_states[-1],
+                        recurrent_state_clamp,
+                    )
                 
                 target_context = self.h_to_context(final_h_out)
                 target_context = _finite_clamp(target_context, context_state_clamp)
                 
-                step_ponder_cost = cum_remain.sum(dim=0).to(enc.dtype)
                 ponder_costs.append(step_ponder_cost)
                 if aux_attention_mask is not None:
                     ponder_weights.append(aux_attention_mask[:, t])
                 else:
                     ponder_weights.append(torch.ones(B, device=device, dtype=torch.float32))
+                if manager_compute_mode != "hard-masked":
+                    h_steps_this_token = torch.full(
+                        (B,),
+                        float(len(h_step_outputs)),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+
+            h_effective_steps.append(
+                h_steps_this_token * token_active_rows.float()
+            )
             
             # LERP (Interpolation)
             step_in_stride = abs_t % stride
@@ -1012,7 +1747,15 @@ class HierarchosCore(nn.Module):
             # ==================================================================
             # 4. WORKER STEP
             # ==================================================================
-            if t == 0 and drift_seed is not None:
+            use_external_drift_seed = (
+                t == 0
+                and drift_seed is not None
+                and (
+                    drift_recurrence_mode == 'legacy-chunk-seeded'
+                    or not l_state_was_provided
+                )
+            )
+            if use_external_drift_seed:
                 initial_drift = _l2_norm_clamp(_finite_clamp(drift_seed, drift_state_clamp), drift_norm_clamp)
             elif self.context_drift_proj is not None:
                 prev_worker_h = self.l_rnn.state_hidden(l_state).to(device)
@@ -1021,21 +1764,52 @@ class HierarchosCore(nn.Module):
             else:
                 initial_drift = torch.zeros(B, self.config.context_dim, device=device)
 
-            if self.training and detach_freq is not None and t > 0 and t % detach_freq == 0:
-                l_state = l_state.detach()
-
             if getattr(self.config, 'gradient_checkpointing', False) and self.training:
-                enc, l_state, cc, final_drift = checkpoint(
+                enc, l_state, cc, final_drift, l_steps_this_token = checkpoint(
                     self.worker_loop_module, enc, sliding_context, l_state, initial_drift, None, l_deepemb_vec,
                     use_reentrant=False
                 )
             else:
-                enc, l_state, cc, final_drift = self.worker_loop_module(
+                enc, l_state, cc, final_drift, l_steps_this_token = self.worker_loop_module(
                     enc, sliding_context, l_state, initial_drift, timestep=None, l_deepemb_vec=l_deepemb_vec
                 )
             enc = _finite_clamp(enc, activation_clamp)
             l_state = _finite_clamp(l_state, recurrent_state_clamp)
             final_drift = _l2_norm_clamp(_finite_clamp(final_drift, drift_state_clamp), drift_norm_clamp)
+            l_effective_steps.append(
+                l_steps_this_token.float() * token_active_rows.float()
+            )
+            if has_inactive_rows:
+                h_state = _keep_active_rows(
+                    h_state,
+                    previous_h_state,
+                    token_active_rows,
+                )
+                l_state = _keep_active_rows(
+                    l_state,
+                    previous_l_state,
+                    token_active_rows,
+                )
+                prev_context = _keep_active_rows(
+                    prev_context,
+                    previous_prev_context,
+                    token_active_rows,
+                )
+                target_context = _keep_active_rows(
+                    target_context,
+                    previous_target_context,
+                    token_active_rows,
+                )
+                final_drift = _keep_active_rows(
+                    final_drift,
+                    previous_drift,
+                    token_active_rows,
+                )
+                cc = torch.where(
+                    token_active_rows,
+                    cc,
+                    torch.zeros_like(cc),
+                )
 
             if ltm_value_readout is not None:
                 value_to_store = self.val_proj(enc.detach())
@@ -1069,16 +1843,27 @@ class HierarchosCore(nn.Module):
                 val_to_store = self.val_proj(enc)
                 val_to_store = torch.clamp(val_to_store, min=-20.0, max=20.0)
                 val_expanded = val_to_store.unsqueeze(1).expand(-1, self.config.ltm_topk, -1)
+                write_topk_idx = topk_idx.masked_fill(
+                    ~token_active_rows.unsqueeze(-1),
+                    -1,
+                )
                 
                 curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
-                    topk_idx, None, val_expanded,
+                    write_topk_idx, None, val_expanded,
                     current_lr=getattr(self.config, 'ltm_lr', 0.001),  # COH #1: Use config LR, not hardcoded 0.01
-                    timestamp=0.0,
+                    timestamp=(
+                        float(memory_write_timestamp)
+                        if memory_write_timestamp is not None
+                        else float(abs_t)
+                    ),
+                    source=memory_write_source,
                     tokens_covered=1,
                     fast_vals=curr_fast_vals,
                     mom_vals=curr_mom_vals,
                     timestamps=memory_timestamps,
                     sources=memory_sources,
+                    wallclock_timestamp=memory_write_wallclock_timestamp,
+                    wallclock_timestamps=memory_wallclock_timestamps,
                     inplace=True
                 )
 
@@ -1092,22 +1877,62 @@ class HierarchosCore(nn.Module):
         ponder_cost_out = None
         commitment_cost_out = None
         ltm_value_alignment_cost_out = None
+        logit_numerics = None
+        logit_saturation_threshold = _config_float(
+            self.config,
+            'logit_saturation_threshold',
+            30.0,
+        )
 
         if labels is not None and not return_logits:
-            loss = self._compute_cuda_chunked_lm_loss(
+            loss, logit_numerics = self._compute_cuda_chunked_lm_loss(
                 final,
                 labels,
                 getattr(self.config, 'z_loss_weight', 1e-4),
                 loss_weights=loss_weights,
+                return_telemetry=True,
             )
         else:
-            logits = self.lm_head(final)
-            
-            if getattr(self.config, 'debug_numerics', False) and (torch.isnan(logits).any() or torch.isinf(logits).any()):
-                print("WARNING: NaN/Inf detected in logits. Replacing with zeros and clamping...")
-                logits = torch.nan_to_num(logits, nan=0.0, posinf=30.0, neginf=-30.0)
-            
-            logits = _finite_clamp(logits, 30.0)
+            raw_logits = self.lm_head(final)
+            logit_numerics = _logit_numerics(
+                raw_logits,
+                logit_saturation_threshold,
+            )
+            has_nonfinite_logits = bool(
+                (logit_numerics["raw_logit_nonfinite_count"] > 0).item()
+            )
+            inference_logit_clamp = float(
+                getattr(self.config, 'inference_logit_clamp', 30.0)
+            )
+            if has_nonfinite_logits:
+                if self.training or inference_logit_clamp <= 0.0:
+                    raise FloatingPointError(
+                        "Non-finite raw language-model logits detected; refusing "
+                        "to hide the numerical failure with sanitization"
+                    )
+                if getattr(self.config, 'debug_numerics', False):
+                    print(
+                        "WARNING: NaN/Inf detected in legacy inference logits; "
+                        "sanitizing under the configured compatibility clamp."
+                    )
+                raw_logits = torch.nan_to_num(
+                    raw_logits,
+                    nan=0.0,
+                    posinf=inference_logit_clamp,
+                    neginf=-inference_logit_clamp,
+                )
+
+            # Training always optimizes the raw logits. Historical inference
+            # retains its old clamp unless a corrected recurrence contract (or
+            # explicit inference_logit_clamp=0) disables it.
+            if not self.training and inference_logit_clamp > 0.0:
+                logits = torch.clamp(
+                    raw_logits,
+                    min=-inference_logit_clamp,
+                    max=inference_logit_clamp,
+                )
+            else:
+                logits = raw_logits
 
             if labels is not None:
                 if labels.ndim != 2 or labels.shape[0] != logits.shape[0]:
@@ -1202,6 +2027,11 @@ class HierarchosCore(nn.Module):
             "ponder_cost": ponder_cost_out, 
             "commitment_cost": commitment_cost_out,
             "ltm_value_alignment_cost": ltm_value_alignment_cost_out,
+            "numerics": logit_numerics,
+            "step_telemetry": {
+                "h_effective_steps": torch.stack(h_effective_steps, dim=1),
+                "l_effective_steps": torch.stack(l_effective_steps, dim=1),
+            },
             "topk_vals": torch.stack(all_topk_vals, dim=1) if (return_topk_values and all_topk_vals) else None, 
             "raw_topk_vals": all_topk_vals if return_raw_topk_values else None,
             "topk_idx": torch.stack(all_topk_idx, dim=1) if all_topk_idx else None,
@@ -1210,12 +2040,21 @@ class HierarchosCore(nn.Module):
             "prev_context": prev_context,
             "target_context": target_context,
             "drift_state": final_drift,
-            "ltm_memory_state": (curr_fast_vals, curr_mom_vals, new_past_tokens, new_rosa_states, memory_timestamps, memory_sources),
+            "ltm_memory_state": (
+                curr_fast_vals,
+                curr_mom_vals,
+                new_past_tokens,
+                new_rosa_states,
+                memory_timestamps,
+                memory_sources,
+                memory_wallclock_timestamps,
+            ),
         }
 
     def _compute_cuda_chunked_lm_loss(self, hidden: torch.Tensor, labels: torch.Tensor,
                                       z_loss_weight: float = 1e-4,
-                                      loss_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+                                      loss_weights: Optional[torch.Tensor] = None,
+                                      return_telemetry: bool = False):
         """
         Memory-friendly supervised-row loss path for large vocabularies.
 
@@ -1260,7 +2099,18 @@ class HierarchosCore(nn.Module):
             valid_weights = shift_weights.view(-1)[valid_mask].float()
         valid_count = valid_labels.shape[0]
         if valid_count == 0:
-            return hidden.sum() * 0.0
+            zero_loss = hidden.sum() * 0.0
+            if not return_telemetry:
+                return zero_loss
+            empty_numerics = _logit_numerics(
+                hidden.new_empty((0, self.config.vocab_size)),
+                _config_float(
+                    self.config,
+                    'logit_saturation_threshold',
+                    30.0,
+                ),
+            )
+            return zero_loss, empty_numerics
         if valid_weights is None:
             denom = torch.tensor(float(valid_count), device=hidden.device, dtype=torch.float32)
         else:
@@ -1275,13 +2125,58 @@ class HierarchosCore(nn.Module):
 
         total_ce = torch.zeros((), device=hidden.device, dtype=torch.float32)
         total_z = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        saturation_threshold = _config_float(
+            self.config,
+            'logit_saturation_threshold',
+            30.0,
+        )
+        raw_logit_max_abs = torch.zeros(
+            (),
+            device=hidden.device,
+            dtype=torch.float32,
+        )
+        raw_logit_nonfinite_count = torch.zeros(
+            (),
+            device=hidden.device,
+            dtype=torch.long,
+        )
+        raw_logit_saturation_count = torch.zeros(
+            (),
+            device=hidden.device,
+            dtype=torch.long,
+        )
+        raw_logit_count = 0
 
         for start in range(0, valid_count, chunk_rows):
             end = min(start + chunk_rows, valid_count)
             chunk_hidden = valid_hidden[start:end]
             chunk_labels = valid_labels[start:end]
             chunk_weights = valid_weights[start:end] if valid_weights is not None else None
-            chunk_logits = torch.clamp(self.lm_head(chunk_hidden), min=-30.0, max=30.0).float()
+            chunk_logits = self.lm_head(chunk_hidden).float()
+            chunk_finite = torch.isfinite(chunk_logits.detach())
+            chunk_nonfinite_count = (~chunk_finite).sum()
+            raw_logit_nonfinite_count = (
+                raw_logit_nonfinite_count + chunk_nonfinite_count
+            )
+            finite_abs = torch.where(
+                chunk_finite,
+                chunk_logits.detach().abs(),
+                torch.zeros_like(chunk_logits.detach()),
+            )
+            raw_logit_max_abs = torch.maximum(
+                raw_logit_max_abs,
+                finite_abs.amax(),
+            )
+            raw_logit_saturation_count = (
+                raw_logit_saturation_count
+                + (finite_abs >= saturation_threshold).sum()
+            )
+            raw_logit_count += chunk_logits.numel()
+            if bool((chunk_nonfinite_count > 0).item()):
+                raise FloatingPointError(
+                    "Non-finite raw language-model logits detected in chunked "
+                    "training loss; refusing to sanitize the training graph"
+                )
 
             if chunk_weights is None:
                 total_ce = total_ce + F.cross_entropy(chunk_logits, chunk_labels, reduction="sum")
@@ -1299,7 +2194,22 @@ class HierarchosCore(nn.Module):
         loss = total_ce / denom
         if z_loss_weight > 0:
             loss = loss + (total_z / denom) * z_loss_weight
-        return loss
+        if not return_telemetry:
+            return loss
+        numerics = {
+            "raw_logit_max_abs": raw_logit_max_abs,
+            "raw_logit_nonfinite_count": raw_logit_nonfinite_count,
+            "raw_logit_saturation_fraction": (
+                raw_logit_saturation_count.float()
+                / max(1, raw_logit_count)
+            ),
+            "raw_logit_saturation_threshold": torch.tensor(
+                saturation_threshold,
+                device=hidden.device,
+                dtype=torch.float32,
+            ),
+        }
+        return loss, numerics
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {"input_ids": input_ids, **kwargs}

@@ -47,6 +47,14 @@ class LTMModule(nn.Module):
         # Buffers for tracking history context
         self.register_buffer("timestamps", torch.zeros(n_slots, dtype=torch.float32))
         self.register_buffer("sources", torch.full((n_slots,), self.SRC_UNKNOWN, dtype=torch.long))
+        # Wall-clock metadata is intentionally runtime-only. ``timestamps`` is the
+        # model-facing token-position clock used by the sinusoidal read feature;
+        # wall-clock seconds are used only by user-facing recency filters.
+        self.register_buffer(
+            "wallclock_timestamps",
+            torch.zeros(n_slots, dtype=torch.float64),
+            persistent=False,
+        )
 
         # Buffer for neg_inf to avoid creation in hot loop
         self.register_buffer("neg_inf", torch.tensor(-float('inf')), persistent=False)
@@ -68,6 +76,7 @@ class LTMModule(nn.Module):
         self._mom_vals.zero_()
         self.timestamps.zero_()
         self.sources.fill_(self.SRC_UNKNOWN)
+        self.wallclock_timestamps.zero_()
 
     def get_effective_memory(self):
         """Returns the combined memory (Slow + Fast)."""
@@ -85,6 +94,70 @@ class LTMModule(nn.Module):
         return self._use_cuda_math(tensor) or bool(
             self.cpu_sparse_update and tensor.device.type == "cpu"
         )
+
+    def _capture_fast_state_for_delta(self, fast_vals: torch.Tensor) -> Optional[torch.Tensor]:
+        if not getattr(self, "accumulate_deltas", False):
+            return None
+        return fast_vals.detach().float().clone()
+
+    def _record_fast_state_delta(
+        self,
+        before: Optional[torch.Tensor],
+        after: torch.Tensor,
+    ) -> None:
+        """Accumulate the exact effective fast-state change, including decay."""
+        if before is None:
+            return
+        delta = after.detach().float() - before.to(device=after.device, dtype=torch.float32)
+        if delta.dim() == 3:
+            # Persistent overlays are model-global. Batched online writes are
+            # unusual, but summing independent row deltas preserves every update.
+            delta = delta.sum(dim=0)
+        self.ltm_deltas.add_(
+            delta.to(device=self.ltm_deltas.device, dtype=self.ltm_deltas.dtype)
+        )
+
+    def _stamp_wallclock_metadata(
+        self,
+        topk_idx: torch.LongTensor,
+        wallclock_timestamp: Optional[float],
+        wallclock_timestamps: Optional[torch.Tensor],
+    ) -> None:
+        if wallclock_timestamp is None:
+            return
+        target = (
+            wallclock_timestamps
+            if wallclock_timestamps is not None
+            else self.wallclock_timestamps
+        )
+        if not torch.is_tensor(target):
+            return
+        valid = topk_idx >= 0
+        if not bool(valid.any().item()):
+            return
+        indices = topk_idx.to(device=target.device, dtype=torch.long)
+        valid = valid.to(device=target.device)
+        with torch.no_grad():
+            if target.dim() == 1:
+                target.index_fill_(0, torch.unique(indices[valid]), float(wallclock_timestamp))
+                return
+            if target.dim() != 2:
+                raise ValueError(
+                    "LTM wall-clock metadata must have shape [slots] or [batch, slots]"
+                )
+            if indices.shape[0] != target.shape[0]:
+                raise ValueError(
+                    f"LTM wall-clock batch {target.shape[0]} does not match "
+                    f"top-k batch {indices.shape[0]}"
+                )
+            for batch_idx in range(target.shape[0]):
+                row_valid = valid[batch_idx]
+                if bool(row_valid.any().item()):
+                    target[batch_idx].index_fill_(
+                        0,
+                        torch.unique(indices[batch_idx][row_valid]),
+                        float(wallclock_timestamp),
+                    )
 
     @staticmethod
     def _expand_slot_tensor_for_index(tensor: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
@@ -151,6 +224,7 @@ class LTMModule(nn.Module):
         if grads_tensor is None:
             return curr_fast, curr_mom
 
+        fast_before = self._capture_fast_state_for_delta(curr_fast)
         device = curr_fast.device
         topk_idx = topk_idx.to(device=device, dtype=torch.long)
         grads_tensor = grads_tensor.to(device=device).float()
@@ -200,9 +274,6 @@ class LTMModule(nn.Module):
         touched_fast.clamp_(min=-50.0, max=50.0)
         curr_fast.index_copy_(0, unique_idx, touched_fast)
 
-        if getattr(self, "accumulate_deltas", False):
-            self.ltm_deltas.index_add_(0, unique_idx, update_step)
-
         target_timestamps = timestamps if timestamps is not None else self.timestamps
         target_sources = sources if sources is not None else self.sources
         with torch.no_grad():
@@ -211,6 +282,7 @@ class LTMModule(nn.Module):
             target_timestamps.index_fill_(0, unique_idx, float(timestamp))
             target_sources.index_fill_(0, unique_idx, int(source))
 
+        self._record_fast_state_delta(fast_before, curr_fast)
         return curr_fast, curr_mom
 
     def _inner_update_batched_cuda(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor,
@@ -222,6 +294,7 @@ class LTMModule(nn.Module):
         if grads_tensor is None:
             return curr_fast, curr_mom
 
+        fast_before = self._capture_fast_state_for_delta(curr_fast)
         device = curr_fast.device
         topk_idx = topk_idx.to(device=device, dtype=torch.long)
         grads_tensor = grads_tensor.to(device=device).float()
@@ -278,9 +351,6 @@ class LTMModule(nn.Module):
         touched_fast.clamp_(min=-50.0, max=50.0)
         curr_fast[batch_idx, slot_idx] = touched_fast
 
-        if getattr(self, "accumulate_deltas", False):
-            self.ltm_deltas.index_add_(0, slot_idx, update_step)
-
         if timestamps is not None and sources is not None:
             with torch.no_grad():
                 timestamps = timestamps.to(device=device)
@@ -288,12 +358,15 @@ class LTMModule(nn.Module):
                 timestamps[batch_idx, slot_idx] = float(timestamp)
                 sources[batch_idx, slot_idx] = int(source)
 
+        self._record_fast_state_delta(fast_before, curr_fast)
         return curr_fast, curr_mom
 
     def retrieve_topk(self, queries: torch.Tensor, topk: int = 4, min_timestamp: float = 0.0,
                       source_filter: Optional[int] = None, fast_vals: Optional[torch.Tensor] = None,
                       timestamps: Optional[torch.Tensor] = None,
-                      sources: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
+                      sources: Optional[torch.Tensor] = None,
+                      min_wallclock_timestamp: float = 0.0,
+                      wallclock_timestamps: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.LongTensor, torch.Tensor]:
         # CRITICAL AMP FIX: Disable autocast for the entire retrieval path.
         # Under BFloat16 AMP, torch.matmul is in the BF16-eligible list and will
         # silently recast explicit .float() operands back to BF16. The backward pass
@@ -315,8 +388,14 @@ class LTMModule(nn.Module):
 
             current_timestamps = timestamps if timestamps is not None else self.timestamps
             current_sources = sources if sources is not None else self.sources
+            current_wallclock = (
+                wallclock_timestamps
+                if wallclock_timestamps is not None
+                else self.wallclock_timestamps
+            )
             current_timestamps = current_timestamps.to(device=queries.device)
             current_sources = current_sources.to(device=queries.device)
+            current_wallclock = current_wallclock.to(device=queries.device)
 
             with torch.no_grad():
                 valid_mask = torch.isfinite(sim)
@@ -324,6 +403,10 @@ class LTMModule(nn.Module):
                     valid_mask = valid_mask & (current_timestamps >= min_timestamp)
                 if source_filter is not None:
                     valid_mask = valid_mask & (current_sources == source_filter)
+                if min_wallclock_timestamp > 0.0:
+                    valid_mask = valid_mask & (
+                        current_wallclock >= float(min_wallclock_timestamp)
+                    )
 
             # Keep the similarity graph alive for address learning. The old
             # filtered branch performed these operations inside no_grad(), which
@@ -434,6 +517,8 @@ class LTMModule(nn.Module):
                     source: int = SRC_USER_INTERACTION, tokens_covered: int = None,
                     fast_vals: Optional[torch.Tensor] = None, mom_vals: Optional[torch.Tensor] = None,
                     timestamps: Optional[torch.Tensor] = None, sources: Optional[torch.Tensor] = None,
+                    wallclock_timestamp: Optional[float] = None,
+                    wallclock_timestamps: Optional[torch.Tensor] = None,
                     inplace: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs a Fast Weight Associative Update (Titans Style).
@@ -451,7 +536,7 @@ class LTMModule(nn.Module):
 
         if curr_fast.dim() == 3:
             if self._use_sparse_update(curr_fast):
-                return self._inner_update_batched_cuda(
+                result = self._inner_update_batched_cuda(
                     topk_idx=topk_idx,
                     grads_tensor=grads_tensor,
                     current_lr=current_lr,
@@ -464,25 +549,32 @@ class LTMModule(nn.Module):
                     sources=sources,
                     inplace=inplace
                 )
-            return self._inner_update_batched(
-                topk_idx=topk_idx,
-                grads_tensor=grads_tensor,
-                current_lr=current_lr,
-                timestamp=timestamp,
-                source=source,
-                tokens_covered=tokens_covered,
-                curr_fast=curr_fast,
-                curr_mom=curr_mom,
-                timestamps=timestamps,
-                sources=sources,
-                inplace=inplace
+            else:
+                result = self._inner_update_batched(
+                    topk_idx=topk_idx,
+                    grads_tensor=grads_tensor,
+                    current_lr=current_lr,
+                    timestamp=timestamp,
+                    source=source,
+                    tokens_covered=tokens_covered,
+                    curr_fast=curr_fast,
+                    curr_mom=curr_mom,
+                    timestamps=timestamps,
+                    sources=sources,
+                    inplace=inplace
+                )
+            self._stamp_wallclock_metadata(
+                topk_idx,
+                wallclock_timestamp,
+                wallclock_timestamps,
             )
+            return result
         
         if grads_tensor is None: 
             return curr_fast, curr_mom
 
         if self._use_sparse_update(curr_fast):
-            return self._inner_update_flat_cuda(
+            result = self._inner_update_flat_cuda(
                 topk_idx=topk_idx,
                 grads_tensor=grads_tensor,
                 current_lr=current_lr,
@@ -495,7 +587,14 @@ class LTMModule(nn.Module):
                 sources=sources,
                 inplace=inplace
             )
+            self._stamp_wallclock_metadata(
+                topk_idx,
+                wallclock_timestamp,
+                wallclock_timestamps,
+            )
+            return result
 
+        fast_before = self._capture_fast_state_for_delta(curr_fast)
         device = curr_fast.device
         valid_mask = topk_idx >= 0
         if not valid_mask.any(): 
@@ -552,8 +651,6 @@ class LTMModule(nn.Module):
             curr_fast.clamp_(min=-50.0, max=50.0)
             new_fast = curr_fast
 
-            if getattr(self, "accumulate_deltas", False):
-                self.ltm_deltas.add_(update_step)
         else:
             update_delta = (new_mom + self.weight_decay * curr_fast)
             update_step = update_delta * (-current_lr)
@@ -569,16 +666,18 @@ class LTMModule(nn.Module):
             new_fast = decayed_fast + update_mask
             new_fast = torch.clamp(new_fast, min=-50.0, max=50.0)
 
-            # Record change for LoRA accumulation if enabled
-            if getattr(self, "accumulate_deltas", False):
-                self.ltm_deltas.add_(update_mask)
-
         target_timestamps = timestamps if timestamps is not None else self.timestamps
         target_sources = sources if sources is not None else self.sources
         with torch.no_grad():
             target_timestamps.data[nonzero_mask] = timestamp
             target_sources.data[nonzero_mask] = source
-            
+
+        self._record_fast_state_delta(fast_before, new_fast)
+        self._stamp_wallclock_metadata(
+            topk_idx,
+            wallclock_timestamp,
+            wallclock_timestamps,
+        )
         return new_fast, new_mom
 
     def _inner_update_batched(self, topk_idx: torch.LongTensor, grads_tensor: torch.Tensor,
@@ -589,6 +688,7 @@ class LTMModule(nn.Module):
         if grads_tensor is None:
             return curr_fast, curr_mom
 
+        fast_before = self._capture_fast_state_for_delta(curr_fast)
         valid_mask_all = topk_idx >= 0
         if not valid_mask_all.any():
             return curr_fast, curr_mom
@@ -631,21 +731,21 @@ class LTMModule(nn.Module):
             curr_fast[batch_idx].add_(update_step)
             curr_fast[batch_idx].clamp_(min=-50.0, max=50.0)
 
-            # Record change for LoRA accumulation if enabled
-            if getattr(self, "accumulate_deltas", False):
-                self.ltm_deltas.add_(update_step)
-
             if timestamps is not None and sources is not None:
                 with torch.no_grad():
                     timestamps[batch_idx].data[nonzero_mask] = timestamp
                     sources[batch_idx].data[nonzero_mask] = source
 
+        self._record_fast_state_delta(fast_before, curr_fast)
         return curr_fast, curr_mom
 
     def update_memory_hebbian(self, topk_idx: torch.LongTensor, keys: torch.Tensor, vals: torch.Tensor, current_lr: float, timestamp: float, 
                               source: int = SRC_USER_INTERACTION, tokens_covered: int = None, fast_vals: Optional[torch.Tensor] = None,
                               mom_vals: Optional[torch.Tensor] = None, timestamps: Optional[torch.Tensor] = None,
-                              sources: Optional[torch.Tensor] = None, inplace: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+                              sources: Optional[torch.Tensor] = None,
+                              wallclock_timestamp: Optional[float] = None,
+                              wallclock_timestamps: Optional[torch.Tensor] = None,
+                              inplace: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Performs a Hebbian-style associative update, unified with Titans Momentum logic.
         """
@@ -661,5 +761,7 @@ class LTMModule(nn.Module):
             mom_vals=mom_vals,
             timestamps=timestamps,
             sources=sources,
+            wallclock_timestamp=wallclock_timestamp,
+            wallclock_timestamps=wallclock_timestamps,
             inplace=inplace
         )

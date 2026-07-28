@@ -32,9 +32,11 @@ from ..utils.checkpoint import (
     sanitize_model_state_dict,
     save_checkpoint_safely,
 )
+from ..models.revisions import architecture_contract, architecture_contract_hash
 from .chat_state import (
     CHAT_STATE_KIND,
     CHAT_STATE_VERSION,
+    chat_state_architecture_metadata,
     chat_state_config_signature,
     clear_ltm_working_memory,
     normalize_recurrent_state_for_model,
@@ -252,6 +254,7 @@ def save_hierarchical_chat_state(
         "rosa_past_tokens": rosa_past_tokens,
         "rosa_states": rosa_states,
     }
+    payload.update(chat_state_architecture_metadata(config))
     payload.update(
         recurrent_state_metadata(
             model=model,
@@ -275,7 +278,11 @@ def load_hierarchical_chat_state(path, *, config, device, model=None):
     if not isinstance(payload, dict) or payload.get("kind") != CHAT_STATE_KIND:
         raise RuntimeError(f"Not a Hierarchos chat runtime state file: {path}")
 
-    validate_chat_state_payload_compatible(payload, config, model=model)
+    allow_legacy_migration = validate_chat_state_payload_compatible(
+        payload,
+        config,
+        model=model,
+    )
 
     def tensor(name):
         value = payload.get(name)
@@ -292,6 +299,7 @@ def load_hierarchical_chat_state(path, *, config, device, model=None):
                 model,
                 "h_rnn",
                 device=device,
+                allow_legacy_migration=allow_legacy_migration,
             )
         if l_state is not None:
             l_state = normalize_recurrent_state_for_model(
@@ -299,6 +307,7 @@ def load_hierarchical_chat_state(path, *, config, device, model=None):
                 model,
                 "l_rnn",
                 device=device,
+                allow_legacy_migration=allow_legacy_migration,
             )
 
     return {
@@ -350,6 +359,7 @@ def _chat_ltm_state_from_rosa_context(model, rosa_past_tokens, rosa_states=None)
 
     timestamps = getattr(ltm, "timestamps", None)
     sources = getattr(ltm, "sources", None)
+    wallclock_timestamps = getattr(ltm, "wallclock_timestamps", None)
     return (
         fast_vals,
         torch.zeros_like(mom_vals),
@@ -357,6 +367,7 @@ def _chat_ltm_state_from_rosa_context(model, rosa_past_tokens, rosa_states=None)
         copy.deepcopy(rosa_states) if rosa_states is not None else None,
         timestamps,
         sources,
+        wallclock_timestamps,
     )
 
 
@@ -625,6 +636,7 @@ def advance_chat_model_state(
     ltm_state,
     global_pos_offset,
     min_timestamp=0.0,
+    min_wallclock_timestamp=0.0,
     source_filter=None,
     is_quantized=False,
     inference_device=None,
@@ -645,6 +657,7 @@ def advance_chat_model_state(
         "ltm_memory_state": ltm_state,
         "global_pos_offset": int(global_pos_offset or 0),
         "min_timestamp": min_timestamp,
+        "min_wallclock_timestamp": min_wallclock_timestamp,
         "source_filter": source_filter,
     }
     if is_quantized:
@@ -689,6 +702,8 @@ def reset_active_ltm_state(model, ltm_state, *, preserve_rosa=True):
     if len(state) >= 6 and torch.is_tensor(state[5]):
         unknown_source = int(getattr(getattr(model, "ltm", None), "SRC_UNKNOWN", 0))
         state[5] = torch.full_like(state[5], unknown_source)
+    if len(state) >= 7 and torch.is_tensor(state[6]):
+        state[6] = torch.zeros_like(state[6])
     return tuple(state)
 
 
@@ -735,6 +750,231 @@ def ltm_replay_seed_state(ltm_state):
     return tuple(state)
 
 
+def _detach_ltm_replay_state(ltm_state):
+    """Detach tensor carriers at a TBPTT boundary without discarding ROSA state."""
+    if not isinstance(ltm_state, (tuple, list)):
+        return ltm_state
+    return tuple(
+        value.detach() if torch.is_tensor(value) else value
+        for value in ltm_state
+    )
+
+
+def replay_online_feedback_with_training_recurrence(
+    model,
+    input_ids,
+    *,
+    config,
+    ltm_state=None,
+    min_timestamp=0.0,
+    min_wallclock_timestamp=0.0,
+    source_filter=None,
+):
+    """Replay feedback with the checkpoint's full-sample/TBPTT state geometry.
+
+    The returned logits and retrieval tensors span the whole sample, but tensor
+    recurrence is detached at the same boundaries as TBPTT training. This keeps
+    online LTM gradients aligned with the path that originally trained the
+    checkpoint instead of silently switching to one monolithic forward.
+    """
+    if input_ids.ndim != 2:
+        raise ValueError(
+            f"Online feedback input_ids must be [batch, sequence], got {tuple(input_ids.shape)}"
+        )
+    total_tokens = int(input_ids.shape[1])
+    if total_tokens <= 0:
+        raise ValueError("Online feedback replay requires at least one token")
+
+    exact_full_sample = uses_full_sample_inference_recurrence(config)
+    chunk_size = resolve_inference_prefill_chunk_size(config)
+    if exact_full_sample or chunk_size <= 0:
+        ranges = [(0, total_tokens)]
+    else:
+        ranges = tbptt_chunk_ranges(total_tokens, chunk_size, 0)
+
+    h_state = None
+    l_state = None
+    prev_context = None
+    target_context = None
+    drift_state = None
+    replay_ltm_state = ltm_replay_seed_state(ltm_state)
+    logits_parts = []
+    topk_parts = []
+    raw_topk_vals = []
+    final_outputs = None
+
+    for start, end in ranges:
+        outputs = model(
+            input_ids=input_ids[:, start:end],
+            h_state=h_state,
+            l_state=l_state,
+            prev_context=prev_context,
+            target_context=target_context,
+            drift_state=boundary_drift_seed(
+                drift_state,
+                start,
+                chunk_size,
+                exact_full_sample=exact_full_sample,
+            ),
+            ltm_memory_state=replay_ltm_state,
+            global_pos_offset=start,
+            min_timestamp=min_timestamp,
+            min_wallclock_timestamp=min_wallclock_timestamp,
+            source_filter=source_filter,
+            suppress_hebbian=True,
+        )
+        if not isinstance(outputs, dict) or outputs.get("logits") is None:
+            raise RuntimeError("Online feedback replay requires model logits")
+
+        logits_parts.append(outputs["logits"])
+        if outputs.get("topk_idx") is not None:
+            topk_parts.append(outputs["topk_idx"])
+        if outputs.get("raw_topk_vals") is not None:
+            raw_topk_vals.extend(outputs["raw_topk_vals"])
+        final_outputs = outputs
+
+        h_state = outputs.get("h_state")
+        l_state = outputs.get("l_state")
+        prev_context = outputs.get("prev_context")
+        target_context = outputs.get("target_context")
+        drift_state = outputs.get("drift_state")
+        replay_ltm_state = outputs.get("ltm_memory_state")
+
+        if not exact_full_sample and end < total_tokens:
+            h_state = h_state.detach() if torch.is_tensor(h_state) else h_state
+            l_state = l_state.detach() if torch.is_tensor(l_state) else l_state
+            prev_context = (
+                prev_context.detach() if torch.is_tensor(prev_context) else prev_context
+            )
+            target_context = (
+                target_context.detach()
+                if torch.is_tensor(target_context)
+                else target_context
+            )
+            drift_state = (
+                drift_state.detach() if torch.is_tensor(drift_state) else drift_state
+            )
+            replay_ltm_state = _detach_ltm_replay_state(replay_ltm_state)
+
+    combined = dict(final_outputs)
+    combined["logits"] = torch.cat(logits_parts, dim=1)
+    combined["raw_topk_vals"] = raw_topk_vals
+    combined["topk_idx"] = (
+        torch.cat(topk_parts, dim=1) if topk_parts else None
+    )
+    combined["ltm_memory_state"] = replay_ltm_state
+    return combined
+
+
+LTM_DELTA_OVERLAY_VERSION = 2
+
+
+def _validated_overlay_tensor(value, reference, name):
+    if not torch.is_tensor(value):
+        raise ValueError(f"LTM overlay {name} must be a tensor")
+    if tuple(value.shape) != tuple(reference.shape):
+        raise ValueError(
+            f"LTM overlay {name} shape {tuple(value.shape)} does not match "
+            f"model shape {tuple(reference.shape)}"
+        )
+    if value.is_floating_point() and not bool(torch.isfinite(value).all().item()):
+        raise ValueError(f"LTM overlay {name} contains non-finite values")
+    return value.detach()
+
+
+def load_ltm_delta_overlay(model, path):
+    """Apply a legacy tensor or versioned cumulative LTM overlay.
+
+    Loading seeds ``ltm_deltas`` with the previously saved cumulative delta so
+    a later save cannot accidentally replace older sessions with only the most
+    recent session's writes.
+    """
+    ltm = getattr(model, "ltm", None)
+    if ltm is None:
+        raise ValueError("Model has no LTM module")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if torch.is_tensor(payload):
+        delta = payload
+        metadata = {}
+        version = 1
+    elif isinstance(payload, dict):
+        version = int(payload.get("version", 0) or 0)
+        delta = payload.get("delta")
+        metadata = payload
+        if version != LTM_DELTA_OVERLAY_VERSION:
+            raise ValueError(f"Unsupported LTM overlay version {version}")
+    else:
+        raise ValueError("LTM overlay must be a tensor or versioned dictionary")
+
+    delta = _validated_overlay_tensor(delta, ltm.vals, "delta")
+    with torch.no_grad():
+        ltm.vals.add_(delta.to(device=ltm.vals.device, dtype=ltm.vals.dtype))
+        if hasattr(ltm, "ltm_deltas"):
+            ltm.ltm_deltas.copy_(
+                delta.to(device=ltm.ltm_deltas.device, dtype=ltm.ltm_deltas.dtype)
+            )
+
+        for key, attr in (
+            ("timestamps", "timestamps"),
+            ("sources", "sources"),
+            ("wallclock_timestamps", "wallclock_timestamps"),
+        ):
+            value = metadata.get(key)
+            target = getattr(ltm, attr, None)
+            if value is None or not torch.is_tensor(target):
+                continue
+            value = _validated_overlay_tensor(value, target, key)
+            target.copy_(value.to(device=target.device, dtype=target.dtype))
+    return version
+
+
+def build_ltm_delta_overlay(model, ltm_state=None):
+    """Build a cumulative, metadata-bearing overlay payload for safe saving."""
+    ltm = getattr(model, "ltm", None)
+    delta = getattr(ltm, "ltm_deltas", None)
+    if ltm is None or not torch.is_tensor(delta):
+        raise ValueError("Model does not expose an LTM delta accumulator")
+    delta = _validated_overlay_tensor(delta, ltm.vals, "delta")
+
+    def _state_or_module(index, attr):
+        if isinstance(ltm_state, (tuple, list)) and len(ltm_state) > index:
+            value = ltm_state[index]
+            target = getattr(ltm, attr, None)
+            if torch.is_tensor(value) and torch.is_tensor(target):
+                if value.dim() == target.dim() + 1 and value.shape[0] == 1:
+                    value = value.squeeze(0)
+                if tuple(value.shape) == tuple(target.shape):
+                    return value
+        return getattr(ltm, attr, None)
+
+    payload = {
+        "version": LTM_DELTA_OVERLAY_VERSION,
+        "delta": delta.cpu().clone(),
+    }
+    for key, index in (
+        ("timestamps", 4),
+        ("sources", 5),
+        ("wallclock_timestamps", 6),
+    ):
+        value = _state_or_module(index, key)
+        if torch.is_tensor(value):
+            payload[key] = value.detach().cpu().clone()
+    return payload
+
+
+def resolve_wallclock_filter(value, *, now=None):
+    """Resolve `/filter time=` into an absolute Unix timestamp cutoff."""
+    seconds_or_timestamp = float(value)
+    if not math.isfinite(seconds_or_timestamp):
+        raise ValueError("time filter must be finite")
+    if seconds_or_timestamp == 0.0:
+        return 0.0
+    if seconds_or_timestamp < 0.0:
+        current_time = time.time() if now is None else float(now)
+        return current_time + seconds_or_timestamp
+    return seconds_or_timestamp
+
+
 def consolidate_ltm_state_for_save(model, ltm_state) -> bool:
     """Fold fast memory into slow LTM values so a fresh chat load retains it."""
     ltm = getattr(model, "ltm", None)
@@ -760,6 +1000,52 @@ def consolidate_ltm_state_for_save(model, ltm_state) -> bool:
         slow_vals.copy_(consolidated.to(dtype=slow_vals.dtype))
     clear_ltm_working_memory(model)
     return True
+
+
+def build_chat_ltm_checkpoint_payload(model):
+    """Build a contract-preserving checkpoint after consolidating chat LTM."""
+    if model is None or not hasattr(model, "config"):
+        raise ValueError("Cannot export chat LTM without a model config")
+
+    contract = architecture_contract(model.config)
+    contract_hash = architecture_contract_hash(model.config)
+    saved_config = dict(model.config)
+    saved_config["architecture_contract_sha256"] = contract_hash
+    source_metadata = getattr(
+        model,
+        "_hierarchos_checkpoint_metadata",
+        {},
+    )
+    if not isinstance(source_metadata, dict):
+        source_metadata = {}
+
+    checkpoint_version = max(
+        4,
+        int(source_metadata.get("checkpoint_version", 0) or 0),
+    )
+    payload = {
+        "checkpoint_version": checkpoint_version,
+        "checkpoint_kind": "inference-ltm-consolidated",
+        "derived_from_checkpoint_kind": str(
+            source_metadata.get("checkpoint_kind") or "unknown"
+        ),
+        "model_state_dict": sanitize_model_state_dict(model),
+        "config": saved_config,
+        "architecture_contract": contract,
+        "architecture_contract_sha256": contract_hash,
+        "training_complete": True,
+    }
+    for key in (
+        "completed_epoch",
+        "run_identity",
+        "best_metric_state",
+        "selection_metric",
+        "effective_training_config",
+        "optimizer_grouping_version",
+    ):
+        if key in source_metadata:
+            payload[key] = copy.deepcopy(source_metadata[key])
+    return payload
 
 
 # --- Simple Generation Helper ---
@@ -892,6 +1178,7 @@ def chat(args, device, tokenizer):
     is_quantized = False
     inference_device = device
     ltm_has_been_updated = False
+    ltm_token_clock = 0
     pending_training_data = None
 
     # =================================================================
@@ -919,9 +1206,27 @@ def chat(args, device, tokenizer):
                 print("INFO: Loaded full-precision model (fallback active).")
                 is_quantized = False
         except Exception as e:
-            print(f"Error loading quantized model: {e}")
-            traceback.print_exc()
-            sys.exit(1)
+            print(f"WARNING: Quantized artifact is unsupported or invalid: {e}")
+            print(
+                "INFO: Looking for a coherent full-precision checkpoint in the "
+                "same model path."
+            )
+            try:
+                model, config = load_full_model_with_config(
+                    args.model_path,
+                    device,
+                )
+                clear_ltm_working_memory(model)
+                is_quantized = False
+                inference_device = device
+                print("Loaded full-precision model; ignored the stale/unsupported .npz artifact.")
+            except Exception as full_precision_error:
+                print(
+                    "Error: neither the quantized artifact nor a full-precision "
+                    f"checkpoint could be loaded: {full_precision_error}"
+                )
+                traceback.print_exc()
+                sys.exit(1)
     else:
         try:
             model, config = load_full_model_with_config(args.model_path, device)
@@ -975,14 +1280,39 @@ def chat(args, device, tokenizer):
             if os.path.exists(ltm_lora_path):
                 print("Loading existing LTM deltas...")
                 try:
-                    deltas = torch.load(ltm_lora_path, weights_only=True)
-                    updatable_model.ltm.vals.data.add_(deltas.to(updatable_model.ltm.vals.device))
+                    overlay_version = load_ltm_delta_overlay(
+                        updatable_model,
+                        ltm_lora_path,
+                    )
+                    if is_quantized and model is not None and shadow_model is not None:
+                        model.ltm.load_state_dict(
+                            shadow_model.ltm.state_dict(),
+                            strict=False,
+                        )
+                        if (
+                            hasattr(model.ltm, "wallclock_timestamps")
+                            and hasattr(shadow_model.ltm, "wallclock_timestamps")
+                        ):
+                            model.ltm.wallclock_timestamps.copy_(
+                                shadow_model.ltm.wallclock_timestamps.to(
+                                    device=model.ltm.wallclock_timestamps.device,
+                                    dtype=model.ltm.wallclock_timestamps.dtype,
+                                )
+                            )
+                    print(f"Loaded cumulative LTM overlay v{overlay_version}.")
                 except Exception as e:
                     print(f"Warning: Failed to load LTM deltas: {e}")
     elif learning_enabled:
         print("LTM online learning is ACTIVE for passive prompt memory and explicit feedback/validation.")
         print("Passive response learning is OFF by default; use --passive-response-learning to opt in.")
     trained_ltm_mode = _print_ltm_chat_alignment(config, learning_enabled)
+    clock_model = shadow_model if is_quantized and shadow_model is not None else model
+    clock_timestamps = getattr(getattr(clock_model, "ltm", None), "timestamps", None)
+    if torch.is_tensor(clock_timestamps) and clock_timestamps.numel() > 0:
+        finite_clock = clock_timestamps.detach().float()
+        finite_clock = finite_clock[torch.isfinite(finite_clock)]
+        if finite_clock.numel() > 0:
+            ltm_token_clock = max(0, int(finite_clock.max().item()))
 
     if not is_quantized:
         model.eval()
@@ -1015,12 +1345,6 @@ def chat(args, device, tokenizer):
         dummy_optimizer = torch.optim.SGD([dummy_param_amp], lr=1.0)
         print("INFO: AMP ENABLED for online learning.")
 
-    def _set_online_update_warmup_complete(update_model):
-        """Match exported late-training checkpoints when computing LTM gradients."""
-        setter = getattr(update_model, "set_training_step", None)
-        if callable(setter):
-            setter(int(getattr(config, "memory_gate_warmup_steps", 0) or 0))
-
     def _merge_ltm_state_into_model_state(update_model, state) -> bool:
         """Copy active chat fast-memory state into model.ltm before saving weights."""
         if (
@@ -1052,6 +1376,8 @@ def chat(args, device, tokenizer):
             copied = _copy_tensor_attr("timestamps", state[4]) or copied
         if len(state) >= 6:
             copied = _copy_tensor_attr("sources", state[5]) or copied
+        if len(state) >= 7:
+            copied = _copy_tensor_attr("wallclock_timestamps", state[6]) or copied
         return copied
 
     # =================================================================
@@ -1060,7 +1386,7 @@ def chat(args, device, tokenizer):
     def perform_ltm_update(input_ids_tensor, label_ids_tensor, source_id, penalty=False, lr_override=None, silent=False, compute_only=False, learn_input_tokens=False):
         """Performs LTM update. Returns loss value if successful, else None.
         If compute_only=True, only computes loss without updating LTM."""
-        nonlocal ltm_has_been_updated, ltm_state
+        nonlocal ltm_has_been_updated, ltm_state, ltm_token_clock
         
         update_model = shadow_model if is_quantized else model
         if update_model is None:
@@ -1073,7 +1399,6 @@ def chat(args, device, tokenizer):
         # Online feedback should observe the same adaptive inference path used
         # to produce the answer. eval() still permits gradients.
         update_model.eval()
-        _set_online_update_warmup_complete(update_model)
         with torch.enable_grad():
             if label_ids_tensor is None:
                 full_sequence = input_ids_tensor.unsqueeze(0)
@@ -1096,13 +1421,14 @@ def chat(args, device, tokenizer):
 
             autocast_device = 'cpu' if is_directml_device(target_device) else target_device.type
             with autocast(device_type=autocast_device, enabled=use_amp):
-                outputs = update_model(
-                    input_ids=full_sequence,
-                    labels=None,
-                    # Replay this sample once. Reusing the active ROSA history
-                    # here would append the same prompt/answer a second time.
-                    ltm_memory_state=ltm_replay_seed_state(ltm_state),
-                    suppress_hebbian=True,
+                outputs = replay_online_feedback_with_training_recurrence(
+                    update_model,
+                    full_sequence,
+                    config=config,
+                    ltm_state=ltm_state,
+                    min_timestamp=min_ts_filter,
+                    min_wallclock_timestamp=min_wallclock_ts_filter,
+                    source_filter=source_id_filter,
                 )
                 logits = outputs["logits"]
                 
@@ -1198,18 +1524,25 @@ def chat(args, device, tokenizer):
                 old_rosa_states = ltm_state[3] if ltm_state is not None and len(ltm_state) >= 4 else None
                 curr_timestamps = curr_ltm[4] if curr_ltm is not None and len(curr_ltm) >= 5 else None
                 curr_sources = curr_ltm[5] if curr_ltm is not None and len(curr_ltm) >= 6 else None
+                curr_wallclock_timestamps = curr_ltm[6] if curr_ltm is not None and len(curr_ltm) >= 7 else None
+                write_timestamp = float(
+                    ltm_token_clock + int(full_sequence.shape[1])
+                )
+                write_wallclock_timestamp = time.time()
 
                 new_fast, new_mom = update_model.ltm.inner_update(
                     outputs["topk_idx"],
                     ltm_grads_copy,
                     current_lr=current_ltm_lr,
-                    timestamp=0.0,
+                    timestamp=write_timestamp,
                     source=source_id,
                     tokens_covered=full_sequence.shape[1],
                     fast_vals=curr_fast,
                     mom_vals=curr_mom,
                     timestamps=curr_timestamps,
                     sources=curr_sources,
+                    wallclock_timestamp=write_wallclock_timestamp,
+                    wallclock_timestamps=curr_wallclock_timestamps,
                     inplace=True
                 )
                 if curr_ltm is not None:
@@ -1220,6 +1553,10 @@ def chat(args, device, tokenizer):
                             curr_timestamps = curr_timestamps.detach().cpu()
                         if isinstance(curr_sources, torch.Tensor):
                             curr_sources = curr_sources.detach().cpu()
+                        if isinstance(curr_wallclock_timestamps, torch.Tensor):
+                            curr_wallclock_timestamps = (
+                                curr_wallclock_timestamps.detach().cpu()
+                            )
                     ltm_state = (
                         new_fast.detach(),
                         new_mom.detach(),
@@ -1227,7 +1564,9 @@ def chat(args, device, tokenizer):
                         old_rosa_states,
                         curr_timestamps.detach() if isinstance(curr_timestamps, torch.Tensor) else curr_timestamps,
                         curr_sources.detach() if isinstance(curr_sources, torch.Tensor) else curr_sources,
+                        curr_wallclock_timestamps.detach() if isinstance(curr_wallclock_timestamps, torch.Tensor) else curr_wallclock_timestamps,
                     )
+                ltm_token_clock = int(write_timestamp)
                 ltm_has_been_updated = True
 
                 if use_amp and scaler and dummy_optimizer:
@@ -1238,7 +1577,17 @@ def chat(args, device, tokenizer):
                 update_model.zero_grad(set_to_none=True)
 
                 if is_quantized and shadow_model:
-                    model.ltm.load_state_dict(update_model.ltm.state_dict())
+                    model.ltm.load_state_dict(update_model.ltm.state_dict(), strict=False)
+                    if (
+                        hasattr(model.ltm, "wallclock_timestamps")
+                        and hasattr(update_model.ltm, "wallclock_timestamps")
+                    ):
+                        model.ltm.wallclock_timestamps.copy_(
+                            update_model.ltm.wallclock_timestamps.to(
+                                device=model.ltm.wallclock_timestamps.device,
+                                dtype=model.ltm.wallclock_timestamps.dtype,
+                            )
+                        )
 
                 update_model.eval()
                 if penalty:
@@ -1259,7 +1608,7 @@ def chat(args, device, tokenizer):
 
     def perform_validation_hebbian_update(input_ids_tensor, label_ids_tensor, source_id, lr_override=None, silent=False):
         """Stores a validated exchange in fast LTM using Hebbian writes only after praise/validation."""
-        nonlocal ltm_has_been_updated, ltm_state
+        nonlocal ltm_has_been_updated, ltm_state, ltm_token_clock
 
         if not _checkpoint_has_trained_hebbian_writer(config):
             if not silent:
@@ -1295,6 +1644,10 @@ def chat(args, device, tokenizer):
         current_ltm_lr = lr_override if lr_override is not None else ltm_lr
         update_model.suppress_hebbian = False
         update_model.config.ltm_lr = current_ltm_lr
+        write_timestamp = float(
+            ltm_token_clock + int(full_sequence.shape[1])
+        )
+        write_wallclock_timestamp = time.time()
 
         try:
             if hasattr(update_model, "eval"):
@@ -1309,8 +1662,12 @@ def chat(args, device, tokenizer):
                     ltm_memory_state=ltm_state,
                     global_pos_offset=0,
                     min_timestamp=min_ts_filter,
+                    min_wallclock_timestamp=min_wallclock_ts_filter,
                     source_filter=source_id_filter,
                     allow_hebbian_update=True,
+                    memory_write_source=source_id,
+                    memory_write_timestamp=write_timestamp,
+                    memory_write_wallclock_timestamp=write_wallclock_timestamp,
                 )
 
             updated_ltm = outputs.get("ltm_memory_state")
@@ -1325,7 +1682,9 @@ def chat(args, device, tokenizer):
                     old_rosa_states,
                     updated_ltm[4] if len(updated_ltm) >= 5 else None,
                     updated_ltm[5] if len(updated_ltm) >= 6 else None,
+                    updated_ltm[6] if len(updated_ltm) >= 7 else None,
                 )
+                ltm_token_clock = int(write_timestamp)
                 ltm_has_been_updated = True
                 if not silent:
                     fv_norm = ltm_state[0].float().norm().item()
@@ -1344,7 +1703,7 @@ def chat(args, device, tokenizer):
     # =================================================================
     print("\nWelcome to Hierarchos Chat. Type 'exit' or 'quit' to end.")
     print("Commands:")
-    print("  /filter time=-<seconds> | /filter source=<id>  : Constrain memory retrieval")
+    print("  /filter time=-<seconds> | token=<floor> | source=<id> : Constrain memory retrieval")
     print("  /settings [temperature <float>] | /temp <float> : View/Change temperature")
     print("  /topk <int> | /topp <float>                    : Change sampling filters")
     print("  /system <prompt> | /system clear               : Set/clear system prompt")
@@ -1432,6 +1791,7 @@ def chat(args, device, tokenizer):
 
     try:
         min_ts_filter = 0.0
+        min_wallclock_ts_filter = 0.0
         source_id_filter = None
         system_prompt = None  # Optional system prompt prepended inside the active training format
         alpaca_chat_format = bool(getattr(args, "alpaca", False) or getattr(config, "alpaca", False))
@@ -1608,16 +1968,43 @@ def chat(args, device, tokenizer):
                     for part in parts[1:]:
                         if part.startswith("time="):
                             try:
-                                min_ts_filter = float(part.split("=")[1])
-                                print(f"Set time filter to {min_ts_filter}")
-                            except:
-                                print("Usage: /filter time=<float>")
+                                raw_time_filter = float(part.split("=", 1)[1])
+                                min_wallclock_ts_filter = resolve_wallclock_filter(
+                                    raw_time_filter
+                                )
+                                if min_wallclock_ts_filter <= 0.0:
+                                    print("Cleared wall-clock memory filter")
+                                elif raw_time_filter < 0.0:
+                                    print(
+                                        "Set wall-clock memory filter to the last "
+                                        f"{abs(raw_time_filter):g} seconds"
+                                    )
+                                else:
+                                    print(
+                                        "Set absolute wall-clock memory cutoff to "
+                                        f"{min_wallclock_ts_filter:g}"
+                                    )
+                            except (TypeError, ValueError):
+                                print("Usage: /filter time=-<seconds> (0 clears)")
+                        elif part.startswith("token="):
+                            try:
+                                min_ts_filter = float(part.split("=", 1)[1])
+                                if not math.isfinite(min_ts_filter) or min_ts_filter < 0:
+                                    raise ValueError
+                                print(f"Set memory token-timestamp floor to {min_ts_filter:g}")
+                            except (TypeError, ValueError):
+                                print("Usage: /filter token=<nonnegative float>")
                         elif part.startswith("source="):
                             try:
-                                source_id_filter = int(part.split("=")[1])
+                                source_value = part.split("=", 1)[1].strip().lower()
+                                source_id_filter = (
+                                    None
+                                    if source_value in {"none", "off", "any"}
+                                    else int(source_value)
+                                )
                                 print(f"Set source filter to {source_id_filter}")
-                            except:
-                                print("Usage: /filter source=<int>")
+                            except (TypeError, ValueError):
+                                print("Usage: /filter source=<int|none>")
                 continue
 
             if prompt.startswith('/temp') or prompt.startswith('/temperature'):
@@ -1860,6 +2247,7 @@ def chat(args, device, tokenizer):
                         ltm_state=ltm_state,
                         global_pos_offset=absolute_start,
                         min_timestamp=min_ts_filter,
+                        min_wallclock_timestamp=min_wallclock_ts_filter,
                         source_filter=source_id_filter,
                         is_quantized=is_quantized,
                         inference_device=inference_device,
@@ -1937,6 +2325,7 @@ def chat(args, device, tokenizer):
                             ltm_state=ltm_state,
                             global_pos_offset=total_tokens_generated,
                             min_timestamp=min_ts_filter,
+                            min_wallclock_timestamp=min_wallclock_ts_filter,
                             source_filter=source_id_filter,
                             is_quantized=is_quantized,
                             inference_device=inference_device,
@@ -2012,6 +2401,7 @@ def chat(args, device, tokenizer):
                         ltm_state=ltm_state,
                         global_pos_offset=total_tokens_generated,
                         min_timestamp=min_ts_filter,
+                        min_wallclock_timestamp=min_wallclock_ts_filter,
                         source_filter=source_id_filter,
                         is_quantized=is_quantized,
                         inference_device=inference_device,
@@ -2134,7 +2524,10 @@ def chat(args, device, tokenizer):
             if hasattr(updatable_model.ltm, 'ltm_deltas') and torch.any(updatable_model.ltm.ltm_deltas != 0):
                 print(f"\nSaving LTM memory deltas to {ltm_lora_path}...")
                 try:
-                    torch.save(updatable_model.ltm.ltm_deltas.cpu(), ltm_lora_path)
+                    torch.save(
+                        build_ltm_delta_overlay(updatable_model, ltm_state),
+                        ltm_lora_path,
+                    )
                     print("Deltas saved.")
                 except Exception as e:
                     print(f"Error saving LTM deltas: {e}")
@@ -2158,11 +2551,10 @@ def chat(args, device, tokenizer):
                                     print("Merged active chat LTM state into model weights.")
                                 if consolidate_ltm_state_for_save(model, ltm_state):
                                     print("Consolidated fast LTM memory into persistent slow values.")
-                                save_checkpoint_safely({
-                                    'model_state_dict': sanitize_model_state_dict(model),
-                                    'config': dict(model.config),
-                                    'training_complete': True,
-                                }, output_weights_path)
+                                save_checkpoint_safely(
+                                    build_chat_ltm_checkpoint_payload(model),
+                                    output_weights_path,
+                                )
                                 print("Save complete.")
                             except Exception as e:
                                 print(f"Error saving model: {e}")

@@ -11,8 +11,11 @@ import sys
 import traceback
 import numpy as np
 import math
+import json
+import hashlib
 
 from .optimizers import DirectMLAdamW
+from .objectives import adaptive_ponder_objective, resolve_ponder_objective
 from ..utils.device import is_directml_device, set_threads
 from ..utils.checkpoint import (
     TRANSIENT_LTM_STATE_KEYS,
@@ -23,8 +26,11 @@ from ..utils.checkpoint import (
     sanitize_model_state_dict,
     _infer_arch_flags_from_state_dict,
     _reject_unsupported_rwkv_state_dict,
+    validate_checkpoint_architecture_contract,
 )
 from ..models.core import HierarchosCore
+from ..models.revisions import architecture_contract, architecture_contract_hash
+from ..evaluation.selection import BestMetric, extract_selection_metric
 
 # Helper for AttrDict access
 class AttrDict(dict):
@@ -189,6 +195,23 @@ def _reset_after_nonfinite(optimizer, model=None):
         model.reset_memory()
     return (None, None, None, None, None, None)
 
+
+def _reject_nonfinite_train_batch(
+    optimizer,
+    model,
+    *,
+    had_accumulated_gradients_on_entry: bool,
+):
+    """Reject a poisoned batch without silently dropping earlier microbatches."""
+    if had_accumulated_gradients_on_entry:
+        raise RuntimeError(
+            "A non-finite trajectory occurred after valid gradients had already "
+            "been accumulated from an earlier microbatch. Refusing to clear "
+            "those gradients and silently change the accumulation objective; "
+            "resume from the last verified checkpoint after diagnosing the batch."
+        )
+    return None, _reset_after_nonfinite(optimizer, model)
+
 def _sanitize_tensor_nonfinite_(tensor: torch.Tensor, nan: float = 0.0, posinf: float = 0.0, neginf: float = 0.0) -> int:
     if not torch.is_tensor(tensor) or not tensor.is_floating_point():
         return 0
@@ -224,6 +247,29 @@ def _cap_loss_component_for_backward(
     if preserve_gradient:
         return value + (capped - value).detach()
     return capped
+
+
+def _adaptive_ponder_loss(args, model, expected_steps, difficulty):
+    model_config = getattr(model, "config", None)
+    architecture_revision = (
+        model_config.get("architecture_revision")
+        if isinstance(model_config, dict)
+        else getattr(model_config, "architecture_revision", None)
+    )
+    mode = resolve_ponder_objective(
+        getattr(args, "ponder_objective", "auto"),
+        architecture_revision=architecture_revision,
+    )
+    result = adaptive_ponder_objective(
+        expected_steps,
+        difficulty,
+        max_steps=int(getattr(args, "max_h_steps", 5) or 5),
+        target_scale=float(getattr(args, "ponder_target_scale", 0.5) or 0.0),
+        min_steps=float(getattr(args, "min_h_steps", 1) or 1),
+        mode=mode,
+        huber_beta=float(getattr(args, "ponder_huber_beta", 0.5) or 0.5),
+    )
+    return result.loss
 
 def _clamp_tensor_finite_magnitude_(tensor: torch.Tensor, max_abs: float) -> int:
     if not torch.is_tensor(tensor) or not tensor.is_floating_point():
@@ -281,6 +327,7 @@ _RUNTIME_MODEL_CONFIG_KEYS = (
     "inference_logit_parity",
     "inference_recurrence_mode",
     "h_halt_thresh",
+    "act_depth_temperature",
     "gradient_checkpointing",
     "debug_numerics",
     "isolate_batch_ltm",
@@ -457,7 +504,8 @@ def _restore_resume_component_state(component, state, component_name: str, check
     if state is None:
         raise RuntimeError(
             f"Checkpoint {checkpoint_path} has no {component_name} state. Exact --resume-from-ckpt "
-            "cannot continue safely; use --override-scheduling to intentionally start fresh "
+            "cannot continue safely; use --reset-optimizer-state and/or "
+            "--rebuild-lr-schedule to intentionally start fresh "
             "optimizer/scheduler state, or use --model-path for a weights-only continuation."
         )
     issue = _find_first_nonfinite_payload_tensor(state, f"{component_name}_state")
@@ -465,16 +513,69 @@ def _restore_resume_component_state(component, state, component_name: str, check
         raise RuntimeError(
             f"Checkpoint {checkpoint_path} has corrupt {component_name} state: {issue}. "
             "Refusing to rewrite non-finite continuation state; use an earlier checkpoint, "
-            "or --override-scheduling only when a fresh optimizer/scheduler is intentional."
+            "or explicit reset/rebuild flags only when fresh state is intentional."
         )
     try:
         component.load_state_dict(state)
     except Exception as exc:
         raise RuntimeError(
             f"Could not restore {component_name} state from {checkpoint_path}: {exc}. "
-            "Refusing a silent fresh-state resume. Use --override-scheduling only if that reset "
+            "Refusing a silent fresh-state resume. Use explicit reset/rebuild flags only if that reset "
             "is intentional."
         ) from exc
+
+
+def restore_scheduler_state_and_live_lrs(
+    scheduler,
+    optimizer,
+    state,
+    checkpoint_path: str,
+):
+    """Restore scheduler counters and the LR used by the very next update.
+
+    LambdaLR construction immediately rewrites optimizer group LRs. Loading its
+    state restores ``_last_lr`` only inside the scheduler, so without this
+    explicit copy logs report one LR while the optimizer applies another.
+    """
+    _restore_resume_component_state(
+        scheduler,
+        state,
+        "main LR scheduler",
+        checkpoint_path,
+    )
+    last_lrs = state.get("_last_lr") if isinstance(state, dict) else None
+    if last_lrs is None:
+        last_lrs = list(scheduler.get_last_lr())
+    base_lrs = (
+        state.get("base_lrs")
+        if isinstance(state, dict)
+        else getattr(scheduler, "base_lrs", None)
+    )
+    if len(last_lrs) != len(optimizer.param_groups):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} scheduler has {len(last_lrs)} LR groups, "
+            f"but the optimizer has {len(optimizer.param_groups)}. Refusing an inexact resume."
+        )
+    if base_lrs is not None and len(base_lrs) != len(optimizer.param_groups):
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} scheduler base LR group count does not "
+            "match the optimizer."
+        )
+    for idx, (group, live_lr) in enumerate(zip(optimizer.param_groups, last_lrs)):
+        group["lr"] = float(live_lr)
+        if base_lrs is not None:
+            group["initial_lr"] = float(base_lrs[idx])
+    scheduler._last_lr = [float(value) for value in last_lrs]
+    live_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+    if live_lrs != [float(value) for value in scheduler.get_last_lr()]:
+        raise RuntimeError(
+            f"Scheduler/optimizer live LR parity failed after restoring {checkpoint_path}."
+        )
+    print(
+        "INFO: Restored scheduler counters and live optimizer LR(s): "
+        + ", ".join(f"{value:.8e}" for value in live_lrs)
+    )
+    return live_lrs
 
 def _print_runtime_stability_config(model):
     config = getattr(model, "config", None)
@@ -1035,6 +1136,31 @@ def should_step_accumulation(step: int, dataloader_len: int, accumulation_steps:
     dataloader_len = max(1, int(dataloader_len))
     return ((int(step) + 1) % accumulation_steps == 0) or (int(step) + 1 >= dataloader_len)
 
+def supervised_weight_mass(batch) -> float:
+    labels = batch.get("labels") if isinstance(batch, dict) else None
+    if not torch.is_tensor(labels) or labels.ndim != 2 or labels.shape[1] <= 1:
+        return 0.0
+    active = labels[:, 1:].ne(-100)
+    attention_mask = batch.get("attention_mask")
+    if torch.is_tensor(attention_mask) and attention_mask.shape == labels.shape:
+        active = active & attention_mask[:, 1:].ne(0)
+    loss_weights = batch.get("loss_weights")
+    if torch.is_tensor(loss_weights) and loss_weights.shape == labels.shape:
+        mass = (loss_weights[:, 1:].to(dtype=torch.float64) * active).sum()
+    else:
+        mass = active.sum().to(dtype=torch.float64)
+    return float(mass.item())
+
+def _divide_pending_gradients_(model, divisor: float):
+    divisor = float(divisor)
+    if not math.isfinite(divisor) or divisor <= 0.0:
+        raise RuntimeError(
+            f"Invalid weighted-token accumulation mass {divisor!r}; refusing optimizer step."
+        )
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.div_(divisor)
+
 def compute_remaining_update_steps(dataloader_len: int, accumulation_steps: int, start_epoch: int,
                                    total_epochs: int, start_step: int = 0) -> int:
     """Count optimizer updates that will actually run after an epoch/mid-epoch resume."""
@@ -1065,6 +1191,18 @@ def resolve_lr_warmup_steps(args, num_update_steps: int) -> int:
     if warmup_ratio <= 0.0:
         return 0
     return min(int(math.ceil(total_steps * min(warmup_ratio, 1.0))), max_warmup)
+
+def reset_optimizer_state_requested(args) -> bool:
+    return bool(
+        getattr(args, "reset_optimizer_state", False)
+        or getattr(args, "override_scheduling", False)
+    )
+
+def rebuild_lr_schedule_requested(args) -> bool:
+    return bool(
+        getattr(args, "rebuild_lr_schedule", False)
+        or getattr(args, "override_scheduling", False)
+    )
 
 def build_lr_scheduler(optimizer, args, num_update_steps: int):
     if getattr(args, 'disable_lr_schedule', False) or num_update_steps <= 0:
@@ -1182,12 +1320,16 @@ def capture_main_lr_scheduler_state(args, scheduler=None, num_update_steps: int 
         "warmup_steps": int(getattr(args, 'warmup_steps', 0) or 0),
         "warmup_ratio": float(getattr(args, 'warmup_ratio', 0.0) or 0.0),
         "override_scheduling": bool(getattr(args, 'override_scheduling', False)),
+        "rebuild_lr_schedule": rebuild_lr_schedule_requested(args),
+        "reset_optimizer_state": reset_optimizer_state_requested(args),
     }
 
 def build_hierarchos_optimizer(model, args, device):
     """RWKV-style AdamW grouping: decay matrices/embeddings, never norms or scalars."""
     lr = args.starting_lr
     weight_decay = float(getattr(args, "rwkv_weight_decay", 0.1))
+    grouping_version = int(getattr(args, "_optimizer_grouping_version", 2) or 2)
+    args._optimizer_grouping_version = grouping_version
     decay = []
     no_decay = []
     deepembed_no_decay = []
@@ -1207,7 +1349,19 @@ def build_hierarchos_optimizer(model, args, device):
             # encoder. Pulling it toward zero would quietly weaken writes.
             no_decay.append(param)
             val_proj_no_decay.append(clean_name)
-        elif (".weight" in name or "emb" in name) and ("ln" not in name and "norm" not in name):
+        elif grouping_version <= 1:
+            # Exact-resume compatibility for checkpoints created before raw
+            # RWKV nn.Parameter matrices were classified by dimensionality.
+            should_decay = (
+                (".weight" in clean_name or "emb" in clean_name)
+                and "ln" not in clean_name
+                and "norm" not in clean_name
+            )
+            (decay if should_decay else no_decay).append(param)
+        elif param.ndim >= 2:
+            # RWKV's w1/w2/a1/a2/v1/v2/g1/g2/r_k tensors are raw
+            # nn.Parameters, so name-only ".weight" tests silently omitted
+            # them. Dimensionality expresses the documented matrix policy.
             decay.append(param)
         else:
             no_decay.append(param)
@@ -1220,6 +1374,11 @@ def build_hierarchos_optimizer(model, args, device):
         print(f"INFO: DeepEmbed weights excluded from AdamW decay ({len(deepembed_no_decay)} tensor(s)).")
     if val_proj_no_decay:
         print(f"INFO: LTM val_proj excluded from AdamW decay ({len(val_proj_no_decay)} tensor(s)).")
+    print(
+        f"INFO: Optimizer grouping v{grouping_version}: "
+        f"{len(decay)} matrix/embedding tensor(s) with decay, "
+        f"{len(no_decay)} norm/vector/special tensor(s) without decay."
+    )
     if is_directml_device(device):
         return DirectMLAdamW(param_groups, lr=lr)
     if device.type == 'cuda':
@@ -1510,6 +1669,7 @@ def detach_ltm_state_from_outputs(outputs):
         curr_ltm[3] if len(curr_ltm) >= 4 else None,
         curr_ltm[4].detach() if len(curr_ltm) >= 5 and isinstance(curr_ltm[4], torch.Tensor) else None,
         curr_ltm[5].detach() if len(curr_ltm) >= 6 and isinstance(curr_ltm[5], torch.Tensor) else None,
+        curr_ltm[6].detach() if len(curr_ltm) >= 7 and isinstance(curr_ltm[6], torch.Tensor) else None,
     )
 
 def capture_model_grad_state(model):
@@ -1621,6 +1781,207 @@ def restore_dataloader_state(dataloader, state):
         _restore_loader_component_state(getattr(dataloader, name, None), state.get(name))
     print("INFO: Restored dataloader sampler state from checkpoint.")
 
+
+_EXACT_RESUME_ARG_KEYS = (
+    "seed",
+    "batch_size",
+    "accumulation_steps",
+    "accumulation_normalization",
+    "max_length",
+    "training_chunk_size",
+    "full_sample_bptt",
+    "full_sample_activation_checkpointing",
+    "full_sample_checkpoint_segment_size",
+    "detach_every_n_steps",
+    "persist_state",
+    "length_bucketing",
+    "length_bucket_size",
+    "train_prompt_tokens",
+    "prompt_loss_weight",
+    "response_loss_weight",
+    "response_boundary_loss_weight",
+    "response_boundary_tokens",
+    "min_response_tokens",
+    "drop_empty_completions",
+    "ponder_loss_weight",
+    "adaptive_ponder",
+    "ponder_target_scale",
+    "ponder_objective",
+    "ponder_huber_beta",
+    "encourage_thinking",
+    "commitment_loss_weight",
+    "commitment_threshold",
+    "ltm_value_alignment_weight",
+    "alpaca",
+    "kayla",
+    "text_column",
+    "prompt_column",
+    "completion_column",
+    "use_rosa",
+    "rosa_max_context",
+    "eval_tasks",
+    "eval_limit",
+    "best_checkpoint_metric",
+    "best_checkpoint_mode",
+)
+
+
+def _json_identity_digest(value):
+    return hashlib.sha256(json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def build_exact_resume_identity(
+    args,
+    tokenizer,
+    dataloader,
+    dataloader_len,
+    architecture_config=None,
+):
+    """Bind a cursor/optimizer checkpoint to the exact data objective."""
+    objective = {
+        key: (
+            _normalize_detach_every_n_steps(getattr(args, key, None))
+            if key == "detach_every_n_steps"
+            else getattr(args, key, None)
+        )
+        for key in _EXACT_RESUME_ARG_KEYS
+    }
+    dataset = {
+        "hf_dataset": getattr(args, "hf_dataset", None),
+        "hf_dataset_config": getattr(args, "hf_dataset_config", None),
+        "hf_dataset_split": getattr(args, "hf_dataset_split", None),
+        "hf_dataset_revision": (
+            getattr(args, "_resolved_hf_dataset_revision", None)
+            or getattr(args, "hf_dataset_revision", None)
+        ),
+        "local_train": (
+            os.path.abspath(os.path.expanduser(str(getattr(args, "train", ""))))
+            if isinstance(getattr(args, "train", None), str)
+            else None
+        ),
+        "pre_chunked_dataset": bool(getattr(args, "pre_chunked_dataset", False)),
+        "pre_pt_dataset": bool(getattr(args, "pre_pt_dataset", False)),
+    }
+    tokenizer_identity = getattr(args, "_tokenizer_identity", None)
+    if not isinstance(tokenizer_identity, dict):
+        tokenizer_identity = {
+            "vocab_size": int(len(tokenizer)) if tokenizer is not None else None,
+            "source": getattr(args, "tokenizer_path", None),
+        }
+    cache_identity = getattr(args, "_token_cache_identity", None)
+    loader_identity = {
+        "dataloader_len": int(dataloader_len),
+        "dataloader_class": (
+            f"{type(dataloader).__module__}.{type(dataloader).__qualname__}"
+            if dataloader is not None else None
+        ),
+        "dataset_class": (
+            f"{type(dataloader.dataset).__module__}.{type(dataloader.dataset).__qualname__}"
+            if dataloader is not None and getattr(dataloader, "dataset", None) is not None
+            else None
+        ),
+        "dataset_len": None,
+    }
+    try:
+        loader_identity["dataset_len"] = int(len(dataloader.dataset))
+    except Exception:
+        pass
+    identity = {
+        "version": 1,
+        "objective": objective,
+        "dataset": dataset,
+        "tokenizer": tokenizer_identity,
+        "token_cache": cache_identity,
+        "loader": loader_identity,
+        "optimizer_grouping_version": int(
+            getattr(args, "_optimizer_grouping_version", 2) or 2
+        ),
+    }
+    if architecture_config is not None:
+        identity["architecture_contract"] = architecture_contract(architecture_config)
+        identity["architecture_contract_sha256"] = architecture_contract_hash(
+            architecture_config
+        )
+    identity["sha256"] = _json_identity_digest(identity)
+    return identity
+
+
+def _identity_mismatches(saved, current, path="run_identity"):
+    mismatches = []
+    if isinstance(saved, dict) and isinstance(current, dict):
+        keys = sorted(set(saved) | set(current))
+        for key in keys:
+            if key == "sha256":
+                continue
+            mismatches.extend(_identity_mismatches(
+                saved.get(key),
+                current.get(key),
+                f"{path}.{key}",
+            ))
+        return mismatches
+    if saved != current:
+        mismatches.append((path, saved, current))
+    return mismatches
+
+
+def validate_exact_resume_identity(checkpoint, current_identity, checkpoint_path):
+    saved = checkpoint.get("run_identity") if isinstance(checkpoint, dict) else None
+    if not isinstance(saved, dict):
+        print(
+            "WARNING: Legacy checkpoint has no exact run identity. Dataset/cache/"
+            "tokenizer compatibility cannot be proven; this one compatibility resume "
+            "is allowed, but the new checkpoint will be identity-bound."
+        )
+        return False
+    mismatches = _identity_mismatches(saved, current_identity)
+    if mismatches:
+        details = "; ".join(
+            f"{path}: saved={old!r}, current={new!r}"
+            for path, old, new in mismatches[:12]
+        )
+        if len(mismatches) > 12:
+            details += f"; ... {len(mismatches) - 12} more"
+        raise RuntimeError(
+            f"Exact resume identity mismatch for {checkpoint_path}: {details}. "
+            "Refusing to apply a saved mid-epoch cursor/optimizer to a different "
+            "data objective. Use --model-path for a deliberate weights-only continuation."
+        )
+    print(
+        "INFO: Exact resume identity verified: "
+        f"{str(saved.get('sha256') or current_identity.get('sha256'))[:16]}."
+    )
+    return True
+
+
+def capture_effective_training_config(args):
+    keys = set(_EXACT_RESUME_ARG_KEYS) | {
+        "starting_lr",
+        "min_lr",
+        "warmup_steps",
+        "warmup_ratio",
+        "disable_lr_schedule",
+        "ltm_lr",
+        "min_ltm_lr",
+        "disable_ltm_lr_schedule",
+        "rwkv_weight_decay",
+        "max_skipped_train_batches",
+    }
+    effective = {}
+    for key in sorted(keys):
+        if not hasattr(args, key):
+            continue
+        value = getattr(args, key)
+        if key == "detach_every_n_steps":
+            value = _normalize_detach_every_n_steps(value)
+        effective[key] = value
+    return effective
+
+
 def build_training_checkpoint(
     model,
     optimizer,
@@ -1633,8 +1994,12 @@ def build_training_checkpoint(
     running_states=None,
 ):
     grad_state = capture_model_grad_state(model)
+    model_architecture_contract = architecture_contract(model.config)
+    model_architecture_hash = architecture_contract_hash(model.config)
+    saved_config = dict(model.config)
+    saved_config["architecture_contract_sha256"] = model_architecture_hash
     checkpoint = {
-        "checkpoint_version": 2,
+        "checkpoint_version": 4,
         "checkpoint_kind": "training",
         "completed_epoch": int(completed_epoch),
         "mid_epoch_step": int(mid_epoch_step or 0),
@@ -1643,17 +2008,127 @@ def build_training_checkpoint(
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "lr_scheduler_state": capture_main_lr_scheduler_state(args, scheduler),
         "scaler_state_dict": scaler.state_dict() if scaler else None,
-        "config": dict(model.config),
+        "config": saved_config,
+        "architecture_contract": model_architecture_contract,
+        "architecture_contract_sha256": model_architecture_hash,
         "rng_state": capture_rng_state(),
         "data_state": capture_dataloader_state(dataloader),
         "grad_state_dict": grad_state,
         "grad_accumulation_active": bool(grad_state),
         "ltm_scheduler_state": capture_ltm_lr_scheduler_state(args),
+        "run_identity": getattr(args, "_run_identity", None),
+        "effective_training_config": capture_effective_training_config(args),
+        "optimizer_grouping_version": int(
+            getattr(args, "_optimizer_grouping_version", 2) or 2
+        ),
+        "accumulation_state": {
+            "normalization": str(
+                getattr(args, "accumulation_normalization", "microbatch")
+            ),
+            "weighted_token_mass": float(
+                getattr(args, "_accumulation_weighted_token_mass", 0.0) or 0.0
+            ),
+        },
+        "error_budget_state": {
+            "skipped_train_batches": int(
+                getattr(args, "_skipped_train_batches", 0) or 0
+            ),
+        },
+        "best_metric_state": getattr(args, "_best_metric_state", None),
         "training_complete": False,
     }
     if running_states is not None:
         checkpoint["running_states"] = _state_to_cpu(running_states)
     return checkpoint
+
+
+def initialize_best_metric_tracker(args, checkpoint=None):
+    selector = getattr(args, "best_checkpoint_metric", None)
+    if not selector:
+        args._best_metric_tracker = None
+        args._best_metric_state = None
+        return None
+
+    mode = getattr(args, "best_checkpoint_mode", "max")
+    tracker = BestMetric(selector, mode=mode)
+    saved_state = (
+        checkpoint.get("best_metric_state")
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    if isinstance(saved_state, dict):
+        restored = BestMetric.from_state_dict(saved_state)
+        if (
+            restored.selector != tracker.selector
+            or restored.mode != tracker.mode
+        ):
+            raise RuntimeError(
+                "Best-checkpoint selector changed across exact resume: "
+                f"saved={restored.selector!r}/{restored.mode}, "
+                f"current={tracker.selector!r}/{tracker.mode}."
+            )
+        tracker = restored
+    args._best_metric_tracker = tracker
+    args._best_metric_state = tracker.state_dict()
+    return tracker
+
+
+def save_best_checkpoint_if_improved(
+    eval_results,
+    *,
+    args,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    dataloader,
+    completed_epoch: int,
+    mid_epoch_step: int,
+    running_states=None,
+):
+    """Persist an exact-resume checkpoint for a strictly improved eval metric."""
+    tracker = getattr(args, "_best_metric_tracker", None)
+    if tracker is None:
+        return False
+    candidate = extract_selection_metric(eval_results, tracker.selector)
+    if not tracker.update(
+        candidate,
+        epoch=int(completed_epoch),
+        step=(
+            int(mid_epoch_step)
+            if int(mid_epoch_step or 0) > 0
+            else None
+        ),
+    ):
+        return False
+
+    args._best_metric_state = tracker.state_dict()
+    best_path = os.path.join(args.out_dir, "hierarchos_best.pt")
+    checkpoint = build_training_checkpoint(
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        args,
+        dataloader,
+        completed_epoch=completed_epoch,
+        mid_epoch_step=mid_epoch_step,
+        running_states=running_states,
+    )
+    checkpoint["checkpoint_kind"] = "best-training"
+    checkpoint["selection_metric"] = tracker.state_dict()
+    checkpoint["evaluation_results"] = eval_results
+    save_training_checkpoint_if_finite(
+        checkpoint,
+        best_path,
+        model,
+        optimizer,
+    )
+    print(
+        "INFO: New best checkpoint: "
+        f"{tracker.selector}={candidate:.8g} ({tracker.mode}) -> {best_path}"
+    )
+    return True
 
 def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, running_states,
                collect_metrics=True, force_optimizer_step=False, accumulation_divisor=None):
@@ -1661,6 +2136,9 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     args._optimizer_step_was_taken = False
     args._train_step_had_backward = False
     args._train_step_had_nonfinite = False
+    args._train_step_had_oom = False
+    args._train_step_had_empty_supervision = False
+    had_accumulated_gradients_on_entry = _has_pending_gradients(model)
     device = next(model.parameters()).device
     set_model_training_step(model, getattr(args, '_current_global_step', step))
     _nb = (device.type == 'cuda')  # non_blocking for async CUDA transfer
@@ -1668,8 +2146,34 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_attention_mask = batch.get('attention_mask')
     full_labels = batch['labels']
     full_rosa_ids = batch.get('rosa_ids')
+    full_rosa_context_mode = batch.get("rosa_ids_context_mode")
     full_loss_weights = batch.get('loss_weights')
-    loss_divisor = max(1, int(accumulation_divisor or accumulation_steps or 1))
+    accumulation_normalization = str(
+        getattr(args, "accumulation_normalization", "microbatch")
+    )
+    if accumulation_normalization == "weighted-token":
+        batch_weight_mass = supervised_weight_mass(batch)
+        if batch_weight_mass <= 0.0:
+            args._train_step_had_empty_supervision = True
+            if _has_pending_gradients(model):
+                raise RuntimeError(
+                    "Encountered an empty-supervision microbatch inside an active "
+                    "accumulation window. Refusing to discard or renormalize earlier "
+                    "valid gradients."
+                )
+            return None, running_states
+        args._accumulation_weighted_token_mass = float(
+            getattr(args, "_accumulation_weighted_token_mass", 0.0) or 0.0
+        ) + batch_weight_mass
+        loss_divisor = 1.0 / batch_weight_mass
+    elif accumulation_normalization == "microbatch":
+        loss_divisor = float(max(1, int(
+            accumulation_divisor or accumulation_steps or 1
+        )))
+    else:
+        raise ValueError(
+            "accumulation_normalization must be 'weighted-token' or 'microbatch'"
+        )
     full_input_ids, full_labels, full_attention_mask = trim_trailing_padding(
         full_input_ids, full_labels, full_attention_mask
     )
@@ -1916,6 +2420,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     return_topk_indices=use_ltm_inner_updates,
                     compute_ltm_value_alignment=ltm_value_alignment_weight > 0.0,
                     rosa_ids=rosa_ids,
+                    rosa_ids_context_mode=full_rosa_context_mode,
                     loss_weights=loss_weights,
                 )
                 if bool(getattr(args, "full_sample_activation_checkpointing", False)):
@@ -1987,15 +2492,15 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                             # RECOVERY MODE: Invert ponder penalty to REWARD thinking
                             aux_loss = aux_loss - (abs(ponder_weight) * ponder_cost_for_backward)
                         elif getattr(args, 'adaptive_ponder', False):
-                            max_h_steps = getattr(args, 'max_h_steps', 5)
-                            target_scale = getattr(args, 'ponder_target_scale', 0.5)
-                            target_ponder = torch.clamp(
-                                ce_loss.detach() * target_scale,
-                                min=1.0,
-                                max=float(max_h_steps),
+                            aux_loss = aux_loss + (
+                                _adaptive_ponder_loss(
+                                    args,
+                                    model,
+                                    ponder_cost_for_backward,
+                                    ce_loss,
+                                )
+                                * ponder_weight
                             )
-                            ponder_diff = target_ponder - ponder_cost_for_backward
-                            aux_loss = aux_loss + torch.relu(ponder_diff) * ponder_weight
                         else:
                             aux_loss = aux_loss + (ponder_weight * ponder_cost_for_backward)
 
@@ -2046,7 +2551,13 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                             print("  " + _describe_tensor_issue("chunk_loss", chunk_loss))
                         print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
                         args._train_step_had_nonfinite = True
-                        return None, _reset_after_nonfinite(optimizer, model)
+                        return _reject_nonfinite_train_batch(
+                            optimizer,
+                            model,
+                            had_accumulated_gradients_on_entry=(
+                                had_accumulated_gradients_on_entry
+                            ),
+                        )
 
             if not full_sample_bptt:
                 # Historical TBPTT backpropagates each detached temporal chunk.
@@ -2096,7 +2607,13 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         )
                         print("  Skipping this batch; poisoned fast-memory updates are never sanitized or applied.")
                         args._train_step_had_nonfinite = True
-                        return None, _reset_after_nonfinite(optimizer, model)
+                        return _reject_nonfinite_train_batch(
+                            optimizer,
+                            model,
+                            had_accumulated_gradients_on_entry=(
+                                had_accumulated_gradients_on_entry
+                            ),
+                        )
 
                     if ltm_grads_tensor is not None:
                         # Unpack current LTM state for the update
@@ -2107,6 +2624,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         curr_rosa_states = curr_ltm[3] if curr_ltm is not None and len(curr_ltm) >= 4 else None
                         curr_timestamps = curr_ltm[4] if curr_ltm is not None and len(curr_ltm) >= 5 else None
                         curr_sources = curr_ltm[5] if curr_ltm is not None and len(curr_ltm) >= 6 else None
+                        curr_wallclock_timestamps = curr_ltm[6] if curr_ltm is not None and len(curr_ltm) >= 7 else None
                         
                         # Titans inner_update (Gradient-based)
                         # Pass fast_vals/mom_vals from forward pass state, not module defaults
@@ -2121,13 +2639,15 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                             mom_vals=curr_mom,
                             timestamps=curr_timestamps,
                             sources=curr_sources,
+                            wallclock_timestamps=curr_wallclock_timestamps,
                             inplace=True
                         )
                         ltm_state = (new_fast.detach(), new_mom.detach(), 
                                      curr_past_tokens.detach() if curr_past_tokens is not None else None,
                                      curr_rosa_states,
                                      curr_timestamps.detach() if isinstance(curr_timestamps, torch.Tensor) else curr_timestamps,
-                                     curr_sources.detach() if isinstance(curr_sources, torch.Tensor) else curr_sources)  # ROSA automaton states (plain Python, no detach needed)
+                                     curr_sources.detach() if isinstance(curr_sources, torch.Tensor) else curr_sources,
+                                     curr_wallclock_timestamps.detach() if isinstance(curr_wallclock_timestamps, torch.Tensor) else curr_wallclock_timestamps)  # ROSA automaton states (plain Python, no detach needed)
                     else:
                         ltm_state = detach_ltm_state_from_outputs(outputs)
             else:
@@ -2244,15 +2764,13 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                         abs(ponder_weight) * ponder_cost_for_backward
                     )
                 elif getattr(args, 'adaptive_ponder', False):
-                    max_h_steps = getattr(args, 'max_h_steps', 5)
-                    target_scale = getattr(args, 'ponder_target_scale', 0.5)
-                    target_ponder = torch.clamp(
-                        whole_ce_loss.detach() * target_scale,
-                        min=1.0,
-                        max=float(max_h_steps),
-                    )
                     aux_loss = aux_loss + (
-                        torch.relu(target_ponder - ponder_cost_for_backward)
+                        _adaptive_ponder_loss(
+                            args,
+                            model,
+                            ponder_cost_for_backward,
+                            whole_ce_loss,
+                        )
                         * ponder_weight
                     )
                 else:
@@ -2304,7 +2822,13 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     print("  " + _describe_tensor_issue("whole_sample_loss", whole_sample_loss))
                 print("  Skipping this batch and clearing recurrent/LTM state before it can poison optimizer state.")
                 args._train_step_had_nonfinite = True
-                return None, _reset_after_nonfinite(optimizer, model)
+                return _reject_nonfinite_train_batch(
+                    optimizer,
+                    model,
+                    had_accumulated_gradients_on_entry=(
+                        had_accumulated_gradients_on_entry
+                    ),
+                )
 
             if scaler is not None:
                 scaler.scale(whole_sample_loss).backward()
@@ -2343,6 +2867,11 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         if should_step_optimizer and _has_pending_gradients(model):
             if scaler is not None:
                 scaler.unscale_(optimizer)
+                if accumulation_normalization == "weighted-token":
+                    _divide_pending_gradients_(
+                        model,
+                        getattr(args, "_accumulation_weighted_token_mass", 0.0),
+                    )
                 grads_ok, grad_issue = _clip_gradients_and_check(
                     model,
                     getattr(args, 'grad_clip', 1.0),
@@ -2352,10 +2881,21 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     print(f"\nCRITICAL: Non-finite gradient at step {step+1}. {grad_issue}")
                     print("  Skipping optimizer step and clearing accumulated gradients.")
                     args._train_step_had_nonfinite = True
-                    return None, _reset_after_nonfinite(optimizer, model)
+                    return _reject_nonfinite_train_batch(
+                        optimizer,
+                        model,
+                        had_accumulated_gradients_on_entry=(
+                            had_accumulated_gradients_on_entry
+                        ),
+                    )
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                if accumulation_normalization == "weighted-token":
+                    _divide_pending_gradients_(
+                        model,
+                        getattr(args, "_accumulation_weighted_token_mass", 0.0),
+                    )
                 grads_ok, grad_issue = _clip_gradients_and_check(
                     model,
                     getattr(args, 'grad_clip', 1.0),
@@ -2365,14 +2905,22 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     print(f"\nCRITICAL: Non-finite gradient at step {step+1}. {grad_issue}")
                     print("  Skipping optimizer step and clearing accumulated gradients.")
                     args._train_step_had_nonfinite = True
-                    return None, _reset_after_nonfinite(optimizer, model)
+                    return _reject_nonfinite_train_batch(
+                        optimizer,
+                        model,
+                        had_accumulated_gradients_on_entry=(
+                            had_accumulated_gradients_on_entry
+                        ),
+                    )
                 optimizer.step()
             if ltm_value_alignment_weight > 0.0:
                 mark_val_proj_trained(model)
             optimizer.zero_grad(set_to_none=True)
+            args._accumulation_weighted_token_mass = 0.0
             args._optimizer_step_was_taken = True
         elif should_step_optimizer:
             optimizer.zero_grad(set_to_none=True)
+            args._accumulation_weighted_token_mass = 0.0
         
         if chunks_processed == 0:
             return None, running_states
@@ -2397,6 +2945,23 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
         next_states = (h_state, l_state, prev_ctx, target_ctx, drift_state, ltm_state)
         return avg_outputs, next_states
             
+    except FloatingPointError as e:
+        print(
+            f"\nCRITICAL: Non-finite model trajectory at training step {step + 1}: "
+            f"{e}"
+        )
+        print(
+            "  Rejecting the complete batch; non-finite intermediates are never "
+            "rewritten into apparently valid recurrent states."
+        )
+        args._train_step_had_nonfinite = True
+        return _reject_nonfinite_train_batch(
+            optimizer,
+            model,
+            had_accumulated_gradients_on_entry=(
+                had_accumulated_gradients_on_entry
+            ),
+        )
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             optimizer.zero_grad(set_to_none=True)
@@ -2413,6 +2978,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     "activation checkpointing."
                 ) from e
             print("WARNING: OOM detected. Clearing cache and skipping the batch.")
+            args._train_step_had_oom = True
             return None, running_states
         raise e
 
@@ -2481,6 +3047,13 @@ def configure_cuda_training_runtime(args, config, device, *, mode_name="training
 
 
 def train(args, device, tokenizer, dataloader, dataloader_len, model_override=None):
+    if bool(getattr(args, "persist_state", False)) and not bool(
+        getattr(getattr(dataloader, "dataset", None), "guarantees_contiguous_state", False)
+    ):
+        raise ValueError(
+            "persist_state requires a dataset that explicitly guarantees contiguous "
+            "same-sequence lane ordering; shuffled independent samples are unsafe."
+        )
     print("Running in TRAIN mode...")
     if dataloader_len <= 0:
         print("ERROR: dataloader_len must be > 0. If automatic detection failed, please specify --dataset-size.")
@@ -2649,11 +3222,26 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
             'h_stride',
             'max_h_steps',
             'max_l_steps',
+            'min_h_steps',
+            'architecture_revision',
+            'core_recurrence_version',
+            'drift_recurrence_mode',
+            'rwkv_state_readout_mode',
+            'manager_state_commit_mode',
+            'manager_compute_mode',
+            'commitment_cost_mode',
             'use_deepembed',
+            'deepembed_mode',
             'use_rosa',
+            'rosa_embedding_mode',
+            'token_adapter_rank',
             'memory_token_routers',
             'rosa_max_context',
+            'enforce_rosa_max_context',
+            'rosa_zero_no_prediction',
             'rwkv_head_size',
+            'h_rwkv_head_size',
+            'l_rwkv_head_size',
         ):
             if key in loaded_config:
                 runtime_config[key] = loaded_config[key]
@@ -2671,6 +3259,14 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
             args.resume_from_ckpt,
             map_location='cpu',
         )
+        args._optimizer_grouping_version = int(
+            checkpoint.get("optimizer_grouping_version", 1) or 1
+        )
+        if args._optimizer_grouping_version <= 1:
+            print(
+                "INFO: Exact resume preserves legacy optimizer grouping v1. "
+                "Use --model-path for a new run with corrected matrix grouping v2."
+            )
         
         saved_config = checkpoint.get('config', {})
         model_config = AttrDict(saved_config)
@@ -2678,6 +3274,11 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
         _reject_unsupported_rwkv_state_dict(state_dict, args.resume_from_ckpt)
         checkpoint['model_state_dict'] = state_dict
         _infer_arch_flags_from_state_dict(model_config, state_dict)
+        validate_checkpoint_architecture_contract(
+            checkpoint,
+            model_config,
+            args.resume_from_ckpt,
+        )
         
         # ARCH Detection (Safely handling compiled checkpoints with '_orig_mod.' prefix)
         state_dict_keys = set()
@@ -2714,7 +3315,17 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
         if 'l_rnn.key.weight' in state_dict_keys:
             model_config.l_hidden = state_dict['l_rnn.key.weight'].shape[0]
         if 'h_rnn.r_k' in state_dict_keys:
-            model_config.rwkv_head_size = state_dict['h_rnn.r_k'].shape[1]
+            model_config.h_rwkv_head_size = state_dict['h_rnn.r_k'].shape[1]
+        if 'l_rnn.r_k' in state_dict_keys:
+            model_config.l_rwkv_head_size = state_dict['l_rnn.r_k'].shape[1]
+        if (
+            model_config.get("h_rwkv_head_size") is not None
+            and model_config.get("h_rwkv_head_size")
+            == model_config.get("l_rwkv_head_size")
+        ):
+            model_config.rwkv_head_size = model_config.h_rwkv_head_size
+        else:
+            model_config.rwkv_head_size = None
 
         # ARCH defaults / Fallbacks
         arch_defaults = {
@@ -2754,7 +3365,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
         
         optimizer = build_hierarchos_optimizer(model, args, device)
         
-        if not getattr(args, 'override_scheduling', False):
+        if not reset_optimizer_state_requested(args):
             _restore_resume_component_state(
                 optimizer,
                 checkpoint.get('optimizer_state_dict'),
@@ -2783,7 +3394,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
         # Only create scaler for float16 AMP.
         if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16':
             scaler = GradScaler()
-            if not getattr(args, 'override_scheduling', False):
+            if not reset_optimizer_state_requested(args):
                 _restore_resume_component_state(
                     scaler,
                     checkpoint.get('scaler_state_dict'),
@@ -2810,11 +3421,26 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
             'h_stride',
             'max_h_steps',
             'max_l_steps',
+            'min_h_steps',
+            'architecture_revision',
+            'core_recurrence_version',
+            'drift_recurrence_mode',
+            'rwkv_state_readout_mode',
+            'manager_state_commit_mode',
+            'manager_compute_mode',
+            'commitment_cost_mode',
             'use_deepembed',
+            'deepembed_mode',
             'use_rosa',
+            'rosa_embedding_mode',
+            'token_adapter_rank',
             'memory_token_routers',
             'rosa_max_context',
+            'enforce_rosa_max_context',
+            'rosa_zero_no_prediction',
             'rwkv_head_size',
+            'h_rwkv_head_size',
+            'l_rwkv_head_size',
         ):
             if key in loaded_config:
                 runtime_config[key] = loaded_config[key]
@@ -2859,6 +3485,30 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
         if hasattr(model, "refresh_runtime_config"):
             model.refresh_runtime_config()
         _print_runtime_stability_config(model)
+    if (
+        checkpoint
+        and not checkpoint.get("run_identity")
+        and "accumulation_normalization"
+        not in set(getattr(args, "_explicit_cli_dests", ()) or ())
+    ):
+        args.accumulation_normalization = "microbatch"
+        print(
+            "INFO: Legacy checkpoint preserves equal-microbatch accumulation. "
+            "New runs default to weighted-token normalization."
+        )
+    args._run_identity = build_exact_resume_identity(
+        args,
+        tokenizer,
+        dataloader,
+        dataloader_len,
+        architecture_config=getattr(model, "config", None),
+    )
+    if checkpoint:
+        validate_exact_resume_identity(
+            checkpoint,
+            args._run_identity,
+            args.resume_from_ckpt,
+        )
     # ----------------------------------------------------
 
     # --- Print Model Stats ---
@@ -2884,12 +3534,12 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
     )
 
     # Scheduler
-    # When override_scheduling is used during resume, calculate T_max based on REMAINING epochs
-    # so that the LR decays properly to min_lr by the final epoch.
+    # A schedule rebuild is independent from optimizer-moment reset. The legacy
+    # --override-scheduling flag requests both through the compatibility helpers.
     full_run_update_steps = compute_update_steps(dataloader_len, args.accumulation_steps) * args.epochs
     saved_main_lr_state = checkpoint.get('lr_scheduler_state') if isinstance(checkpoint, dict) else None
     saved_ltm_lr_state = checkpoint.get('ltm_scheduler_state') if isinstance(checkpoint, dict) else None
-    if getattr(args, 'override_scheduling', False) and args.resume_from_ckpt:
+    if rebuild_lr_schedule_requested(args) and args.resume_from_ckpt:
         num_update_steps = compute_remaining_update_steps(
             dataloader_len,
             args.accumulation_steps,
@@ -2897,7 +3547,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
             args.epochs,
             start_step,
         )
-        print(f"INFO: --override-scheduling: Calculating LR schedule for remaining work ({num_update_steps} update steps)")
+        print(f"INFO: Rebuilding LR schedule for remaining work ({num_update_steps} update steps)")
     elif (
         args.resume_from_ckpt
         and isinstance(saved_main_lr_state, dict)
@@ -2919,44 +3569,71 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
         )
     else:
         num_update_steps = full_run_update_steps
-        if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False):
+        if args.resume_from_ckpt and not rebuild_lr_schedule_requested(args):
             print(
                 "INFO: Resume scheduler using checkpoint/full-run schedule state. "
-                "Pass --override-scheduling to rebuild LR decay over only the remaining work."
+                "Pass --rebuild-lr-schedule to rebuild LR decay over only the remaining work."
             )
     args._main_lr_schedule_total_steps = int(num_update_steps)
     
     if not getattr(args, 'disable_lr_schedule', False) and num_update_steps > 0:
         scheduler = build_lr_scheduler(optimizer, args, num_update_steps)
-        if args.resume_from_ckpt and not getattr(args, 'override_scheduling', False):
-            _restore_resume_component_state(
+        if args.resume_from_ckpt and not rebuild_lr_schedule_requested(args):
+            restore_scheduler_state_and_live_lrs(
                 scheduler,
+                optimizer,
                 checkpoint.get('scheduler_state_dict'),
-                "main LR scheduler",
                 args.resume_from_ckpt,
             )
     configure_ltm_lr_schedule(
         args,
         num_update_steps,
         checkpoint=checkpoint,
-        override_schedule=bool(getattr(args, 'override_scheduling', False)),
+        override_schedule=rebuild_lr_schedule_requested(args),
         scheduler=scheduler,
     )
     if hasattr(model, 'config'):
         model.config.ltm_lr = getattr(args, 'ltm_lr', getattr(model.config, 'ltm_lr', 1e-3))
         model.config.min_ltm_lr = getattr(args, 'min_ltm_lr', getattr(model.config, 'min_ltm_lr', None))
         model.config.disable_ltm_lr_schedule = getattr(args, 'disable_ltm_lr_schedule', False)
+    args._accumulation_weighted_token_mass = 0.0
     if checkpoint:
         restore_dataloader_state(dataloader, checkpoint.get('data_state'))
         restore_rng_state(checkpoint.get('rng_state'))
-        if getattr(args, 'override_scheduling', False):
+        if reset_optimizer_state_requested(args):
             if checkpoint.get('grad_state_dict'):
                 print(
                     "INFO: Ignoring pending gradient accumulation from checkpoint "
-                    "because --override-scheduling requested a fresh optimizer/scheduler path."
+                    "because optimizer-state reset requested a fresh optimizer path."
                 )
         else:
-            restore_model_grad_state(model, checkpoint.get('grad_state_dict'), device)
+            restored_pending_grads = restore_model_grad_state(
+                model,
+                checkpoint.get('grad_state_dict'),
+                device,
+            )
+            accumulation_state = checkpoint.get("accumulation_state")
+            if restored_pending_grads and isinstance(accumulation_state, dict):
+                saved_normalization = str(
+                    accumulation_state.get("normalization", "microbatch")
+                )
+                if saved_normalization != str(args.accumulation_normalization):
+                    raise RuntimeError(
+                        "Pending-gradient accumulation normalization mismatch: "
+                        f"checkpoint={saved_normalization!r}, "
+                        f"current={args.accumulation_normalization!r}."
+                    )
+                args._accumulation_weighted_token_mass = float(
+                    accumulation_state.get("weighted_token_mass", 0.0) or 0.0
+                )
+                if (
+                    saved_normalization == "weighted-token"
+                    and args._accumulation_weighted_token_mass <= 0.0
+                ):
+                    raise RuntimeError(
+                        "Checkpoint contains pending weighted-token gradients but "
+                        "no positive accumulated token mass."
+                    )
         if checkpoint.get('running_states') is not None:
             running_issue = _find_first_nonfinite_payload_tensor(checkpoint['running_states'], "running_states")
             if running_issue:
@@ -2973,6 +3650,16 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
             if getattr(args, 'persist_state', False) and 'running_states' not in checkpoint:
                 print("Warning: Mid-epoch checkpoint has no running RWKV/LTM states while --persist-state is enabled; continuing with reset states.")
 
+    error_budget_state = (
+        checkpoint.get("error_budget_state")
+        if isinstance(checkpoint, dict)
+        else None
+    )
+    args._skipped_train_batches = int(
+        error_budget_state.get("skipped_train_batches", 0)
+        if isinstance(error_budget_state, dict)
+        else 0
+    )
     startup_issue = _find_first_nonfinite_model_tensor(model, include_grads=True)
     if startup_issue:
         raise RuntimeError(f"Non-finite startup model/gradient state is not recoverable safely: {startup_issue}")
@@ -2987,9 +3674,26 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
     _sanitize_model_transient_state_(model, max_abs=getattr(args, 'grad_clip', 1.0))
     # --- Evaluation Confirmation ---
     eval_tasks = getattr(args, 'eval_tasks', None)
+    best_metric_tracker = initialize_best_metric_tracker(args, checkpoint)
+    if best_metric_tracker is not None and not eval_tasks:
+        raise ValueError(
+            "--best-checkpoint-metric requires at least one immutable "
+            "--eval-tasks benchmark."
+        )
     if eval_tasks:
         eval_every = getattr(args, 'eval_every_epoch', 1)
         print(f"INFO: Evaluation ENABLED - will run {eval_tasks} every {eval_every} epoch(s)")
+        if best_metric_tracker is not None:
+            from ..evaluation import is_lm_eval_available
+            if not is_lm_eval_available():
+                raise RuntimeError(
+                    "--best-checkpoint-metric was requested, but lm-eval is not "
+                    "installed. Refusing to train without the promised selection metric."
+                )
+            print(
+                "INFO: Best-checkpoint selection ENABLED - "
+                f"{best_metric_tracker.selector} ({best_metric_tracker.mode})."
+            )
     
     # --- Training Loop ---
     for epoch in range(start_epoch, args.epochs):
@@ -3051,6 +3755,33 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
                 force_optimizer_step=force_optimizer_step,
                 accumulation_divisor=accumulation_divisor,
             )
+            skip_reason = None
+            if getattr(args, "_train_step_had_nonfinite", False):
+                skip_reason = "nonfinite loss/gradient"
+            elif getattr(args, "_train_step_had_oom", False):
+                skip_reason = "out of memory"
+            elif getattr(args, "_train_step_had_empty_supervision", False):
+                skip_reason = "empty supervised-token mass"
+            elif not getattr(args, "_train_step_had_backward", False):
+                skip_reason = "no backward-producing chunk"
+            if skip_reason is not None:
+                args._accumulation_weighted_token_mass = 0.0
+                args._skipped_train_batches = int(
+                    getattr(args, "_skipped_train_batches", 0) or 0
+                ) + 1
+                max_skipped = max(
+                    0, int(getattr(args, "max_skipped_train_batches", 0) or 0)
+                )
+                if args._skipped_train_batches > max_skipped:
+                    raise RuntimeError(
+                        "Training skip/error budget exceeded at "
+                        f"epoch={absolute_epoch + 1}, step={step + 1}: {skip_reason}. "
+                        f"Observed {args._skipped_train_batches}, allowed {max_skipped}."
+                    )
+                print(
+                    "WARNING: Training batch skipped within explicit budget "
+                    f"({args._skipped_train_batches}/{max_skipped}): {skip_reason}."
+                )
             if outputs:
                 postfix = {"loss": f"{outputs['loss'].item():.4f}"}
                 if outputs.get('ponder_cost') is not None:
@@ -3116,11 +3847,33 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
                             eval_path = os.path.join(args.out_dir, f"eval_epoch_{absolute_epoch+1}_step_{step+1}.json")
                             from ..evaluation import save_results
                             save_results(eval_results, eval_path)
+                            save_best_checkpoint_if_improved(
+                                eval_results,
+                                args=args,
+                                model=model,
+                                optimizer=optimizer,
+                                scheduler=scheduler,
+                                scaler=scaler,
+                                dataloader=dataloader,
+                                completed_epoch=absolute_epoch,
+                                mid_epoch_step=step + 1,
+                                running_states=running_states,
+                            )
+                        elif getattr(args, "_best_metric_tracker", None) is not None:
+                            raise RuntimeError(
+                                "Evaluation returned no results for the configured "
+                                "best-checkpoint selector."
+                            )
                         
                         model.train()
                     else:
                         print("WARNING: lm-eval not installed. Install with: pip install lm-eval>=0.4.0")
                 except Exception as e:
+                    if getattr(args, "_best_metric_tracker", None) is not None:
+                        raise RuntimeError(
+                            "Best-checkpoint evaluation failed; refusing to "
+                            "continue without a trustworthy selection signal."
+                        ) from e
                     print(f"WARNING: Step-based evaluation failed: {e}")
                     model.train()
         
@@ -3169,11 +3922,32 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
                             eval_path = os.path.join(args.out_dir, f"eval_epoch_{absolute_epoch+1}.json")
                             from ..evaluation import save_results
                             save_results(eval_results, eval_path)
+                            save_best_checkpoint_if_improved(
+                                eval_results,
+                                args=args,
+                                model=model,
+                                optimizer=optimizer,
+                                scheduler=scheduler,
+                                scaler=scaler,
+                                dataloader=dataloader,
+                                completed_epoch=absolute_epoch + 1,
+                                mid_epoch_step=0,
+                            )
+                        elif getattr(args, "_best_metric_tracker", None) is not None:
+                            raise RuntimeError(
+                                "Evaluation returned no results for the configured "
+                                "best-checkpoint selector."
+                            )
                         
                         model.train()  # Back to training mode
                     else:
                         print("WARNING: lm-eval not installed. Install with: pip install lm-eval>=0.4.0")
                 except Exception as e:
+                    if getattr(args, "_best_metric_tracker", None) is not None:
+                        raise RuntimeError(
+                            "Best-checkpoint evaluation failed; refusing to "
+                            "continue without a trustworthy selection signal."
+                        ) from e
                     print(f"WARNING: Evaluation failed: {e}")
         model.train()  # Ensure model is back in training mode
 
@@ -3197,10 +3971,25 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
         model.config.completed_epoch = final_completed_epoch
     final_config = dict(model.config)
     final_config['completed_epoch'] = final_completed_epoch
+    effective_training_config = capture_effective_training_config(args)
+    final_config.update(effective_training_config)
+    final_architecture_contract = architecture_contract(model.config)
+    final_architecture_hash = architecture_contract_hash(model.config)
+    final_config["architecture_contract_sha256"] = final_architecture_hash
     final_checkpoint = {
+        'checkpoint_version': 4,
+        'checkpoint_kind': 'inference',
         'model_state_dict': clean_state_dict,
         'config': final_config,
+        'architecture_contract': final_architecture_contract,
+        'architecture_contract_sha256': final_architecture_hash,
         'completed_epoch': final_completed_epoch,
+        'run_identity': getattr(args, "_run_identity", None),
+        'best_metric_state': getattr(args, "_best_metric_state", None),
+        'effective_training_config': effective_training_config,
+        'optimizer_grouping_version': int(
+            getattr(args, "_optimizer_grouping_version", 2) or 2
+        ),
         'training_complete': True,
     }
     save_training_checkpoint_if_finite(final_checkpoint, final_model_path, model, optimizer=None)
@@ -3377,7 +4166,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     else:
         optimizer = build_hierarchos_optimizer(model, args, device)
     
-    if checkpoint and not getattr(args, 'override_scheduling', False):
+    if checkpoint and not reset_optimizer_state_requested(args):
         _restore_resume_component_state(
             optimizer,
             checkpoint.get('optimizer_state_dict'),
@@ -3404,7 +4193,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     if use_amp:
         if amp_dtype_str == 'float16':
             scaler = GradScaler()
-            if checkpoint and not getattr(args, 'override_scheduling', False):
+            if checkpoint and not reset_optimizer_state_requested(args):
                 _restore_resume_component_state(
                     scaler,
                     checkpoint.get('scaler_state_dict'),
@@ -3420,7 +4209,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     saved_main_lr_state = checkpoint.get('lr_scheduler_state') if isinstance(checkpoint, dict) else None
     if (
         checkpoint
-        and not getattr(args, 'override_scheduling', False)
+        and not rebuild_lr_schedule_requested(args)
         and isinstance(saved_main_lr_state, dict)
         and saved_main_lr_state.get("enabled", True)
         and int(saved_main_lr_state.get("total_steps", 0) or 0) > 0
@@ -3433,11 +4222,11 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     if not getattr(args, 'disable_lr_schedule', False):
         if num_update_steps > 0:
             scheduler = build_lr_scheduler(optimizer, args, num_update_steps)
-            if checkpoint and not getattr(args, 'override_scheduling', False):
-                _restore_resume_component_state(
+            if checkpoint and not rebuild_lr_schedule_requested(args):
+                restore_scheduler_state_and_live_lrs(
                     scheduler,
+                    optimizer,
                     checkpoint.get('scheduler_state_dict'),
-                    "main LR scheduler",
                     args.resume_from_ckpt,
                 )
         else:
@@ -3446,7 +4235,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
         args,
         num_update_steps,
         checkpoint=checkpoint,
-        override_schedule=bool(getattr(args, 'override_scheduling', False)),
+        override_schedule=rebuild_lr_schedule_requested(args),
         scheduler=scheduler,
     )
     if hasattr(model, 'config'):
@@ -3506,6 +4295,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             attention_mask = batch.get("attention_mask")
             labels = batch["labels"]
             rosa_ids = batch.get("rosa_ids")
+            rosa_context_mode = batch.get("rosa_ids_context_mode")
             loss_weights = batch.get("loss_weights")
             input_ids, labels, attention_mask = trim_trailing_padding(
                 input_ids, labels, attention_mask
@@ -3562,6 +4352,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
                     attention_mask=attention_mask,
                     labels=labels,
                     rosa_ids=rosa_ids,
+                    rosa_ids_context_mode=rosa_context_mode,
                     loss_weights=loss_weights,
                     return_topk_values=False,
                     return_raw_topk_values=use_ltm_inner_updates,

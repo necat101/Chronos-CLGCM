@@ -5,6 +5,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _clamp_preserve_nonfinite(tensor: torch.Tensor, minimum: float, maximum: float):
+    """Clamp finite values while leaving NaN/Inf visible to outer guards."""
+    clamped = torch.clamp(tensor, min=minimum, max=maximum)
+    return torch.where(torch.isfinite(tensor), clamped, tensor)
+
+
 def _choose_head_size(n_embd: int, requested=None) -> int:
     n_embd = int(n_embd)
     if requested:
@@ -56,11 +62,19 @@ class RWKVCell(nn.Module):
     Public interface intentionally stays compatible with the old Hierarchos cell:
     forward(x, state, timestep=None, deepemb_vec=None) -> (x, state).
 
-    Packed state layout, shape [B, C, 3 + head_size]:
+    Legacy packed state layout, shape [B, C, 3 + head_size]:
       slot 0: previous time-mix input (LayerNorm output)
       slot 1: previous channel-mix input (LayerNorm output)
       slot 2: latest v_first value, reserved for stack-compatible checkpoints
       slots 3: per-head matrix state reshaped as [B, C, head_size]
+
+    Corrected ``explicit-output`` state layout, shape [B, C, 4 + head_size]:
+      slots 0..2: same recurrent caches as the legacy layout
+      slot 3: the block's most recent output (the public hidden readout)
+      slots 4: per-head matrix state reshaped as [B, C, head_size]
+
+    The legacy layout remains the default so checkpoints without an explicit
+    recurrence-version declaration keep byte-for-byte compatible behavior.
     """
 
     def __init__(
@@ -71,6 +85,8 @@ class RWKVCell(nn.Module):
         n_layer: int = 2,
         channel_mix_key_clamp: float = 12.0,
         channel_mix_deepembed_clamp: float = 4.0,
+        state_readout_mode: str = "legacy-input-cache",
+        state_clamp: float = 50.0,
     ):
         super().__init__()
         self.n_embd = int(n_embd)
@@ -78,8 +94,15 @@ class RWKVCell(nn.Module):
         self.n_head = self.n_embd // self.head_size
         self.layer_id = int(layer_id)
         self.n_layer = max(2, int(n_layer))
-        self.state_size = 3 + self.head_size
-        self.state_clamp = 50.0
+        self.state_readout_mode = str(state_readout_mode or "legacy-input-cache")
+        if self.state_readout_mode not in {"legacy-input-cache", "explicit-output"}:
+            raise ValueError(
+                "state_readout_mode must be 'legacy-input-cache' or "
+                f"'explicit-output', got {self.state_readout_mode!r}"
+            )
+        self.matrix_offset = 4 if self.state_readout_mode == "explicit-output" else 3
+        self.state_size = self.matrix_offset + self.head_size
+        self.state_clamp = None if state_clamp is None else float(state_clamp)
         self.allow_legacy_state_migration = True
         self._compiled_impl = None
         try:
@@ -187,7 +210,13 @@ class RWKVCell(nn.Module):
             raise ValueError("state_hidden requires a non-None state")
         if state.dim() == 4 and state.shape[0] == 1:
             state = state.squeeze(0)
-        return state[:, :, 0]
+        hidden_slot = 3 if self.state_readout_mode == "explicit-output" else 0
+        if state.shape[-1] <= hidden_slot:
+            raise ValueError(
+                f"RWKV state has {state.shape[-1]} slots, but "
+                f"{self.state_readout_mode!r} requires slot {hidden_slot}"
+            )
+        return state[:, :, hidden_slot]
 
     def compile_forward(self, **compile_kwargs) -> None:
         if not hasattr(torch, "compile"):
@@ -212,18 +241,65 @@ class RWKVCell(nn.Module):
             # Old scalar-WKV states also used 5 slots and stored pp=-1e30 in
             # slot 3. For tiny head_size=2 this collides with the new packed
             # shape, so treat that sentinel as a legacy state to migrate.
-            if state[:, :, 3:].numel() == 0 or state[:, :, 3:].amin() > -1e20:
+            state_tail = state[:, :, self.matrix_offset:]
+            scalar_wkv_sentinel = (
+                state.shape[-1] >= 5
+                and state[:, :, 3].amin() <= -1e20
+            )
+            if (
+                not scalar_wkv_sentinel
+                and (state_tail.numel() == 0 or state_tail.amin() > -1e20)
+            ):
                 return state
 
         migrated = self.initial_state(B, device=x.device, dtype=torch.float32)
+        if state.dim() != 3:
+            return migrated
+
         common_b = min(B, state.shape[0])
         common_c = min(self.n_embd, state.shape[1])
-        if state.dim() == 3 and state.shape[-1] > 0:
-            migrated[:common_b, :common_c, 0] = state[:common_b, :common_c, 0]
-            if state.shape[-1] > 4:
-                migrated[:common_b, :common_c, 1] = state[:common_b, :common_c, 4]
-            elif state.shape[-1] > 1:
-                migrated[:common_b, :common_c, 1] = state[:common_b, :common_c, 1]
+        source = state[:common_b, :common_c]
+        source_slots = int(state.shape[-1])
+        scalar_wkv_sentinel = (
+            source_slots >= 5 and source[:, :, 3].amin() <= -1e20
+        )
+
+        if source_slots > 0:
+            migrated[:common_b, :common_c, 0] = source[:, :, 0]
+        if scalar_wkv_sentinel:
+            # Historical scalar-WKV layout: slot 4 was the channel-mix cache.
+            migrated[:common_b, :common_c, 1] = source[:, :, 4]
+            if self.state_readout_mode == "explicit-output":
+                migrated[:common_b, :common_c, 3] = source[:, :, 0]
+            return migrated
+
+        prefix_slots = min(3, source_slots)
+        if prefix_slots > 0:
+            migrated[:common_b, :common_c, :prefix_slots] = source[:, :, :prefix_slots]
+
+        explicit_source = source_slots == 4 + self.head_size
+        source_matrix_offset = 4 if explicit_source else 3
+        if self.state_readout_mode == "explicit-output":
+            if explicit_source:
+                migrated[:common_b, :common_c, 3] = source[:, :, 3]
+            elif source_slots > 0:
+                # An old state cannot recover the historical block output.
+                # Seeding with its old public readout makes migration continuous
+                # while all future states use the corrected explicit output.
+                migrated[:common_b, :common_c, 3] = source[:, :, 0]
+
+        available_matrix = max(0, source_slots - source_matrix_offset)
+        matrix_slots = min(self.head_size, available_matrix)
+        if matrix_slots > 0:
+            migrated[
+                :common_b,
+                :common_c,
+                self.matrix_offset:self.matrix_offset + matrix_slots,
+            ] = source[
+                :,
+                :,
+                source_matrix_offset:source_matrix_offset + matrix_slots,
+            ]
         return migrated
 
     def _mix(self, x: torch.Tensor, previous: torch.Tensor, coeff: torch.Tensor) -> torch.Tensor:
@@ -254,7 +330,7 @@ class RWKVCell(nn.Module):
 
         prev_tm = state[:, :, 0].to(dtype=x_dtype)
         prev_cm = state[:, :, 1].to(dtype=x_dtype)
-        matrix_state = state[:, :, 3:].contiguous().view(B, H, N, N)
+        matrix_state = state[:, :, self.matrix_offset:].contiguous().view(B, H, N, N)
 
         x_norm = self.ln1(x)
         xr = self._mix(x_norm, prev_tm, self.x_r)
@@ -291,7 +367,8 @@ class RWKVCell(nn.Module):
             v_f = v.float().view(B, H, N)
             a_f = state_a.float().view(B, H, N)
             b_f = state_b.float().view(B, H, N)
-            w_decay = torch.exp(-torch.exp(torch.clamp(w.float(), min=-60.0, max=30.0))).view(B, H, N)
+            bounded_w = _clamp_preserve_nonfinite(w.float(), -60.0, 30.0)
+            w_decay = torch.exp(-torch.exp(bounded_w)).view(B, H, N)
             state_f = matrix_state.float()
 
             sa = torch.matmul(state_f, a_f.unsqueeze(-1)).squeeze(-1)
@@ -319,24 +396,27 @@ class RWKVCell(nn.Module):
         xk_cm = self._mix(x_norm2, prev_cm, self.x_k_cm)
         cm_key = self.key_cm(xk_cm)
         if self.channel_mix_key_clamp > 0.0:
-            cm_key = torch.clamp(
+            cm_key = _clamp_preserve_nonfinite(
                 cm_key,
-                min=-self.channel_mix_key_clamp,
-                max=self.channel_mix_key_clamp,
+                -self.channel_mix_key_clamp,
+                self.channel_mix_key_clamp,
             )
         ffn = torch.square(torch.relu(cm_key))
         if deepemb_vec is not None:
             deepemb = deepemb_vec.to(dtype=ffn.dtype, device=ffn.device)
             if self.channel_mix_deepembed_clamp > 0.0:
-                deepemb = torch.clamp(
-                    torch.nan_to_num(
-                        deepemb,
-                        nan=1.0,
-                        posinf=self.channel_mix_deepembed_clamp,
-                        neginf=-self.channel_mix_deepembed_clamp,
-                    ),
-                    min=-self.channel_mix_deepembed_clamp,
-                    max=self.channel_mix_deepembed_clamp,
+                clamped_deepemb = _clamp_preserve_nonfinite(
+                    deepemb,
+                    -self.channel_mix_deepembed_clamp,
+                    self.channel_mix_deepembed_clamp,
+                )
+                # Do not turn a broken adapter trajectory into a plausible
+                # multiplicative gate. Preserve NaN/Inf so the model-level
+                # numerical guard rejects the forward/batch.
+                deepemb = torch.where(
+                    torch.isfinite(deepemb),
+                    clamped_deepemb,
+                    deepemb,
                 )
             ffn = ffn * deepemb
             if self.channel_mix_key_clamp > 0.0 and self.channel_mix_deepembed_clamp > 0.0:
@@ -345,16 +425,27 @@ class RWKVCell(nn.Module):
                     * self.channel_mix_key_clamp
                     * self.channel_mix_deepembed_clamp
                 )
-                ffn = torch.clamp(ffn, min=-ffn_limit, max=ffn_limit)
+                ffn = _clamp_preserve_nonfinite(
+                    ffn,
+                    -ffn_limit,
+                    ffn_limit,
+                )
         x = x_resid_cm + self.value_cm(ffn)
 
-        new_state = torch.cat([
+        state_parts = [
             x_norm.float().unsqueeze(-1),
             x_norm2.float().unsqueeze(-1),
             v_first.float().unsqueeze(-1),
-            state_f.reshape(B, C, N)
-        ], dim=-1)
+        ]
+        if self.state_readout_mode == "explicit-output":
+            state_parts.append(x.float().unsqueeze(-1))
+        state_parts.append(state_f.reshape(B, C, N))
+        new_state = torch.cat(state_parts, dim=-1)
         if self.state_clamp is not None:
-            new_state = torch.clamp(new_state, min=-self.state_clamp, max=self.state_clamp)
+            new_state = _clamp_preserve_nonfinite(
+                new_state,
+                -self.state_clamp,
+                self.state_clamp,
+            )
 
         return x, new_state

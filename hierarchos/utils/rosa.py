@@ -5,18 +5,30 @@ Persistent incremental implementation with an asynchronous GPU pipeline.
 Key optimizations:
   1. Single-pass persistent automata across TBPTT chunks
   2. Bounded parallel batch processing via ThreadPoolExecutor
-  3. Pinned-memory buffer pool for zero-copy CPU→GPU DMA transfers
+  3. Request-owned pinned buffers for race-free asynchronous DMA transfers
   4. CUDA stream-based async pipeline for CPU/GPU overlap
   5. Suffix automaton state persistence across TBPTT chunks (O(T_chunk) not O(T_total))
   6. Proper tie-breaking per v8 spec (largest j on equal match length)
 """
 
 import os
+import threading
 import numpy as np
 import torch
 from typing import List, Optional, Tuple
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
+
+ROSA_BOUNDED_CONTEXT_MODE = "bounded-segment-v1"
+ROSA_UNBOUNDED_CONTEXT_MODE = "legacy-unbounded-v1"
+
+
+def rosa_context_mode(enforce_max_context: bool) -> str:
+    return (
+        ROSA_BOUNDED_CONTEXT_MODE
+        if bool(enforce_max_context)
+        else ROSA_UNBOUNDED_CONTEXT_MODE
+    )
 
 # ─────────────────────────────────────────────────────────────
 # Numba JIT Detection
@@ -36,53 +48,70 @@ if _USE_NUMBA:
 # ─────────────────────────────────────────────────────────────
 _ROSA_POOL = None
 _ROSA_POOL_PID = None
+_ROSA_PIPELINE_POOL = None
+_ROSA_PIPELINE_POOL_PID = None
 _ROSA_AUTO_WORKER_LIMIT = 32
+_ROSA_POOL_INIT_LOCK = threading.Lock()
 
 def _get_pool(max_workers: int = 0) -> Optional[ThreadPoolExecutor]:
     """Returns a per-process thread pool for parallel ROSA batch computation."""
     global _ROSA_POOL, _ROSA_POOL_PID
     pid = os.getpid()
     if _ROSA_POOL is None or _ROSA_POOL_PID != pid:
-        if _ROSA_POOL is not None:
-            try:
-                _ROSA_POOL.shutdown(wait=False)
-            except Exception:
-                pass
-        if max_workers <= 0:
-            cpu_count = os.cpu_count() or 1
-            gpu_count = 1
-            try:
-                gpu_count = max(1, torch.cuda.device_count())
-            except Exception:
-                pass
-            max_workers = min(
-                _ROSA_AUTO_WORKER_LIMIT,
-                max(1, cpu_count // gpu_count),
-            )
-        _ROSA_POOL = ThreadPoolExecutor(max_workers=max_workers)
-        _ROSA_POOL_PID = pid
+        with _ROSA_POOL_INIT_LOCK:
+            if _ROSA_POOL is not None and _ROSA_POOL_PID == pid:
+                return _ROSA_POOL
+            if _ROSA_POOL is not None:
+                try:
+                    _ROSA_POOL.shutdown(wait=False)
+                except Exception:
+                    pass
+            if max_workers <= 0:
+                cpu_count = os.cpu_count() or 1
+                gpu_count = 1
+                try:
+                    gpu_count = max(1, torch.cuda.device_count())
+                except Exception:
+                    pass
+                max_workers = min(
+                    _ROSA_AUTO_WORKER_LIMIT,
+                    max(1, cpu_count // gpu_count),
+                )
+            _ROSA_POOL = ThreadPoolExecutor(max_workers=max_workers)
+            _ROSA_POOL_PID = pid
     return _ROSA_POOL
+
+
+def _get_pipeline_pool() -> ThreadPoolExecutor:
+    """Separate executor prevents nested ROSA batch work from deadlocking."""
+    global _ROSA_PIPELINE_POOL, _ROSA_PIPELINE_POOL_PID
+    pid = os.getpid()
+    if _ROSA_PIPELINE_POOL is None or _ROSA_PIPELINE_POOL_PID != pid:
+        with _ROSA_POOL_INIT_LOCK:
+            if (
+                _ROSA_PIPELINE_POOL is not None
+                and _ROSA_PIPELINE_POOL_PID == pid
+            ):
+                return _ROSA_PIPELINE_POOL
+            if _ROSA_PIPELINE_POOL is not None:
+                try:
+                    _ROSA_PIPELINE_POOL.shutdown(wait=False)
+                except Exception:
+                    pass
+            cpu_count = os.cpu_count() or 1
+            _ROSA_PIPELINE_POOL = ThreadPoolExecutor(
+                max_workers=min(4, max(1, cpu_count))
+            )
+            _ROSA_PIPELINE_POOL_PID = pid
+    return _ROSA_PIPELINE_POOL
 
 
 # ─────────────────────────────────────────────────────────────
 # Pinned Memory Buffer Pool
 # ─────────────────────────────────────────────────────────────
-class _PinnedBufferPool:
-    """Reusable pinned-memory tensor pool keyed by (tag, shape, dtype)."""
-    __slots__ = ("_pool",)
-
-    def __init__(self):
-        self._pool = {}
-
-    def get(self, tag: str, shape: tuple, dtype=torch.int64) -> torch.Tensor:
-        key = (tag, shape, dtype)
-        t = self._pool.get(key)
-        if t is None or t.shape != torch.Size(shape) or t.dtype != dtype:
-            t = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=torch.cuda.is_available())
-            self._pool[key] = t
-        return t
-
-_PINNED = _PinnedBufferPool()
+# A process-global tensor pool is deliberately not used. A same-shaped request
+# can begin before an earlier asynchronous DMA completes, so each pipeline call
+# owns its host buffers for the full transfer lifetime.
 
 # ─────────────────────────────────────────────────────────────
 # Cached CUDA Stream for Async Pipeline
@@ -200,7 +229,22 @@ def ROSA(x):
     return y
 
 
-def _rosa_incremental(state: ROSAState, new_tokens: List[int]) -> List[int]:
+def _reset_rosa_state_in_place(state: ROSAState) -> None:
+    """Reset an automaton without replacing the caller-owned state object."""
+    state.transitions = {0: {}}
+    state.suffix_links = [-1]
+    state.lengths = [0]
+    state.endpos = [-1]
+    state.last_state = 0
+    state.num_states = 1
+    state.tokens = []
+
+
+def _rosa_incremental(
+    state: ROSAState,
+    new_tokens: List[int],
+    max_context: int = 0,
+) -> List[int]:
     """
     Incrementally extend an existing suffix automaton with new tokens.
     Returns predictions for the new tokens only.
@@ -212,12 +256,27 @@ def _rosa_incremental(state: ROSAState, new_tokens: List[int]) -> List[int]:
     g = state.last_state
     z = state.num_states
     all_tokens = state.tokens
+    max_context = max(0, int(max_context or 0))
 
     predictions = []
-    base_offset = len(all_tokens)
 
-    for local_i, t in enumerate(new_tokens):
-        i = base_offset + local_i
+    for t in new_tokens:
+        # A suffix automaton does not support inexpensive deletion. Versioned
+        # bounded mode therefore uses deterministic fixed-size segments: once a
+        # segment reaches the configured cap, begin a fresh automaton before the
+        # next token. This keeps O(max_context) state and remains invariant to
+        # caller chunk boundaries.
+        if max_context > 0 and len(all_tokens) >= max_context:
+            _reset_rosa_state_in_place(state)
+            b = state.transitions
+            c = state.suffix_links
+            d = state.lengths
+            e = state.endpos
+            g = state.last_state
+            z = state.num_states
+            all_tokens = state.tokens
+
+        i = len(all_tokens)
         all_tokens.append(t)
 
         # Extend automaton
@@ -420,27 +479,32 @@ else:
 # ─────────────────────────────────────────────────────────────
 # Batch Processing API
 # ─────────────────────────────────────────────────────────────
-def rosa_single(x: List[int], state: Optional[ROSAState] = None) -> Tuple[List[int], ROSAState]:
+def rosa_single(
+    x: List[int],
+    state: Optional[ROSAState] = None,
+    max_context: int = 0,
+) -> Tuple[List[int], ROSAState]:
     """
     Process a single sequence through ROSA.
     If state is provided, incrementally extends the existing automaton.
     Returns (predictions_for_new_tokens, updated_state).
     """
     if state is not None:
-        preds = _rosa_incremental(state, x)
+        preds = _rosa_incremental(state, x, max_context=max_context)
         return preds, state
 
     # Building the persistent automaton already computes the predictions. The
     # old path first ran the stateless JIT kernel and then replayed every token
     # to construct this state, duplicating first-chunk work.
     new_state = ROSAState.new()
-    preds = _rosa_incremental(new_state, x)
+    preds = _rosa_incremental(new_state, x, max_context=max_context)
     return preds, new_state
 
 
 def rosa_batch_parallel(
     batch: List[List[int]],
     states: Optional[List[Optional[ROSAState]]] = None,
+    max_context: int = 0,
 ) -> Tuple[List[List[int]], List[ROSAState]]:
     """
     Process a batch of sequences through ROSA in parallel.
@@ -458,16 +522,27 @@ def rosa_batch_parallel(
 
     if states is None:
         states = [None] * B
+    elif len(states) != B:
+        raise ValueError(
+            f"ROSA states length {len(states)} does not match batch size {B}"
+        )
 
     # For single-element batches, skip thread pool overhead
     if B == 1:
-        preds, new_state = rosa_single(batch[0], states[0])
+        preds, new_state = rosa_single(batch[0], states[0], max_context=max_context)
         return [preds], [new_state]
 
     pool = _get_pool()
     futures = []
     for b in range(B):
-        futures.append(pool.submit(rosa_single, batch[b], states[b]))
+        futures.append(
+            pool.submit(
+                rosa_single,
+                batch[b],
+                states[b],
+                max_context,
+            )
+        )
 
     all_preds = []
     all_states = []
@@ -487,12 +562,14 @@ def precompute_rosa_ids_for_chunks(
     vocab_size: int,
     chunk_size: int,
     rosa_max_ctx: int = 512,
+    enforce_max_context: bool = False,
 ) -> List[int]:
     """
     Precompute the exact ROSA ids produced by the training forward path.
 
-    The live path now carries full ROSA history across chunks, so this mirrors
-    rosa_async_pipeline chunk-by-chunk with persistent automaton state.
+    This mirrors ``rosa_async_pipeline`` chunk-by-chunk with persistent
+    automaton state. Legacy mode carries full history; bounded-segment mode
+    resets at the configured boundary and is intentionally versioned.
     """
     tokens = [int(token) for token in tokens]
     total = len(tokens)
@@ -503,10 +580,19 @@ def precompute_rosa_ids_for_chunks(
     chunk_size = max(1, int(chunk_size or total))
     cached = [no_prediction] * total
     state = None
+    effective_max_context = (
+        max(1, int(rosa_max_ctx))
+        if enforce_max_context and int(rosa_max_ctx or 0) > 0
+        else 0
+    )
 
     for start in range(0, total, chunk_size):
         end = min(start + chunk_size, total)
-        rosa_chunk, state = rosa_single(tokens[start:end], state)
+        rosa_chunk, state = rosa_single(
+            tokens[start:end],
+            state,
+            max_context=effective_max_context,
+        )
         cached[start:end] = [
             no_prediction if int(pred) == -1 else int(pred)
             for pred in rosa_chunk
@@ -531,6 +617,7 @@ def rosa_async_pipeline(
     vocab_size: int,
     device: torch.device,
     rosa_max_ctx: int = 512,
+    enforce_max_context: bool = False,
 ):
     """
     Launches ROSA computation asynchronously so CPU work overlaps with GPU.
@@ -543,9 +630,14 @@ def rosa_async_pipeline(
     B, T = input_ids.shape
     is_cuda = (device.type == 'cuda')
     no_prediction = vocab_size
+    effective_max_context = (
+        max(1, int(rosa_max_ctx))
+        if enforce_max_context and int(rosa_max_ctx or 0) > 0
+        else 0
+    )
 
-    # Keep full ROSA history for continuation. rosa_max_ctx is retained for
-    # API compatibility with older callers, but past_tokens is no longer capped.
+    # Legacy checkpoints keep full ROSA history. Versioned bounded mode stores
+    # only the active fixed-size segment so cached/live paths share one contract.
     if past_tokens is not None:
         past_cpu = past_tokens.detach()
         if past_cpu.device.type != "cpu" or past_cpu.dtype != torch.int64:
@@ -566,10 +658,14 @@ def rosa_async_pipeline(
     # Transfer only the current model tokens to CPU (async if CUDA). The
     # previous history already lives on CPU between chunks in core.py.
     if is_cuda:
-        # Use pinned buffer for async D2H copy
-        host_buf = _PINNED.get("rosa_current", (B, T), dtype=torch.int64)
-        if host_buf.shape != input_ids.shape:
-            host_buf = _PINNED.get("rosa_current", tuple(input_ids.shape), dtype=torch.int64)
+        # A fresh per-call buffer prevents concurrent inference requests from
+        # overwriting one another's in-flight D2H/H2D transfers.
+        host_buf = torch.empty(
+            (B, T),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        )
 
         copy_stream = _get_rosa_stream(device)
         copy_stream.wait_stream(torch.cuda.current_stream(device))
@@ -584,9 +680,13 @@ def rosa_async_pipeline(
     # Build the states list
     if rosa_states is None:
         rosa_states = [None] * B
+    elif len(rosa_states) != B:
+        raise ValueError(
+            f"ROSA state count {len(rosa_states)} does not match batch size {B}"
+        )
 
     # Launch CPU computation on thread pool (overlaps with GPU forward)
-    pool = _get_pool()
+    pool = _get_pipeline_pool()
 
     def _cpu_work():
         # Wait for D2H copy to complete
@@ -596,10 +696,8 @@ def rosa_async_pipeline(
         current_tokens_cpu = host_buf.detach().cpu().clone()
         current_input_lists = current_tokens_cpu.tolist()
         if past_cpu is not None:
-            next_past_tokens = torch.cat([past_cpu, current_tokens_cpu], dim=1)
             past_input_lists = past_cpu.tolist()
         else:
-            next_past_tokens = current_tokens_cpu.clone()
             past_input_lists = [[] for _ in range(B)]
 
         state_inputs = []
@@ -622,7 +720,11 @@ def rosa_async_pipeline(
                 rebuild_flags.append(True)
 
         # Parallel ROSA batch computation
-        rosa_preds, new_states = rosa_batch_parallel(state_inputs, state_seeds)
+        rosa_preds, new_states = rosa_batch_parallel(
+            state_inputs,
+            state_seeds,
+            max_context=effective_max_context,
+        )
 
         # Return exactly one ROSA token per model token.
         rosa_raw = []
@@ -637,8 +739,26 @@ def rosa_async_pipeline(
         rosa_np = np.array(rosa_raw, dtype=np.int64)
         rosa_np[rosa_np == -1] = no_prediction  # sentinel for "no prediction"
 
-        # Use pinned buffer for H2D transfer
-        result_buf = _PINNED.get("rosa_result", (B, T), dtype=torch.int64)
+        if effective_max_context > 0:
+            state_histories = [list(state.tokens) for state in new_states]
+            history_lengths = {len(history) for history in state_histories}
+            if len(history_lengths) != 1:
+                raise RuntimeError(
+                    "Bounded ROSA batch rows produced different active-history lengths"
+                )
+            next_past_tokens = torch.tensor(state_histories, dtype=torch.int64)
+        elif past_cpu is not None:
+            next_past_tokens = torch.cat([past_cpu, current_tokens_cpu], dim=1)
+        else:
+            next_past_tokens = current_tokens_cpu.clone()
+
+        # Fresh per-call result storage makes parallel forwards race-free.
+        result_buf = torch.empty(
+            (B, T),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=is_cuda,
+        )
         np.copyto(np.asarray(result_buf), rosa_np, casting="unsafe")
 
         return result_buf, next_past_tokens, new_states

@@ -1,9 +1,17 @@
 import json
 import os
+import hashlib
+import zipfile
+import copy
 import torch
 import torch.nn as nn
 from typing import Dict, Any, Tuple, Optional
 from .device import is_directml_device
+from ..models.revisions import (
+    COHERENT_REVISION,
+    normalize_architecture_revision,
+    validate_architecture_contract,
+)
 
 TRANSIENT_LTM_STATE_KEYS = (
     "ltm.fast_vals",
@@ -14,6 +22,18 @@ TRANSIENT_LTM_STATE_KEYS = (
 
 DETERMINISTIC_STATE_KEYS = (
     "time_freqs",
+)
+
+RUNTIME_CHECKPOINT_METADATA_KEYS = (
+    "checkpoint_version",
+    "checkpoint_kind",
+    "completed_epoch",
+    "run_identity",
+    "best_metric_state",
+    "selection_metric",
+    "effective_training_config",
+    "optimizer_grouping_version",
+    "training_complete",
 )
 
 
@@ -111,13 +131,39 @@ def _legacy_numpy_checkpoint_safe_globals():
 
 def load_checkpoint_payload_compatible(path: str, map_location="cpu"):
     """Load Hierarchos payloads safely, including legacy NumPy RNG metadata."""
+    checksum_path = path + ".sha256"
+    if os.path.exists(checksum_path):
+        with open(checksum_path, "r", encoding="utf-8") as checksum_file:
+            expected = checksum_file.read().strip().split()[0].lower()
+        hasher = hashlib.sha256()
+        with open(path, "rb") as checkpoint_file:
+            while True:
+                chunk = checkpoint_file.read(8 << 20)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        actual = hasher.hexdigest()
+        if not expected or actual != expected:
+            raise RuntimeError(
+                f"Checkpoint SHA-256 verification failed for {path}: "
+                f"expected={expected!r}, actual={actual!r}"
+            )
     try:
         from torch.serialization import safe_globals
     except (ImportError, AttributeError):
         # PyTorch releases predating safe_globals retain their legacy loader.
         return torch.load(path, map_location=map_location)
 
-    allowed_globals = [AttrDict, *_legacy_numpy_checkpoint_safe_globals()]
+    # Current exact-resume checkpoints can contain the deterministic,
+    # project-owned ROSA automaton carried at a TBPTT boundary. Keep the
+    # allowlist narrow: arbitrary user classes must remain rejected.
+    from .rosa import ROSAState
+
+    allowed_globals = [
+        AttrDict,
+        ROSAState,
+        *_legacy_numpy_checkpoint_safe_globals(),
+    ]
     with safe_globals(allowed_globals):
         return torch.load(path, map_location=map_location, weights_only=True)
 
@@ -313,6 +359,16 @@ def _reject_model_load_mismatch(model, state_dict, missing_keys, unexpected_keys
 
     state_keys = set(state_dict)
     allowed_missing = set(TRANSIENT_LTM_STATE_KEYS) | set(DETERMINISTIC_STATE_KEYS)
+    model_config = getattr(model, "config", {})
+    model_revision = normalize_architecture_revision(
+        model_config.get("architecture_revision")
+        if isinstance(model_config, dict)
+        else getattr(model_config, "architecture_revision", None)
+    )
+    if model_revision != COHERENT_REVISION:
+        # This buffer did not exist in historical checkpoints. In coherent-v9
+        # it is schedule state and is required for train/eval/chat logit parity.
+        allowed_missing.add("memory_gate_warmup_step")
     if "tok_emb.weight" in state_keys and "lm_head.weight" not in state_keys:
         allowed_missing.add("lm_head.weight")
     if "lm_head.weight" in state_keys and "tok_emb.weight" not in state_keys:
@@ -351,17 +407,44 @@ def load_model_state_dict_compatible(model, state_dict: Dict[str, torch.Tensor],
 
 def _infer_arch_flags_from_state_dict(config_dict: Dict[str, Any], state_dict: Dict[str, torch.Tensor]) -> None:
     """Backfill architecture toggles for checkpoints saved before these flags existed."""
+    has_legacy_deepembed = any(
+        key.startswith("h_deepemb.") or key.startswith("l_deepemb.")
+        for key in state_dict
+    )
+    has_shared_deepembed = any(
+        key.startswith("h_deepembed_adapter.")
+        or key.startswith("l_deepembed_adapter.")
+        for key in state_dict
+    )
+    if "deepembed_mode" not in config_dict:
+        if has_shared_deepembed:
+            config_dict["deepembed_mode"] = "shared-factorized"
+        elif has_legacy_deepembed:
+            config_dict["deepembed_mode"] = "legacy-table"
+        else:
+            config_dict["deepembed_mode"] = "off"
     if "use_deepembed" not in config_dict:
-        config_dict["use_deepembed"] = any(
-            key.startswith("h_deepemb.") or key.startswith("l_deepemb.")
-            for key in state_dict
+        config_dict["use_deepembed"] = bool(
+            has_legacy_deepembed or has_shared_deepembed
         )
 
+    has_legacy_rosa = any(key.startswith("rosa_emb.") for key in state_dict)
+    has_shared_rosa = any(key.startswith("rosa_adapter.") for key in state_dict)
+    if "rosa_embedding_mode" not in config_dict:
+        if has_shared_rosa:
+            config_dict["rosa_embedding_mode"] = "shared-factorized"
+        elif has_legacy_rosa:
+            config_dict["rosa_embedding_mode"] = "legacy-table"
+        else:
+            config_dict["rosa_embedding_mode"] = "off"
     if "use_rosa" not in config_dict:
-        config_dict["use_rosa"] = any(
-            key.startswith("rosa_emb.") or key == "rosa_gate_logit"
-            for key in state_dict
-        )
+        config_dict["use_rosa"] = bool(has_legacy_rosa or has_shared_rosa)
+
+    if (
+        "architecture_revision" not in config_dict
+        and (has_shared_deepembed or has_shared_rosa)
+    ):
+        config_dict["architecture_revision"] = "coherent-v9"
 
     if config_dict.get("use_rosa", True) and "rosa_max_context" not in config_dict:
         config_dict["rosa_max_context"] = 512
@@ -373,10 +456,29 @@ def _infer_arch_flags_from_state_dict(config_dict: Dict[str, Any], state_dict: D
         )
         config_dict["memory_token_routers"] = has_router_weights
 
+    h_head_shape = state_dict.get("h_rnn.r_k")
+    l_head_shape = state_dict.get("l_rnn.r_k")
+    if (
+        "h_rwkv_head_size" not in config_dict
+        and torch.is_tensor(h_head_shape)
+        and h_head_shape.ndim == 2
+    ):
+        config_dict["h_rwkv_head_size"] = int(h_head_shape.shape[1])
+    if (
+        "l_rwkv_head_size" not in config_dict
+        and torch.is_tensor(l_head_shape)
+        and l_head_shape.ndim == 2
+    ):
+        config_dict["l_rwkv_head_size"] = int(l_head_shape.shape[1])
     if "rwkv_head_size" not in config_dict:
-        head_shape = state_dict.get("h_rnn.r_k")
-        if torch.is_tensor(head_shape) and head_shape.ndim == 2:
-            config_dict["rwkv_head_size"] = int(head_shape.shape[1])
+        h_head = config_dict.get("h_rwkv_head_size")
+        l_head = config_dict.get("l_rwkv_head_size")
+        if h_head is not None and (l_head is None or h_head == l_head):
+            config_dict["rwkv_head_size"] = int(h_head)
+        elif l_head is not None and h_head is None:
+            config_dict["rwkv_head_size"] = int(l_head)
+        else:
+            config_dict["rwkv_head_size"] = None
 
     if "rwkv_channel_mix_key_clamp" not in config_dict:
         config_dict["rwkv_channel_mix_key_clamp"] = 12.0
@@ -395,6 +497,92 @@ def _infer_arch_flags_from_state_dict(config_dict: Dict[str, Any], state_dict: D
         config_dict["inference_recurrence_mode"] = (
             "full-sample" if bool(config_dict["full_sample_bptt"]) else "tbptt"
         )
+
+
+def validate_checkpoint_architecture_contract(
+    checkpoint: Dict[str, Any],
+    config_dict: Dict[str, Any],
+    source: str = "checkpoint",
+) -> bool:
+    """Verify every persisted copy of the learned-function contract.
+
+    The redundant copies are intentional: training checkpoints, inference
+    exports, and exact-resume identity each remain independently inspectable.
+    Any disagreement is treated as corruption/configuration drift.
+    """
+
+    contracts = []
+    hashes = []
+
+    if isinstance(checkpoint.get("architecture_contract"), dict):
+        contracts.append(("checkpoint", checkpoint["architecture_contract"]))
+    if checkpoint.get("architecture_contract_sha256") is not None:
+        hashes.append(("checkpoint", checkpoint["architecture_contract_sha256"]))
+
+    config_hash = config_dict.get("architecture_contract_sha256")
+    if config_hash is not None:
+        hashes.append(("config", config_hash))
+
+    run_identity = checkpoint.get("run_identity")
+    if isinstance(run_identity, dict):
+        if isinstance(run_identity.get("architecture_contract"), dict):
+            contracts.append(("run_identity", run_identity["architecture_contract"]))
+        if run_identity.get("architecture_contract_sha256") is not None:
+            hashes.append((
+                "run_identity",
+                run_identity["architecture_contract_sha256"],
+            ))
+
+    if len(contracts) > 1:
+        canonical_contract = contracts[0][1]
+        disagreements = [
+            name for name, value in contracts[1:]
+            if value != canonical_contract
+        ]
+        if disagreements:
+            raise ValueError(
+                f"Conflicting architecture contracts in {source}: "
+                f"{contracts[0][0]} disagrees with {', '.join(disagreements)}."
+            )
+    if len(hashes) > 1:
+        canonical_hash = str(hashes[0][1]).strip().lower()
+        disagreements = [
+            name for name, value in hashes[1:]
+            if str(value).strip().lower() != canonical_hash
+        ]
+        if disagreements:
+            raise ValueError(
+                f"Conflicting architecture contract hashes in {source}: "
+                f"{hashes[0][0]} disagrees with {', '.join(disagreements)}."
+            )
+
+    expected_contract = contracts[0][1] if contracts else None
+    expected_hash = hashes[0][1] if hashes else None
+    if expected_contract is None and expected_hash is None:
+        revision = normalize_architecture_revision(
+            config_dict.get("architecture_revision")
+        )
+        checkpoint_version = int(checkpoint.get("checkpoint_version", 0) or 0)
+        if revision == COHERENT_REVISION or checkpoint_version >= 4:
+            raise ValueError(
+                f"Missing architecture contract metadata in {source}. "
+                "coherent-v9 and checkpoint format v4+ require a serialized "
+                "contract so recurrent/inference semantics cannot drift silently."
+            )
+        print(
+            "WARNING: Legacy checkpoint has no architecture contract metadata; "
+            "resolved legacy settings will be used for compatibility."
+        )
+        return False
+
+    validate_architecture_contract(
+        config_dict,
+        expected_contract=expected_contract,
+        expected_hash=expected_hash,
+        source=source,
+    )
+    print(f"INFO: Architecture contract verified for {source}.")
+    return True
 
 
 def load_full_model_with_config(model_path: str, device):
@@ -430,6 +618,11 @@ def load_full_model_with_config(model_path: str, device):
     state_dict = sanitize_model_state_dict(state_source, reset_transient_ltm=True)
     _reject_unsupported_rwkv_state_dict(state_dict, weights_path)
     _infer_arch_flags_from_state_dict(config_dict, state_dict)
+    validate_checkpoint_architecture_contract(
+        checkpoint,
+        config_dict,
+        weights_path,
+    )
 
     config = AttrDict(config_dict)
 
@@ -437,6 +630,20 @@ def load_full_model_with_config(model_path: str, device):
     model = HierarchosCore(config)
     
     load_result = load_model_state_dict_compatible(model, state_dict, weights_path)
+    if (
+        "memory_gate_warmup_step" in load_result.missing_keys
+        and normalize_architecture_revision(
+            config_dict.get("architecture_revision")
+        ) != COHERENT_REVISION
+        and hasattr(model, "memory_gate_warmup_step")
+    ):
+        # Historical eval/chat bypassed the warmup floor entirely. Treat a
+        # legacy inference export with no schedule buffer as warmup-complete so
+        # this parity fix does not restart its gate curriculum at inference.
+        with torch.no_grad():
+            model.memory_gate_warmup_step.fill_(
+                float(config_dict.get("memory_gate_warmup_steps", 0) or 0)
+            )
     allowed_missing = [
         key for key in load_result.missing_keys
         if key in TRANSIENT_LTM_STATE_KEYS or key in DETERMINISTIC_STATE_KEYS
@@ -447,38 +654,91 @@ def load_full_model_with_config(model_path: str, device):
     model.to(device)
     if checkpoint.get('training_complete', False) and hasattr(model, 'reset_memory'):
         model.reset_memory()
+    # Retain only small identity metadata needed by inference-side re-exports.
+    # Keeping it on the loaded model avoids rereading a multi-gigabyte checkpoint
+    # merely to preserve its contract and training provenance after an LTM edit.
+    model._hierarchos_checkpoint_metadata = {
+        key: copy.deepcopy(checkpoint[key])
+        for key in RUNTIME_CHECKPOINT_METADATA_KEYS
+        if key in checkpoint
+    }
+    model._hierarchos_checkpoint_metadata["source_weights_path"] = weights_path
     model.eval()
     return model, config
 
 def save_checkpoint_safely(checkpoint_dict: Dict[str, Any], path: str):
-    """Saves a checkpoint safely with validation and backup."""
+    """Save atomically with ZIP readback, SHA-256 identity, and backup."""
     temp_path = path + ".tmp"
+    temp_checksum_path = temp_path + ".sha256"
+    checksum_path = path + ".sha256"
     backup_path = path + ".bak"
+    backup_checksum_path = backup_path + ".sha256"
     moved_existing_to_backup = False
 
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         if os.path.exists(temp_path):
             os.remove(temp_path)
+        if os.path.exists(temp_checksum_path):
+            os.remove(temp_checksum_path)
         torch.save(checkpoint_dict, temp_path)
         if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
             raise RuntimeError("Failed to save checkpoint: Temp file is missing or empty.")
+        # torch.save's default container is ZIP. CRC-test every member without
+        # materializing a second copy of all tensors in RAM.
+        if zipfile.is_zipfile(temp_path):
+            with zipfile.ZipFile(temp_path, "r") as archive:
+                corrupt_member = archive.testzip()
+            if corrupt_member is not None:
+                raise RuntimeError(
+                    f"Checkpoint readback found a corrupt ZIP member: {corrupt_member}"
+                )
+        # Windows requires a writable descriptor for fsync/FlushFileBuffers.
+        with open(temp_path, "r+b") as checkpoint_file:
+            os.fsync(checkpoint_file.fileno())
+        hasher = hashlib.sha256()
+        with open(temp_path, "rb") as checkpoint_file:
+            while True:
+                chunk = checkpoint_file.read(8 << 20)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+        digest = hasher.hexdigest()
+        with open(temp_checksum_path, "w", encoding="utf-8") as checksum_file:
+            checksum_file.write(f"{digest}  {os.path.basename(path)}\n")
+            checksum_file.flush()
+            os.fsync(checksum_file.fileno())
 
         if os.path.exists(path):
             if os.path.exists(backup_path):
                 os.remove(backup_path)
+            if os.path.exists(backup_checksum_path):
+                os.remove(backup_checksum_path)
             os.replace(path, backup_path)
+            if os.path.exists(checksum_path):
+                os.replace(checksum_path, backup_checksum_path)
             moved_existing_to_backup = True
 
         os.replace(temp_path, path)
-        print(f"INFO: Checkpoint saved safely to {path}")
+        os.replace(temp_checksum_path, checksum_path)
+        print(
+            f"INFO: Checkpoint saved safely to {path} "
+            f"(sha256={digest[:16]}..., ZIP readback passed)"
+        )
     except Exception as e:
         print(f"ERROR: Failed to save checkpoint safely: {e}")
         if os.path.exists(temp_path):
             os.remove(temp_path)
+        if os.path.exists(temp_checksum_path):
+            os.remove(temp_checksum_path)
         if moved_existing_to_backup and not os.path.exists(path) and os.path.exists(backup_path):
             try:
                 os.replace(backup_path, path)
+                if (
+                    not os.path.exists(checksum_path)
+                    and os.path.exists(backup_checksum_path)
+                ):
+                    os.replace(backup_checksum_path, checksum_path)
                 print(f"INFO: Restored previous checkpoint after failed save: {path}")
             except OSError as restore_error:
                 print(f"CRITICAL: Could not restore checkpoint backup '{backup_path}': {restore_error}")

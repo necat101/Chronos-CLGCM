@@ -26,11 +26,19 @@ from .post_training import (
     write_benchmark_artifacts,
 )
 
-# Conditionally export HierarchosLM
-try:
-    from .lm_eval_wrapper import HierarchosLM
-except ImportError:
-    HierarchosLM = None
+def __getattr__(name):
+    """Lazily expose the optional lm-eval wrapper.
+
+    The evaluation package is initialized when the trainer imports the
+    lightweight checkpoint-selection helpers. Do not pull lm-eval/transformers
+    into spawned data workers merely because this package was initialized.
+    """
+
+    if name == "HierarchosLM":
+        from .lm_eval_wrapper import HierarchosLM
+
+        return HierarchosLM
+    raise AttributeError(name)
 
 __all__ = [
     "run_eval",

@@ -7,17 +7,31 @@ on Hierarchos models during or after training.
 import json
 from typing import Dict, List, Optional, Any
 
-try:
-    import lm_eval
-    from lm_eval import simple_evaluate
-    _HAS_LM_EVAL = True
-except ImportError:
-    _HAS_LM_EVAL = False
+_LM_EVAL_IMPORT_ERROR = None
+
+
+def _load_simple_evaluate():
+    """Import the optional benchmark stack only in the process using it.
+
+    Importing lm-eval at module initialization made every spawned Windows
+    DataLoader worker load transformers' audio/image dependencies. Besides
+    wasting substantial RAM/startup time, an optional libsndfile failure could
+    kill an otherwise unrelated training worker.
+    """
+
+    global _LM_EVAL_IMPORT_ERROR
+    try:
+        from lm_eval import simple_evaluate
+    except Exception as exc:
+        _LM_EVAL_IMPORT_ERROR = exc
+        return None
+    _LM_EVAL_IMPORT_ERROR = None
+    return simple_evaluate
 
 
 def is_lm_eval_available() -> bool:
-    """Check if lm-evaluation-harness is installed."""
-    return _HAS_LM_EVAL
+    """Check that lm-eval and its runtime dependencies import successfully."""
+    return _load_simple_evaluate() is not None
 
 
 def run_eval(
@@ -55,9 +69,12 @@ def run_eval(
         >>> print(results["results"]["hellaswag"]["acc,none"])
         0.45
     """
-    if not _HAS_LM_EVAL:
-        print("WARNING: lm-evaluation-harness is not installed.")
+    simple_evaluate = _load_simple_evaluate()
+    if simple_evaluate is None:
+        print("WARNING: lm-evaluation-harness is unavailable.")
         print("         Install with: pip install lm-eval>=0.4.0")
+        if _LM_EVAL_IMPORT_ERROR is not None:
+            print(f"         Import error: {_LM_EVAL_IMPORT_ERROR}")
         print("         Skipping evaluation.")
         return None
     

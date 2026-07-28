@@ -6,10 +6,15 @@ import torch
 import traceback
 import functools
 import itertools
+import random
 from collections import OrderedDict
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, IterableDataset, Sampler
 from typing import Optional, List, Dict, Any
+from hierarchos.utils.rosa import (
+    ROSA_BOUNDED_CONTEXT_MODE,
+    ROSA_UNBOUNDED_CONTEXT_MODE,
+)
 
 
 def _shared_epoch_counter():
@@ -233,6 +238,16 @@ def _worker_init_fn(_worker_id):
     # Keep loader workers from each spinning up a full BLAS/OpenMP thread pool.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     torch.set_num_threads(1)
+    # PyTorch gives each worker a deterministic seed derived from the loader's
+    # generator. Mirror it into libraries used by dataset/formatter extensions
+    # so a global run seed controls every preprocessing path.
+    worker_seed = int(torch.initial_seed()) % (2**32)
+    random.seed(worker_seed)
+    try:
+        import numpy as np
+        np.random.seed(worker_seed)
+    except ImportError:
+        pass
 
 def _resolve_prefetch_factor(num_workers: int, prefetch_factor=None, pin_memory: bool = False):
     if num_workers <= 0:
@@ -385,7 +400,8 @@ def _compose_prompt_response_sample(prompt_ids, response_ids, eos_token_id, max_
                                     response_loss_weight: float = 1.0,
                                     response_boundary_loss_weight: float = 1.0,
                                     response_boundary_tokens: int = 0,
-                                    min_response_tokens: int = 1):
+                                    min_response_tokens: int = 1,
+                                    return_audit: bool = False):
     """
     Compose prompt/completion rows while preserving supervised answer tokens.
 
@@ -404,6 +420,8 @@ def _compose_prompt_response_sample(prompt_ids, response_ids, eos_token_id, max_
 
     prompt_ids = list(prompt_ids)
     response_ids = list(response_ids)
+    original_prompt_tokens = len(prompt_ids)
+    original_response_tokens = len(response_ids)
     if eos_token_id is None:
         eos_token_id = response_ids[-1] if response_ids else 0
     eos_token_id = int(eos_token_id)
@@ -446,7 +464,23 @@ def _compose_prompt_response_sample(prompt_ids, response_ids, eos_token_id, max_
         response_boundary_loss_weight,
         response_boundary_tokens,
     )
-    return ids, labels, loss_weights
+    if not return_audit:
+        return ids, labels, loss_weights
+    audit = {
+        "original_prompt_tokens": int(original_prompt_tokens),
+        "original_response_tokens": int(original_response_tokens),
+        "original_tokens": int(original_prompt_tokens + original_response_tokens + 1),
+        "retained_prompt_tokens": int(len(prompt_ids)),
+        # full_response_ids always ends in EOS. Exclude it from response-length
+        # distributions so a one-token EOS is never reported as an answer.
+        "retained_response_tokens": int(max(0, len(full_response_ids) - 1)),
+        "retained_tokens": int(len(ids)),
+        "truncated": bool(
+            len(prompt_ids) != original_prompt_tokens
+            or max(0, len(full_response_ids) - 1) != original_response_tokens
+        ),
+    }
+    return ids, labels, loss_weights, audit
 
 def _sample_effective_length(item, fallback_length: Optional[int] = None):
     if item is None:
@@ -499,12 +533,20 @@ def _yield_length_bucket(buffer, batch_size: int, shuffle: bool, generator: torc
             yield item
 
 
-def _attach_precomputed_rosa(sample, vocab_size: int, chunk_size: int,
-                             max_context: int = 512):
+def _attach_precomputed_rosa(
+    sample,
+    vocab_size: int,
+    chunk_size: int,
+    max_context: int = 512,
+    enforce_max_context: bool = False,
+):
     """Attach exact cached ROSA ids inside a loader worker."""
     if sample is None:
         return None
-    from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
+    from hierarchos.utils.rosa import (
+        precompute_rosa_ids_for_chunks,
+        rosa_context_mode,
+    )
 
     input_ids = sample.get("input_ids")
     if isinstance(input_ids, torch.Tensor):
@@ -518,10 +560,12 @@ def _attach_precomputed_rosa(sample, vocab_size: int, chunk_size: int,
             vocab_size=sentinel,
             chunk_size=max(1, int(chunk_size or len(tokens) or 1)),
             rosa_max_ctx=max(1, int(max_context or 512)),
+            enforce_max_context=bool(enforce_max_context),
         ),
         dtype=torch.long,
     )
     sample["_rosa_sentinel"] = sentinel
+    sample["_rosa_context_mode"] = rosa_context_mode(enforce_max_context)
     return sample
 
 _TEXT_COLUMN_CANDIDATES = ("text", "content")
@@ -566,6 +610,87 @@ def _is_alpaca_prompt_pair(prompt_column: Optional[str], completion_column: Opti
         str(prompt_column or "").lower() == "instruction"
         and str(completion_column or "").lower() == "output"
     )
+
+def _bounded_audit_value(value, default: str = "unknown") -> str:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        text = default
+    return text[:256]
+
+def _audit_source_name(text_dict: dict, default: Optional[str] = None) -> str:
+    if isinstance(text_dict, dict):
+        for key in ("source", "dataset_source", "dataset_name", "origin", "_source"):
+            value = text_dict.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                return _bounded_audit_value(value)
+    return _bounded_audit_value(default, "unknown")
+
+def _audit_schema_and_rejection(
+    text_dict,
+    *,
+    text_column: Optional[str] = None,
+    prompt_column: Optional[str] = None,
+    completion_column: Optional[str] = None,
+    alpaca_mode: bool = False,
+    drop_empty_completions: bool = True,
+):
+    if not isinstance(text_dict, dict):
+        return "invalid", "not_an_object"
+    resolved_text, resolved_prompt, resolved_completion = _resolve_text_sample_columns(
+        text_dict,
+        text_column=text_column,
+        prompt_column=prompt_column,
+        completion_column=completion_column,
+        alpaca_mode=alpaca_mode,
+    )
+    if resolved_text:
+        schema = f"text:{resolved_text}"
+        if not _column_has_value(text_dict, resolved_text):
+            return schema, "empty_text"
+        return schema, None
+    if resolved_prompt and resolved_completion:
+        if _is_alpaca_prompt_pair(resolved_prompt, resolved_completion):
+            schema = "alpaca:instruction-output"
+        else:
+            schema = f"pair:{resolved_prompt}-{resolved_completion}"
+        prompt = str(text_dict.get(resolved_prompt, "") or "").strip()
+        completion = str(text_dict.get(resolved_completion, "") or "").strip()
+        inp = str(text_dict.get("input", "") or "").strip()
+        if drop_empty_completions and not completion:
+            return schema, "empty_completion"
+        if not prompt and not completion and not inp:
+            return schema, "empty_prompt_and_completion"
+        return schema, None
+    return "unknown", "missing_supported_schema"
+
+def _make_audit_rejection(
+    text_dict,
+    *,
+    source_default: Optional[str] = None,
+    text_column: Optional[str] = None,
+    prompt_column: Optional[str] = None,
+    completion_column: Optional[str] = None,
+    alpaca_mode: bool = False,
+    drop_empty_completions: bool = True,
+    reason: Optional[str] = None,
+):
+    schema, classified_reason = _audit_schema_and_rejection(
+        text_dict,
+        text_column=text_column,
+        prompt_column=prompt_column,
+        completion_column=completion_column,
+        alpaca_mode=alpaca_mode,
+        drop_empty_completions=drop_empty_completions,
+    )
+    return {
+        "_audit_only": True,
+        "_audit": {
+            "accepted": False,
+            "schema": schema,
+            "source": _audit_source_name(text_dict, source_default),
+            "rejection_reason": reason or classified_reason or "formatting_or_tokenization_failure",
+        },
+    }
 
 def _format_alpaca_prompt(instruction: str, inp: str) -> str:
     prompt = ""
@@ -978,6 +1103,18 @@ class TokenizedBinaryDataset(Dataset):
         self.has_rosa_ids = bool(index.get("has_rosa_ids", False))
         self.has_loss_weights = bool(index.get("has_loss_weights", False))
         self.rosa_sentinel = int(index.get("rosa_sentinel", 0))
+        self.rosa_ids_context_mode = str(
+            index.get("rosa_ids_context_mode")
+            or ROSA_UNBOUNDED_CONTEXT_MODE
+        )
+        if self.rosa_ids_context_mode not in {
+            ROSA_BOUNDED_CONTEXT_MODE,
+            ROSA_UNBOUNDED_CONTEXT_MODE,
+        }:
+            raise ValueError(
+                "Token cache has an unsupported ROSA context mode: "
+                f"{self.rosa_ids_context_mode!r}"
+            )
         self.label_encoding = index.get("label_encoding")
         if self.label_encoding in ("", "None", "none"):
             self.label_encoding = None
@@ -1378,6 +1515,7 @@ class TokenizedBinaryDataset(Dataset):
                 self._rosa_torch_dtype,
             )
             item["_rosa_sentinel"] = self.rosa_sentinel
+            item["_rosa_context_mode"] = self.rosa_ids_context_mode
         return item
 
     def __getitems__(self, indices):
@@ -1521,6 +1659,7 @@ class TokenizedBinaryDataset(Dataset):
             batch["loss_weights"] = loss_weights
         if rosa_ids is not None:
             batch["rosa_ids"] = rosa_ids
+            batch["rosa_ids_context_mode"] = self.rosa_ids_context_mode
         return batch
 
     def get_sample_lengths(self):
@@ -1585,10 +1724,32 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                          response_boundary_loss_weight: float = 1.0,
                          response_boundary_tokens: int = 0,
                          min_response_tokens: int = 1,
-                         drop_empty_completions: bool = True):
+                         drop_empty_completions: bool = True,
+                         include_audit: bool = False,
+                         audit_source_default: Optional[str] = None):
+    requested_columns = (text_column, prompt_column, completion_column)
+
+    def reject(reason):
+        if not include_audit:
+            return None
+        return _make_audit_rejection(
+            text_dict,
+            source_default=audit_source_default,
+            text_column=requested_columns[0],
+            prompt_column=requested_columns[1],
+            completion_column=requested_columns[2],
+            alpaca_mode=alpaca_mode,
+            drop_empty_completions=drop_empty_completions,
+            reason=reason,
+        )
+
     try:
         if not isinstance(text_dict, dict):
-            return None
+            return reject("not_an_object")
+        try:
+            minimum_response_tokens = max(0, int(min_response_tokens or 0))
+        except (TypeError, ValueError):
+            minimum_response_tokens = 1
         prompt_loss_weight, response_loss_weight, response_boundary_loss_weight, response_boundary_tokens = (
             _normalize_loss_weight_args(
                 prompt_loss_weight,
@@ -1598,6 +1759,15 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
             )
         )
         loss_weights = None
+        composition_audit = None
+        schema, _schema_rejection = _audit_schema_and_rejection(
+            text_dict,
+            text_column=requested_columns[0],
+            prompt_column=requested_columns[1],
+            completion_column=requested_columns[2],
+            alpaca_mode=alpaca_mode,
+            drop_empty_completions=drop_empty_completions,
+        )
 
         text_column, prompt_column, completion_column = _resolve_text_sample_columns(
             text_dict,
@@ -1609,9 +1779,20 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
 
         if text_column:
             text = str(text_dict.get(text_column, ""))
-            if not text.strip(): return None
+            if not text.strip():
+                return reject("empty_text")
             ids = tokenizer.encode(text) + [tokenizer.eos_token_id]
             labels = list(ids)
+            original_text_tokens = len(ids)
+            composition_audit = {
+                "original_prompt_tokens": 0,
+                "original_response_tokens": max(0, original_text_tokens - 1),
+                "original_tokens": original_text_tokens,
+                "retained_prompt_tokens": 0,
+                "retained_response_tokens": max(0, original_text_tokens - 1),
+                "retained_tokens": original_text_tokens,
+                "truncated": False,
+            }
             if _uses_custom_loss_weights(
                 prompt_loss_weight,
                 response_loss_weight,
@@ -1624,9 +1805,9 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
             output = str(text_dict.get(completion_column, ""))
             inp = str(text_dict.get('input', "")).strip()
             if drop_empty_completions and not output.strip():
-                return None
+                return reject("empty_completion")
             if not instruction.strip() and not output.strip() and not inp:
-                return None
+                return reject("empty_prompt_and_completion")
             if kayla_mode:
                 feelings = str(text_dict.get('feelings', ''))
                 thought = str(text_dict.get('thought-process', ''))
@@ -1636,6 +1817,9 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                 p_ids = tokenizer.encode(prompt_text)
                 t_ids = tokenizer.encode(thought_text, add_special_tokens=False)
                 r_ids = tokenizer.encode(response_text, add_special_tokens=False)
+                output_ids = tokenizer.encode(output, add_special_tokens=False)
+                if output.strip() and len(output_ids) < minimum_response_tokens:
+                    return reject("response_below_minimum")
                 composed = _compose_prompt_response_sample(
                     p_ids,
                     t_ids + r_ids,
@@ -1646,15 +1830,22 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                     response_loss_weight,
                     response_boundary_loss_weight,
                     response_boundary_tokens,
-                    min_response_tokens,
+                    minimum_response_tokens,
+                    return_audit=include_audit,
                 )
                 if composed is None:
-                    return None
-                ids, labels, loss_weights = composed
+                    return reject("composition_failed")
+                if include_audit:
+                    ids, labels, loss_weights, composition_audit = composed
+                    composition_audit["original_response_tokens"] = len(output_ids)
+                else:
+                    ids, labels, loss_weights = composed
             elif alpaca_mode or _is_alpaca_prompt_pair(prompt_column, completion_column):
                 prompt = _format_alpaca_prompt(instruction, inp)
                 p_ids = tokenizer.encode(prompt)
                 c_ids = tokenizer.encode(output, add_special_tokens=False)
+                if output.strip() and len(c_ids) < minimum_response_tokens:
+                    return reject("response_below_minimum")
                 composed = _compose_prompt_response_sample(
                     p_ids,
                     c_ids,
@@ -1665,11 +1856,15 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                     response_loss_weight,
                     response_boundary_loss_weight,
                     response_boundary_tokens,
-                    min_response_tokens,
+                    minimum_response_tokens,
+                    return_audit=include_audit,
                 )
                 if composed is None:
-                    return None
-                ids, labels, loss_weights = composed
+                    return reject("composition_failed")
+                if include_audit:
+                    ids, labels, loss_weights, composition_audit = composed
+                else:
+                    ids, labels, loss_weights = composed
             else:
                 if inp:
                     prompt = f"User: {inp}\n\nUser: {instruction}\n\nAssistant: "
@@ -1677,6 +1872,8 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                     prompt = f"User: {instruction}\n\nAssistant: "
                 p_ids = tokenizer.encode(prompt)
                 c_ids = tokenizer.encode(output, add_special_tokens=False)
+                if output.strip() and len(c_ids) < minimum_response_tokens:
+                    return reject("response_below_minimum")
                 composed = _compose_prompt_response_sample(
                     p_ids,
                     c_ids,
@@ -1687,18 +1884,34 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
                     response_loss_weight,
                     response_boundary_loss_weight,
                     response_boundary_tokens,
-                    min_response_tokens,
+                    minimum_response_tokens,
+                    return_audit=include_audit,
                 )
                 if composed is None:
-                    return None
-                ids, labels, loss_weights = composed
-        else: return None
+                    return reject("composition_failed")
+                if include_audit:
+                    ids, labels, loss_weights, composition_audit = composed
+                else:
+                    ids, labels, loss_weights = composed
+        else:
+            return reject("missing_supported_schema")
         if len(ids) > max_length:
             ids = ids[:max_length-1] + [tokenizer.eos_token_id]
             labels = labels[:max_length-1] + [tokenizer.eos_token_id]
             if loss_weights is not None:
                 eos_weight = loss_weights[-1] if loss_weights else 1.0
                 loss_weights = loss_weights[:max_length-1] + [eos_weight]
+            if composition_audit is not None:
+                composition_audit["retained_tokens"] = len(ids)
+                composition_audit["truncated"] = True
+        if (
+            prompt_column
+            and completion_column
+            and str(text_dict.get(completion_column, "") or "").strip()
+            and composition_audit is not None
+            and int(composition_audit.get("retained_response_tokens", 0)) < minimum_response_tokens
+        ):
+            return reject("retained_response_below_minimum")
         sample = {
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
@@ -1710,8 +1923,28 @@ def process_text_sample(tokenizer, text_dict: dict, max_length: int, kayla_mode:
             elif len(loss_weights) > len(ids):
                 loss_weights = loss_weights[:len(ids)]
             sample["loss_weights"] = torch.tensor(loss_weights, dtype=torch.float32)
+        if include_audit:
+            active_labels = sample["labels"][1:].ne(-100)
+            supervised_tokens = int(active_labels.sum().item())
+            if "loss_weights" in sample:
+                weighted_tokens = float(
+                    sample["loss_weights"][1:][active_labels].sum().item()
+                )
+            else:
+                weighted_tokens = float(supervised_tokens)
+            composition_audit = dict(composition_audit or {})
+            composition_audit.update({
+                "accepted": True,
+                "schema": schema,
+                "source": _audit_source_name(text_dict, audit_source_default),
+                "retained_tokens": int(len(ids)),
+                "supervised_tokens": supervised_tokens,
+                "weighted_tokens": weighted_tokens,
+            })
+            sample["_audit"] = composition_audit
         return sample
-    except: return None
+    except Exception as exc:
+        return reject(f"formatting_or_tokenization_error:{type(exc).__name__}")
 
 
 class _BatchEncodeRecorder:
@@ -1831,7 +2064,9 @@ def process_text_samples_batch(tokenizer, text_dicts, max_length: int,
                                response_boundary_loss_weight: float = 1.0,
                                response_boundary_tokens: int = 0,
                                min_response_tokens: int = 1,
-                               drop_empty_completions: bool = True):
+                               drop_empty_completions: bool = True,
+                               include_audit: bool = False,
+                               audit_source_default: Optional[str] = None):
     """Tokenize a map-style batch while preserving scalar sample semantics.
 
     Each prompt, completion, thought, or response remains an independent
@@ -1858,6 +2093,8 @@ def process_text_samples_batch(tokenizer, text_dicts, max_length: int,
         response_boundary_tokens,
         min_response_tokens,
         drop_empty_completions,
+        include_audit,
+        audit_source_default,
     )
 
     def scalar_fallback():
@@ -2109,7 +2346,10 @@ class StreamingJSONLDataset(IterableDataset):
                  precompute_rosa: bool = False,
                  rosa_vocab_size: Optional[int] = None,
                  rosa_chunk_size: int = 256,
-                 rosa_max_context: int = 512):
+                 rosa_max_context: int = 512,
+                 include_audit: bool = False,
+                 audit_source_default: Optional[str] = None,
+                 enforce_rosa_max_context: bool = False):
         super().__init__()
         self.path = path
         self.paths = _resolve_jsonl_paths(path)
@@ -2131,6 +2371,9 @@ class StreamingJSONLDataset(IterableDataset):
         self.rosa_vocab_size = int(rosa_vocab_size or 0)
         self.rosa_chunk_size = max(1, int(rosa_chunk_size or 256))
         self.rosa_max_context = max(1, int(rosa_max_context or 512))
+        self.enforce_rosa_max_context = bool(enforce_rosa_max_context)
+        self.include_audit = bool(include_audit)
+        self.audit_source_default = audit_source_default or path
         self.bucket_size = max(0, int(bucket_size or 0))
         self.batch_size = max(1, int(batch_size))
         self.shuffle_buckets = bool(shuffle_buckets)
@@ -2158,6 +2401,12 @@ class StreamingJSONLDataset(IterableDataset):
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
+                if self.include_audit:
+                    yield _make_audit_rejection(
+                        {},
+                        source_default=self.audit_source_default,
+                        reason="malformed_json",
+                    )
                 continue
             processed = process_tokenized_sample(obj, self.max_length)
             if processed is None:
@@ -2177,8 +2426,33 @@ class StreamingJSONLDataset(IterableDataset):
                     response_boundary_tokens=self.response_boundary_tokens,
                     min_response_tokens=self.min_response_tokens,
                     drop_empty_completions=self.drop_empty_completions,
+                    include_audit=self.include_audit,
+                    audit_source_default=self.audit_source_default,
                 )
+            elif self.include_audit:
+                length = int(processed.get("_length", len(processed["input_ids"])))
+                active_labels = processed["labels"][1:length].ne(-100)
+                weights = processed.get("loss_weights")
+                weighted_tokens = (
+                    float(weights[1:length][active_labels].sum().item())
+                    if weights is not None else float(active_labels.sum().item())
+                )
+                processed["_audit"] = {
+                    "accepted": True,
+                    "schema": "pretokenized",
+                    "source": _audit_source_name(obj, self.audit_source_default),
+                    "original_tokens": length,
+                    "retained_tokens": length,
+                    "original_response_tokens": 0,
+                    "retained_response_tokens": 0,
+                    "supervised_tokens": int(active_labels.sum().item()),
+                    "weighted_tokens": weighted_tokens,
+                    "truncated": False,
+                }
             if processed is None:
+                continue
+            if processed.get("_audit_only", False):
+                yield processed
                 continue
             if self.precompute_rosa:
                 processed = _attach_precomputed_rosa(
@@ -2186,6 +2460,7 @@ class StreamingJSONLDataset(IterableDataset):
                     self.rosa_vocab_size,
                     self.rosa_chunk_size,
                     self.rosa_max_context,
+                    self.enforce_rosa_max_context,
                 )
             if self.bucket_size > 0:
                 bucket.append(processed)
@@ -2335,7 +2610,7 @@ class HuggingFaceStreamingDataset(IterableDataset):
             yield from _yield_length_bucket(bucket, self.batch_size, self.shuffle, generator)
 
 class HuggingFaceMapStyleDataset(Dataset):
-    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None, alpaca_mode: bool = False, train_prompt_tokens: bool = True, prompt_loss_weight: float = 1.0, response_loss_weight: float = 1.0, response_boundary_loss_weight: float = 1.0, response_boundary_tokens: int = 0, min_response_tokens: int = 1, drop_empty_completions: bool = True, precompute_rosa: bool = False, rosa_vocab_size: Optional[int] = None, rosa_chunk_size: int = 256, rosa_max_context: int = 512):
+    def __init__(self, hf_dataset, tokenizer, max_length, kayla_mode=False, text_column=None, prompt_column=None, completion_column=None, alpaca_mode: bool = False, train_prompt_tokens: bool = True, prompt_loss_weight: float = 1.0, response_loss_weight: float = 1.0, response_boundary_loss_weight: float = 1.0, response_boundary_tokens: int = 0, min_response_tokens: int = 1, drop_empty_completions: bool = True, precompute_rosa: bool = False, rosa_vocab_size: Optional[int] = None, rosa_chunk_size: int = 256, rosa_max_context: int = 512, include_audit: bool = False, audit_source_default: Optional[str] = None, enforce_rosa_max_context: bool = False):
         super().__init__()
         self.hf_dataset, self.tokenizer, self.max_length, self.kayla_mode = hf_dataset, tokenizer, max_length, kayla_mode
         self.text_column, self.prompt_column, self.completion_column = text_column, prompt_column, completion_column
@@ -2351,17 +2626,21 @@ class HuggingFaceMapStyleDataset(Dataset):
         self.rosa_vocab_size = int(rosa_vocab_size or 0)
         self.rosa_chunk_size = max(1, int(rosa_chunk_size or 256))
         self.rosa_max_context = max(1, int(rosa_max_context or 512))
+        self.enforce_rosa_max_context = bool(enforce_rosa_max_context)
+        self.include_audit = bool(include_audit)
+        self.audit_source_default = audit_source_default
         self.sample_lengths = None
     def __len__(self): return len(self.hf_dataset)
     def __getitem__(self, idx):
         try:
-            sample = process_text_sample(self.tokenizer, self.hf_dataset[idx], self.max_length, self.kayla_mode, self.text_column, self.prompt_column, self.completion_column, self.alpaca_mode, self.train_prompt_tokens, self.prompt_loss_weight, self.response_loss_weight, self.response_boundary_loss_weight, self.response_boundary_tokens, self.min_response_tokens, self.drop_empty_completions)
-            if self.precompute_rosa:
+            sample = process_text_sample(self.tokenizer, self.hf_dataset[idx], self.max_length, self.kayla_mode, self.text_column, self.prompt_column, self.completion_column, self.alpaca_mode, self.train_prompt_tokens, self.prompt_loss_weight, self.response_loss_weight, self.response_boundary_loss_weight, self.response_boundary_tokens, self.min_response_tokens, self.drop_empty_completions, self.include_audit, self.audit_source_default)
+            if self.precompute_rosa and sample is not None and not sample.get("_audit_only", False):
                 sample = _attach_precomputed_rosa(
                     sample,
                     self.rosa_vocab_size,
                     self.rosa_chunk_size,
                     self.rosa_max_context,
+                    self.enforce_rosa_max_context,
                 )
             return sample
         except Exception:
@@ -2420,6 +2699,8 @@ class HuggingFaceMapStyleDataset(Dataset):
                 self.response_boundary_tokens,
                 self.min_response_tokens,
                 self.drop_empty_completions,
+                self.include_audit,
+                self.audit_source_default,
             )
             if self.precompute_rosa:
                 processed_rows = [
@@ -2428,7 +2709,10 @@ class HuggingFaceMapStyleDataset(Dataset):
                         self.rosa_vocab_size,
                         self.rosa_chunk_size,
                         self.rosa_max_context,
+                        self.enforce_rosa_max_context,
                     )
+                    if sample is not None and not sample.get("_audit_only", False)
+                    else sample
                     for sample in processed_rows
                 ]
             return processed_rows
@@ -2464,6 +2748,8 @@ class HuggingFaceMapStyleDataset(Dataset):
                         self.response_boundary_tokens,
                         self.min_response_tokens,
                         self.drop_empty_completions,
+                        self.include_audit,
+                        self.audit_source_default,
                     )
                     length = len(processed["input_ids"]) if processed is not None else None
             except Exception:
@@ -2475,8 +2761,20 @@ class HuggingFaceMapStyleDataset(Dataset):
         return self.sample_lengths
 
 def _collate_training_batch(batch, pad_token_id):
-    batch = [i for i in batch if i is not None]
-    if not batch: return None
+    audit_records = [
+        dict(item["_audit"])
+        for item in batch
+        if isinstance(item, dict) and isinstance(item.get("_audit"), dict)
+    ]
+    batch = [
+        item for item in batch
+        if isinstance(item, dict)
+        and not item.get("_audit_only", False)
+        and "input_ids" in item
+        and "labels" in item
+    ]
+    if not batch:
+        return {"_audit_records": audit_records} if audit_records else None
     ml = max(_sample_effective_length(i) for i in batch)
     ids = torch.full((len(batch), ml), pad_token_id, dtype=torch.long)
     labels = torch.full((len(batch), ml), -100, dtype=torch.long)
@@ -2489,6 +2787,21 @@ def _collate_training_batch(batch, pad_token_id):
         sentinel = next((int(item.get("_rosa_sentinel")) for item in batch if "_rosa_sentinel" in item), None)
         if sentinel is None:
             raise ValueError("Cached ROSA samples must include _rosa_sentinel")
+        rosa_context_modes = {
+            str(
+                item.get(
+                    "_rosa_context_mode",
+                    ROSA_UNBOUNDED_CONTEXT_MODE,
+                )
+            )
+            for item in batch
+            if "rosa_ids" in item
+        }
+        if len(rosa_context_modes) != 1:
+            raise ValueError(
+                "Cannot mix cached ROSA context modes in one batch"
+            )
+        rosa_context_mode = next(iter(rosa_context_modes))
         rosa_ids = torch.full((len(batch), ml), sentinel, dtype=torch.long)
     for i, item in enumerate(batch):
         item_ids = _as_long_tensor(item["input_ids"])
@@ -2518,6 +2831,9 @@ def _collate_training_batch(batch, pad_token_id):
         batch_out["loss_weights"] = loss_weights
     if rosa_ids is not None:
         batch_out["rosa_ids"] = rosa_ids
+        batch_out["rosa_ids_context_mode"] = rosa_context_mode
+    if audit_records:
+        batch_out["_audit_records"] = audit_records
     return batch_out
 
 def _collate_fn_dynamic_padding(batch, pad_token_id):
@@ -2552,7 +2868,10 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
                                 rosa_vocab_size: Optional[int] = None,
                                 rosa_chunk_size: int = 256,
                                 rosa_max_context: int = 512,
-                                in_order: bool = True):
+                                in_order: bool = True,
+                                include_audit: bool = False,
+                                audit_source_default: Optional[str] = None,
+                                enforce_rosa_max_context: bool = False):
     dataset = StreamingJSONLDataset(
         path,
         tokenizer,
@@ -2573,6 +2892,9 @@ def create_dataloader_for_jsonl(path, tokenizer, max_length, batch_size, pad_tok
         rosa_vocab_size=rosa_vocab_size,
         rosa_chunk_size=rosa_chunk_size,
         rosa_max_context=rosa_max_context,
+        enforce_rosa_max_context=enforce_rosa_max_context,
+        include_audit=include_audit,
+        audit_source_default=audit_source_default,
         bucket_size=_streaming_bucket_size(batch_size, use_length_bucketing, bucket_size),
         batch_size=batch_size,
         shuffle_buckets=True,

@@ -70,26 +70,15 @@ def detect_quantized_rwkv_format(q_data) -> str:
 
 
 def validate_quantized_rwkv_format(q_data, source: str = "quantized archive") -> str:
-    """Reject archives that do not match the currently implemented quantized cell."""
+    """Reject every legacy ``.npz`` path until recurrent parity is implemented."""
     rwkv_format = detect_quantized_rwkv_format(q_data)
-    if rwkv_format == "legacy-scalar":
-        return rwkv_format
-    if rwkv_format == "v8-matrix":
-        raise ValueError(
-            f"Unsupported v8 matrix-state quantized model in {source}. "
-            "The active full-precision model uses RWKV v8 keys such as h_rnn.x_r/r_k, "
-            "but the quantized inference loader still implements the older scalar-state "
-            "RWKV path. Use full-precision chat or build a v8-compatible quantized loader "
-            "before trusting quantized outputs."
-        )
-    if rwkv_format == "mixed":
-        raise ValueError(
-            f"Mixed legacy/v8 quantized RWKV keys found in {source}. "
-            "Refusing to load a partial recurrent architecture."
-        )
     raise ValueError(
-        f"Could not identify quantized RWKV format in {source}. "
-        "Expected legacy scalar-RWKV keys such as h_rnn.time_decay for this loader."
+        f"Quantized .npz inference is intentionally unsupported for {source} "
+        f"(detected recurrent format: {rwkv_format}). The retained quantized "
+        "implementation predates the active RWKV matrix state, DeepEmbed/ROSA "
+        "adapters, hard ACT, and Worker recurrence contract, so it cannot provide "
+        "coherent-v9 control-flow or logit parity. Use the full-precision "
+        "hierarchos.pt checkpoint."
     )
 
 class QuantizedLinear:
@@ -246,8 +235,13 @@ class QuantizedRWKVCell:
         return x, new_state
 
 class QuantizedHierarchos:
-    """The quantized hierarchos model for CPU/Vulkan inference."""
+    """Retained legacy implementation; construction is intentionally disabled."""
     def __init__(self, config: dict, q_data: dict):
+        raise RuntimeError(
+            "QuantizedHierarchos is intentionally unsupported: the legacy "
+            "scalar-RWKV path does not implement the active coherent-v9 "
+            "architecture. Use full-precision inference."
+        )
         if not _HAS_KERNEL:
             raise ImportError("Cannot initialize QuantizedHierarchos: C++ kernel not found.")
         
@@ -344,6 +338,7 @@ class QuantizedHierarchos:
                  prev_context: torch.Tensor, target_context: torch.Tensor,
                  global_pos_offset: int = 0,
                  device: str = "cpu", min_timestamp: float = 0.0, source_filter: int = None,
+                 min_wallclock_timestamp: float = 0.0,
                  drift_state=None, ltm_memory_state=None, **kwargs):
         
         B, T = input_ids.shape
@@ -374,6 +369,14 @@ class QuantizedHierarchos:
                 value = value * scale
             return value
         allow_hebbian_update = kwargs.pop("allow_hebbian_update", False)
+        memory_write_source = int(
+            kwargs.pop("memory_write_source", self.ltm.SRC_USER_INTERACTION)
+        )
+        memory_write_timestamp = kwargs.pop("memory_write_timestamp", None)
+        memory_write_wallclock_timestamp = kwargs.pop(
+            "memory_write_wallclock_timestamp",
+            None,
+        )
         suppress_hebbian = kwargs.pop("suppress_hebbian", getattr(self, "suppress_hebbian", True))
         hebbian_writer_ready = bool(getattr(self.config, "val_proj_trained", False))
         allow_untrained_writer = bool(
@@ -385,6 +388,7 @@ class QuantizedHierarchos:
             suppress_hebbian = True
         memory_timestamps = None
         memory_sources = None
+        memory_wallclock_timestamps = None
         past_tokens = None
         rosa_states = None
         if ltm_memory_state is None:
@@ -394,13 +398,17 @@ class QuantizedHierarchos:
                 curr_mom_vals = self.ltm._mom_vals.unsqueeze(0).expand(B, -1, -1).clone()
                 memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(B, -1).clone()
                 memory_sources = self.ltm.sources.unsqueeze(0).expand(B, -1).clone()
+                memory_wallclock_timestamps = self.ltm.wallclock_timestamps.unsqueeze(0).expand(B, -1).clone()
             else:
                 curr_fast_vals = self.ltm.fast_vals
                 curr_mom_vals = self.ltm._mom_vals
                 memory_timestamps = self.ltm.timestamps
                 memory_sources = self.ltm.sources
+                memory_wallclock_timestamps = self.ltm.wallclock_timestamps
         else:
-            if len(ltm_memory_state) >= 6:
+            if len(ltm_memory_state) >= 7:
+                curr_fast_vals, curr_mom_vals, past_tokens, rosa_states, memory_timestamps, memory_sources, memory_wallclock_timestamps = ltm_memory_state[:7]
+            elif len(ltm_memory_state) >= 6:
                 curr_fast_vals, curr_mom_vals, past_tokens, rosa_states, memory_timestamps, memory_sources = ltm_memory_state[:6]
             elif len(ltm_memory_state) >= 4:
                 curr_fast_vals, curr_mom_vals, past_tokens, rosa_states = ltm_memory_state[:4]
@@ -413,9 +421,16 @@ class QuantizedHierarchos:
                 if curr_fast_vals.dim() == 3:
                     memory_timestamps = self.ltm.timestamps.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
                     memory_sources = self.ltm.sources.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                    memory_wallclock_timestamps = self.ltm.wallclock_timestamps.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
                 else:
                     memory_timestamps = self.ltm.timestamps
                     memory_sources = self.ltm.sources
+                    memory_wallclock_timestamps = self.ltm.wallclock_timestamps
+            elif memory_wallclock_timestamps is None:
+                if curr_fast_vals.dim() == 3:
+                    memory_wallclock_timestamps = self.ltm.wallclock_timestamps.unsqueeze(0).expand(curr_fast_vals.shape[0], -1).clone()
+                else:
+                    memory_wallclock_timestamps = self.ltm.wallclock_timestamps
 
         curr_prev_context = prev_context.to(device if device == 'vulkan' else 'cpu')
         logits = None
@@ -462,13 +477,16 @@ class QuantizedHierarchos:
                                                            source_filter=source_filter,
                                                            fast_vals=curr_fast_vals,
                                                            timestamps=memory_timestamps,
-                                                           sources=memory_sources)
+                                                           sources=memory_sources,
+                                                           min_wallclock_timestamp=min_wallclock_timestamp,
+                                                           wallclock_timestamps=memory_wallclock_timestamps)
             all_topk_vals.append(topk_vals); all_topk_idx.append(topk_idx)
             
             args = topk_ts.unsqueeze(-1) * self.time_freqs.to(device).unsqueeze(0).unsqueeze(0)
             pe = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
             if self.config.ltm_val_dim % 2 == 1: pe = torch.cat([pe, torch.zeros_like(pe[..., :1])], dim=-1)
-            topk_vals = topk_vals + pe
+            valid_memory = (topk_idx >= 0).unsqueeze(-1)
+            topk_vals = (topk_vals + pe) * valid_memory.to(dtype=topk_vals.dtype)
             
             gate = torch.sigmoid(torch.clamp(self.ltm_gate_logit.to(device), min=-50.0, max=50.0))
             topk_vals = topk_vals * gate
@@ -567,12 +585,19 @@ class QuantizedHierarchos:
                  curr_fast_vals, curr_mom_vals = self.ltm.update_memory_hebbian(
                      topk_idx, None, val_expanded,
                      current_lr=self.config.ltm_lr,
-                     timestamp=float(abs_t),
+                     timestamp=(
+                         float(memory_write_timestamp)
+                         if memory_write_timestamp is not None
+                         else float(abs_t)
+                     ),
+                     source=memory_write_source,
                      tokens_covered=1,
                      fast_vals=curr_fast_vals,
                      mom_vals=curr_mom_vals,
                      timestamps=memory_timestamps,
                      sources=memory_sources,
+                     wallclock_timestamp=memory_write_wallclock_timestamp,
+                     wallclock_timestamps=memory_wallclock_timestamps,
                      inplace=True
                  )
 
@@ -588,19 +613,18 @@ class QuantizedHierarchos:
                 rosa_states,
                 memory_timestamps.cpu() if isinstance(memory_timestamps, torch.Tensor) else memory_timestamps,
                 memory_sources.cpu() if isinstance(memory_sources, torch.Tensor) else memory_sources,
+                memory_wallclock_timestamps.cpu() if isinstance(memory_wallclock_timestamps, torch.Tensor) else memory_wallclock_timestamps,
             )
         }
 
 def load_quantized(model_path: str, device=None):
-    if device and is_directml_device(device):
-        from ..utils.checkpoint import load_full_model_with_config
-        return load_full_model_with_config(model_path, device)
-    if not _HAS_KERNEL: raise ImportError("Cannot load quantized model: C++ kernel not found.")
+    """Fail closed for legacy archives; chat may then try full precision."""
     npz_files = [f for f in os.listdir(model_path) if f.endswith('.npz')]
     if not npz_files: raise FileNotFoundError(f"No quantized model .npz file found in {model_path}")
     q_path = os.path.join(model_path, npz_files[0])
-    q_data = np.load(q_path, allow_pickle=True)
-    validate_quantized_rwkv_format(q_data, q_path)
-    config = AttrDict(q_data['_config'].item())
-    if 'model_type' not in config: config['model_type'] = 'hierarchos'
-    return QuantizedHierarchos(config, q_data), config
+    raise ValueError(
+        f"Quantized .npz inference is intentionally unsupported for {q_path}. "
+        "Legacy scalar-RWKV and current matrix-state archives both diverge from "
+        "the supported full-precision coherent-v9 architecture. Place/use a "
+        "full-precision hierarchos.pt checkpoint instead."
+    )

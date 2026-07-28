@@ -32,25 +32,23 @@ from .utils.device import (
 from .utils.checkpoint import AttrDict, load_full_model_with_config, save_checkpoint_safely
 from .inference.chat import chat
 
-# Optional evaluation support (requires: pip install lm-eval)
-try:
-    from .evaluation import (
-        run_eval,
-        is_lm_eval_available,
-        format_results,
-        HierarchosLM,
-        format_benchmark_catalog,
-        resolve_task_names,
-        run_post_training_benchmarks,
-        write_benchmark_artifacts,
-    )
-except ImportError:
-    # lm-eval not installed - evaluation features not available
-    run_eval = None
-    is_lm_eval_available = lambda: False
-    format_results = None
-    HierarchosLM = None
-    format_benchmark_catalog = None
-    resolve_task_names = None
-    run_post_training_benchmarks = None
-    write_benchmark_artifacts = None
+# Lightweight evaluation orchestration is always importable. The optional
+# lm-eval/transformers stack is loaded only when a benchmark is actually
+# requested, which keeps Windows DataLoader spawn workers lean and reliable.
+from .evaluation import (
+    run_eval,
+    is_lm_eval_available,
+    format_results,
+    format_benchmark_catalog,
+    resolve_task_names,
+    run_post_training_benchmarks,
+    write_benchmark_artifacts,
+)
+
+
+def __getattr__(name):
+    if name == "HierarchosLM":
+        from .evaluation.lm_eval_wrapper import HierarchosLM
+
+        return HierarchosLM
+    raise AttributeError(name)
