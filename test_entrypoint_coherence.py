@@ -1,5 +1,7 @@
 from pathlib import Path
 import re
+import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parent
@@ -65,3 +67,24 @@ def test_docs_and_launchers_do_not_call_legacy_monolith():
         "Command-style references to the legacy monolith must use "
         "hierarchos_cli.py instead:\n" + "\n".join(offenders)
     )
+
+
+def test_core_package_import_does_not_load_optional_benchmark_stack():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import hierarchos; "
+                "assert 'lm_eval' not in sys.modules; "
+                "assert 'soundfile' not in sys.modules; "
+                "assert 'transformers.pipelines' not in sys.modules"
+            ),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr

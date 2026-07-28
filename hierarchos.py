@@ -1,3 +1,23 @@
+"""Unsupported legacy monolith.
+
+Use ``hierarchos_cli.py`` and the modular ``hierarchos`` package. In
+particular, this historical file's scalar-RWKV ``.npz`` quantization path does
+not implement the active coherent-v9 recurrence and is deliberately disabled.
+"""
+
+if __name__ == "__main__":
+    import sys as _startup_sys
+
+    print(
+        "ERROR: hierarchos.py is an unsupported historical monolith and must "
+        "not be used for training or inference."
+    )
+    print(
+        "       Run the maintained modular entry point instead: "
+        "python hierarchos_cli.py <mode> ..."
+    )
+    raise SystemExit(2)
+
 import os
 import sys
 import json
@@ -12,6 +32,12 @@ import traceback # Added for better error reporting
 import signal # <<< MODIFIED: Import signal >>>
 from torch.compiler import cudagraph_mark_step_begin # <<< ADD THIS LINE
 import math # For ceil in dataset chunking (though that script is separate)
+
+_LEGACY_QUANTIZATION_UNSUPPORTED = (
+    "Legacy hierarchos.py quantization is unsupported: its scalar-RWKV .npz "
+    "format cannot preserve the active coherent-v9 recurrence/logit contract. "
+    "Use hierarchos_cli.py with a full-precision hierarchos.pt checkpoint."
+)
 
 # <<< MODIFIED: Set Tokenizers Parallelism Environment Variable >>>
 # Set this early, before tokenizers might be implicitly loaded by other imports
@@ -1119,7 +1145,8 @@ def get_q_block_size(qtype: str) -> int:
         raise ValueError(f"Unknown quantization type: {qtype}")
 
 def export_and_quantize_model(output_dir: str, model: nn.Module, tokenizer, qtype: str):
-    """Quantizes and exports the model to a directory containing the .npz and tokenizer."""
+    """Refuse the obsolete monolithic scalar-RWKV exporter."""
+    raise RuntimeError(_LEGACY_QUANTIZATION_UNSUPPORTED)
     if not _HAS_KERNEL:
         print("ERROR: C++ kernel is required for quantization. Aborting.")
         return
@@ -2673,8 +2700,9 @@ class HierarchosCore(nn.Module):
 # <<< RESTORED CLASS: QuantizedHierarchos for Inference >>>
 # ==================================================================
 class QuantizedHierarchos:
-    """The quantized hierarchos model for CPU/Vulkan inference (now using RWKV cells)."""
+    """Obsolete monolithic quantized model; construction is disabled."""
     def __init__(self, config: dict, q_data: dict):
+        raise RuntimeError(_LEGACY_QUANTIZATION_UNSUPPORTED)
         if not _HAS_KERNEL:
             raise ImportError("Cannot initialize QuantizedHierarchos: C++ kernel not found.")
         
@@ -3056,7 +3084,8 @@ class QuantizedHierarchos:
         self.ltm.update_memory_hebbian(topk_idx, None, vals, current_lr=lr, timestamp=timestamp, source=LTMModule.SRC_USER_INTERACTION, tokens_covered=tokens_covered, inplace=True)
 
 def load_quantized(model_path: str, device=None):
-    """Loads a quantized model directory, automatically finding the .npz and tokenizer."""
+    """Refuse obsolete monolithic ``.npz`` inference."""
+    raise RuntimeError(_LEGACY_QUANTIZATION_UNSUPPORTED)
     # <<< FIX: DirectML Fallback >>>
     if device and is_directml_device(device):
         print("INFO: DirectML detected. Quantized models are incompatible with DirectML.")
@@ -4363,6 +4392,7 @@ def merge_lora(args, device, tokenizer):
 # <<< QUANTIZE Function >>>
 # ... (quantize remains unchanged) ...
 def quantize(args, device, model=None, tokenizer=None, out_dir=None):
+    raise RuntimeError(_LEGACY_QUANTIZATION_UNSUPPORTED)
     if not _HAS_KERNEL:
         print("ERROR: Cannot quantize model - C++ kernel not found or failed to import.")
         return
@@ -5661,18 +5691,3 @@ def main():
             sys.exit(1)
         chat(args, pt_device, tokenizer)
 
-
-if __name__ == "__main__":
-    # --- ADD THIS LINE ---
-    # Fix for linux dataloader deadlock when num_workers > 0
-    # Must be inside __name__ == "__main__" block
-    try:
-        torch.multiprocessing.set_start_method('spawn', force=True)
-    except RuntimeError as e:
-        if "cannot be called" in str(e):
-             print("INFO: Multiprocessing context already set. Skipping 'spawn'.")
-        else:
-             print(f"Warning: Could not set multiprocessing start method 'spawn': {e}")
-    # --- END OF FIX ---
-    
-    main()

@@ -4,6 +4,9 @@ import argparse
 import json
 import hashlib
 import shutil
+import random
+import math
+import time
 from array import array
 import torch
 import torch.nn as nn
@@ -19,6 +22,7 @@ from hierarchos.utils.checkpoint import (
     load_checkpoint_payload_compatible,
     save_checkpoint_safely,
     sanitize_model_state_dict,
+    validate_checkpoint_architecture_contract,
 )
 from hierarchos.inference.chat_state import clear_ltm_working_memory
 from hierarchos import (
@@ -46,9 +50,54 @@ from hierarchos import (
     run_post_training_benchmarks,
     write_benchmark_artifacts,
 )
-from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
+from hierarchos.utils.rosa import (
+    precompute_rosa_ids_for_chunks,
+    rosa_context_mode,
+)
+from hierarchos.models.revisions import (
+    apply_architecture_revision_defaults,
+    architecture_contract,
+    architecture_contract_hash,
+)
 
-HF_CACHE_FORMATTER_VERSION = "alpaca-previous-context-v5"
+HF_CACHE_FORMATTER_VERSION = "alpaca-previous-context-v6-min-response-filter"
+_RETRY_CACHE_DIRECTORY_PERMISSION_ERRORS = os.name == "nt"
+
+
+def _replace_cache_directory_atomically(tmp_dir, cache_dir, *, attempts=5):
+    """Publish a completed cache despite brief Windows handle contention."""
+    attempts = max(1, int(attempts))
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp_dir, cache_dir)
+            return
+        except PermissionError:
+            if (
+                not _RETRY_CACHE_DIRECTORY_PERMISSION_ERRORS
+                or attempt + 1 >= attempts
+            ):
+                raise
+            # Antivirus/indexers can briefly retain a directory handle after
+            # its final file closes. Keep the retry bounded and never mark the
+            # temporary cache complete unless the atomic rename succeeds.
+            time.sleep(0.05 * (2 ** attempt))
+
+
+def set_global_training_seed(seed):
+    """Seed every host/device RNG before tokenizer and loader construction."""
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed % (2**32))
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"INFO: Global training seed set to {seed}.")
+    return seed
 
 
 def load_hf_dataset(
@@ -200,6 +249,226 @@ def _tokenizer_vocab_size(tokenizer):
         if vocab_size is not None:
             return int(vocab_size)
         return 50257
+
+
+def _tokenizer_identity(tokenizer):
+    """Return a content identity, not merely a mutable tokenizer path."""
+    hasher = hashlib.sha256()
+    identity = {
+        "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+        "vocab_size": _tokenizer_vocab_size(tokenizer),
+    }
+    name_or_path = getattr(tokenizer, "name_or_path", None)
+    if name_or_path:
+        identity["name_or_path"] = str(name_or_path)
+    try:
+        vocab = tokenizer.get_vocab()
+    except Exception:
+        vocab = None
+    if isinstance(vocab, dict):
+        for token, token_id in sorted(vocab.items(), key=lambda item: (int(item[1]), str(item[0]))):
+            encoded = str(token).encode("utf-8", errors="surrogatepass")
+            hasher.update(len(encoded).to_bytes(4, "little", signed=False))
+            hasher.update(encoded)
+            hasher.update(int(token_id).to_bytes(8, "little", signed=True))
+    else:
+        hasher.update(json.dumps(identity, sort_keys=True).encode("utf-8"))
+    special_map = getattr(tokenizer, "special_tokens_map", None)
+    if isinstance(special_map, dict):
+        normalized_specials = {
+            str(key): str(value)
+            for key, value in sorted(special_map.items())
+        }
+        hasher.update(json.dumps(
+            normalized_specials,
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8", errors="surrogatepass"))
+        identity["special_tokens_map"] = normalized_specials
+    identity["sha256"] = hasher.hexdigest()
+    return identity
+
+
+def _ensure_tokenizer_identity(args, tokenizer):
+    identity = getattr(args, "_tokenizer_identity", None)
+    if not isinstance(identity, dict) or not identity.get("sha256"):
+        identity = _tokenizer_identity(tokenizer)
+        args._tokenizer_identity = identity
+    return identity
+
+
+def _new_cache_audit():
+    return {
+        "version": 1,
+        "records": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "truncated": 0,
+        "original_tokens": 0,
+        "retained_tokens": 0,
+        "supervised_tokens": 0,
+        "weighted_tokens": 0.0,
+        "original_response_tokens": 0,
+        "retained_response_tokens": 0,
+        "rejection_reasons": {},
+        "response_length_histogram": {
+            "0": 0,
+            "1-7": 0,
+            "8-31": 0,
+            "32-127": 0,
+            "128-511": 0,
+            "512+": 0,
+        },
+        "by_schema": {},
+        "by_source": {},
+    }
+
+
+def _bounded_counter_bucket(mapping, name, *, limit=4096):
+    name = str(name or "unknown")[:256]
+    if name not in mapping and len(mapping) >= limit:
+        name = "__other__"
+    return mapping.setdefault(name, {
+        "records": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "truncated": 0,
+        "retained_tokens": 0,
+        "supervised_tokens": 0,
+        "weighted_tokens": 0.0,
+        "retained_response_tokens": 0,
+    })
+
+
+def _response_length_bucket(length):
+    length = max(0, int(length or 0))
+    if length == 0:
+        return "0"
+    if length < 8:
+        return "1-7"
+    if length < 32:
+        return "8-31"
+    if length < 128:
+        return "32-127"
+    if length < 512:
+        return "128-511"
+    return "512+"
+
+
+def _consume_cache_audit(batch, audit):
+    records = batch.pop("_audit_records", None) if isinstance(batch, dict) else None
+    if not records:
+        # Third-party/legacy test loaders may not emit audit metadata. Preserve
+        # compatibility while still reporting exact retained/loss mass.
+        if not isinstance(batch, dict) or "input_ids" not in batch:
+            return
+        lengths = _batch_effective_lengths(batch)
+        labels = batch.get("labels")
+        weights = batch.get("loss_weights")
+        records = []
+        for row, length in enumerate(lengths):
+            length = max(0, int(length))
+            active = labels[row, 1:length].ne(-100) if labels is not None else torch.ones(
+                max(0, length - 1), dtype=torch.bool
+            )
+            weighted = (
+                float(weights[row, 1:length][active].sum().item())
+                if weights is not None else float(active.sum().item())
+            )
+            records.append({
+                "accepted": True,
+                "schema": "unknown",
+                "source": "unknown",
+                "original_tokens": length,
+                "retained_tokens": length,
+                "original_response_tokens": 0,
+                "retained_response_tokens": 0,
+                "supervised_tokens": int(active.sum().item()),
+                "weighted_tokens": weighted,
+                "truncated": False,
+            })
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        accepted = bool(record.get("accepted", False))
+        truncated = bool(record.get("truncated", False))
+        retained = max(0, int(record.get("retained_tokens", 0) or 0))
+        supervised = max(0, int(record.get("supervised_tokens", 0) or 0))
+        weighted = max(0.0, float(record.get("weighted_tokens", 0.0) or 0.0))
+        retained_response = max(0, int(record.get("retained_response_tokens", 0) or 0))
+        audit["records"] += 1
+        audit["accepted" if accepted else "rejected"] += 1
+        audit["truncated"] += int(truncated)
+        audit["original_tokens"] += max(0, int(record.get("original_tokens", retained) or 0))
+        audit["retained_tokens"] += retained
+        audit["supervised_tokens"] += supervised
+        audit["weighted_tokens"] += weighted
+        audit["original_response_tokens"] += max(
+            0, int(record.get("original_response_tokens", retained_response) or 0)
+        )
+        audit["retained_response_tokens"] += retained_response
+        audit["response_length_histogram"][
+            _response_length_bucket(retained_response)
+        ] += int(accepted)
+        if not accepted:
+            reason = str(record.get("rejection_reason") or "unknown")[:256]
+            audit["rejection_reasons"][reason] = (
+                int(audit["rejection_reasons"].get(reason, 0)) + 1
+            )
+        for dimension, key in (
+            ("by_schema", record.get("schema")),
+            ("by_source", record.get("source")),
+        ):
+            bucket = _bounded_counter_bucket(audit[dimension], key)
+            bucket["records"] += 1
+            bucket["accepted" if accepted else "rejected"] += 1
+            bucket["truncated"] += int(truncated)
+            bucket["retained_tokens"] += retained
+            bucket["supervised_tokens"] += supervised
+            bucket["weighted_tokens"] += weighted
+            bucket["retained_response_tokens"] += retained_response
+
+
+def _enforce_cache_audit_budgets(args, audit):
+    total = max(1, int(audit.get("records", 0) or 0))
+    rejected = max(0, int(audit.get("rejected", 0) or 0))
+    truncated = max(0, int(audit.get("truncated", 0) or 0))
+    max_rejected_count = max(0, int(getattr(args, "max_cache_rejected_samples", 0) or 0))
+    max_rejected_fraction = max(
+        0.0, float(getattr(args, "max_cache_rejected_fraction", 0.0) or 0.0)
+    )
+    allowed_rejected = max(
+        max_rejected_count,
+        int(math.floor(total * min(1.0, max_rejected_fraction))),
+    )
+    raw_truncated_count = getattr(args, "max_cache_truncated_samples", -1)
+    max_truncated_count = int(
+        -1 if raw_truncated_count is None else raw_truncated_count
+    )
+    max_truncated_fraction = max(
+        0.0, float(getattr(args, "max_cache_truncated_fraction", 0.05) or 0.0)
+    )
+    allowed_truncated = max(
+        max(0, max_truncated_count),
+        int(math.floor(total * min(1.0, max_truncated_fraction))),
+    )
+    failures = []
+    if rejected > allowed_rejected:
+        failures.append(
+            f"rejected {rejected}/{total} rows (allowed {allowed_rejected}); "
+            f"reasons={audit.get('rejection_reasons', {})}"
+        )
+    if truncated > allowed_truncated:
+        failures.append(
+            f"truncated {truncated}/{total} accepted rows (allowed {allowed_truncated})"
+        )
+    if failures:
+        raise RuntimeError(
+            "Token-cache data quality budget exceeded: " + "; ".join(failures)
+            + ". Inspect cache_audit.json, repair the dataset/format flags, or "
+            "set explicit --max-cache-*-samples/fraction budgets after review."
+        )
 
 
 def _jsonl_source_files(path):
@@ -697,6 +966,7 @@ def _append_token_cache_record(
     *,
     layout,
     precompute_rosa,
+    identity_hasher=None,
 ):
     labels_elided = layout.get("label_encoding") == "input_ids_alias"
     if batch.get("_cache_storage_encoded", False):
@@ -741,6 +1011,28 @@ def _append_token_cache_record(
         parts.append(rosa_ids.numpy().tobytes())
     for part in parts:
         write_buffer.extend(part)
+    if identity_hasher is not None:
+        identity_hasher.update(int(length).to_bytes(8, "little", signed=False))
+        for part in parts:
+            identity_hasher.update(part)
+        if layout.get("has_loss_weights"):
+            codes = batch.get("_cache_loss_weight_codes")
+            if codes is not None:
+                identity_hasher.update(
+                    codes[row, :length].detach().cpu().contiguous().numpy().tobytes()
+                )
+            else:
+                weights = batch.get("loss_weights")
+                if weights is None:
+                    identity_hasher.update(
+                        torch.ones(length, dtype=torch.float32).numpy().tobytes()
+                    )
+                else:
+                    identity_hasher.update(
+                        weights[row, :length].detach().cpu().to(
+                            dtype=torch.float32
+                        ).contiguous().numpy().tobytes()
+                    )
     return sum(len(part) for part in parts)
 
 
@@ -857,6 +1149,7 @@ def _hf_cache_key_payload(args, *, format_name, num_shards=None):
             or getattr(args, "model_path", None)
             or "openai-community/gpt2"
         ),
+        "tokenizer_identity": getattr(args, "_tokenizer_identity", None),
         "max_length": int(getattr(args, "max_length", 0) or 0),
         "kayla": bool(getattr(args, "kayla", False)),
         "alpaca": bool(getattr(args, "alpaca", False)),
@@ -874,6 +1167,12 @@ def _hf_cache_key_payload(args, *, format_name, num_shards=None):
         "completion_column": getattr(args, "completion_column", None),
         "precompute_rosa": bool(getattr(args, "use_rosa", True)),
         "rosa_max_context": int(getattr(args, "rosa_max_context", 512) or 512),
+        "enforce_rosa_max_context": bool(
+            getattr(args, "enforce_rosa_max_context", False)
+        ),
+        "rosa_ids_context_mode": rosa_context_mode(
+            getattr(args, "enforce_rosa_max_context", False)
+        ),
         "training_chunk_size": int(getattr(args, "training_chunk_size", 256) or 256),
     }
     if num_shards is not None:
@@ -954,10 +1253,16 @@ def _processed_sample_to_cached_item(processed, args=None, tokenizer=None):
                 vocab_size=rosa_sentinel,
                 chunk_size=getattr(args, "training_chunk_size", 256),
                 rosa_max_ctx=getattr(args, "rosa_max_context", 512),
+                enforce_max_context=bool(
+                    getattr(args, "enforce_rosa_max_context", False)
+                ),
             ),
             dtype=torch.int32,
         )
         item["_rosa_sentinel"] = int(rosa_sentinel)
+        item["_rosa_context_mode"] = rosa_context_mode(
+            getattr(args, "enforce_rosa_max_context", False)
+        )
     return item
 
 
@@ -1083,11 +1388,24 @@ def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
             "max_length": getattr(args, "max_length", 1024),
             "train_prompt_tokens": bool(getattr(args, "train_prompt_tokens", True)),
             "chunks_per_file": chunks_per_file,
+            "has_rosa_ids": bool(getattr(args, "use_rosa", True)),
+            "rosa_max_context": int(
+                getattr(args, "rosa_max_context", 512) or 512
+            ),
+            "rosa_training_chunk_size": int(
+                getattr(args, "training_chunk_size", 256) or 256
+            ),
+            "enforce_rosa_max_context": bool(
+                getattr(args, "enforce_rosa_max_context", False)
+            ),
+            "rosa_ids_context_mode": rosa_context_mode(
+                getattr(args, "enforce_rosa_max_context", False)
+            ),
         }, f, indent=2)
 
     if os.path.exists(shard_dir):
         shutil.rmtree(shard_dir)
-    os.replace(tmp_dir, shard_dir)
+    _replace_cache_directory_atomically(tmp_dir, shard_dir)
     print(
         f"INFO: HF tokenized PT shards ready in {shard_dir} "
         f"({sum(shard_counts)} samples, skipped {skipped})."
@@ -1141,8 +1459,106 @@ def _legacy_hf_token_cache_key(args):
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
+def _file_sha256(path, *, chunk_bytes=8 << 20):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(chunk_bytes)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _read_token_cache_identity(cache_dir):
+    index_path = os.path.join(cache_dir, "index.pt")
+    success_path = os.path.join(cache_dir, "_SUCCESS")
+    data_path = os.path.join(cache_dir, "tokens.bin")
+    with open(success_path, "r", encoding="utf-8") as stream:
+        success = json.load(stream)
+    index = torch.load(index_path, map_location="cpu", weights_only=True)
+    audit_path = os.path.join(cache_dir, str(success.get("audit_file") or "cache_audit.json"))
+    expected_audit_hash = success.get("audit_sha256") or index.get("audit_sha256")
+    if expected_audit_hash and (
+        not os.path.exists(audit_path)
+        or _file_sha256(audit_path) != str(expected_audit_hash)
+    ):
+        raise RuntimeError(
+            f"Token cache audit manifest checksum failed: {audit_path}"
+        )
+    ordered_hash = index.get("ordered_record_sha256")
+    success_hash = success.get("ordered_record_sha256")
+    if ordered_hash and success_hash and str(ordered_hash) != str(success_hash):
+        raise RuntimeError(
+            f"Token cache identity mismatch between index.pt and _SUCCESS: {cache_dir}"
+        )
+    if ordered_hash or success_hash:
+        digest = str(ordered_hash or success_hash)
+        algorithm = str(
+            index.get("ordered_record_hash_algorithm")
+            or success.get("ordered_record_hash_algorithm")
+            or "record-stream-v1"
+        )
+    else:
+        # Legacy caches did not persist a logical record hash. Hash their
+        # physical ordered stream plus lengths and payload once so new
+        # checkpoints can still bind to that exact cache without rewriting it.
+        hasher = hashlib.sha256()
+        hasher.update(b"legacy-token-cache-file-v1\0")
+        hasher.update(_file_sha256(data_path).encode("ascii"))
+        lengths = index.get("lengths")
+        if torch.is_tensor(lengths):
+            hasher.update(
+                lengths.detach().cpu().to(dtype=torch.int64).contiguous().numpy().tobytes()
+            )
+        hasher.update(json.dumps(
+            success.get("cache_payload") or index.get("cache_payload") or {},
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8"))
+        digest = hasher.hexdigest()
+        algorithm = "legacy-token-cache-file-v1"
+    samples = int(success.get("samples", len(index.get("lengths", []))) or 0)
+    return {
+        "cache_key": str(success.get("cache_key") or index.get("cache_key") or ""),
+        "format": str(success.get("format") or index.get("format") or ""),
+        "ordered_record_sha256": digest,
+        "ordered_record_hash_algorithm": algorithm,
+        "samples": samples,
+        "cache_payload_sha256": hashlib.sha256(json.dumps(
+            success.get("cache_payload") or index.get("cache_payload") or {},
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")).hexdigest(),
+        "audit_sha256": success.get("audit_sha256") or index.get("audit_sha256"),
+    }
+
+
+def _attach_token_cache_identity(args, cache_dir):
+    audit_path = os.path.join(cache_dir, "cache_audit.json")
+    if os.path.exists(audit_path):
+        with open(audit_path, "r", encoding="utf-8") as audit_file:
+            cache_audit = json.load(audit_file)
+        _enforce_cache_audit_budgets(args, cache_audit)
+    else:
+        print(
+            "WARNING: Reused legacy token cache has no cache_audit.json; "
+            "schema/rejection/truncation quality budgets cannot be revalidated."
+        )
+    identity = _read_token_cache_identity(cache_dir)
+    args._token_cache_identity = identity
+    args._token_cache_dir = os.path.abspath(cache_dir)
+    print(
+        "INFO: Token cache ordered identity: "
+        f"{identity['ordered_record_sha256'][:16]} "
+        f"({identity['samples']} samples, {identity['ordered_record_hash_algorithm']})."
+    )
+    return cache_dir
+
+
 def materialize_hf_token_cache(args, tokenizer):
     resolve_hf_dataset_revision(args, announce=True)
+    _ensure_tokenizer_identity(args, tokenizer)
     cache_root = (
         getattr(args, "hf_token_cache_dir", None)
         or getattr(args, "hf_shard_cache_dir", None)
@@ -1170,7 +1586,7 @@ def materialize_hf_token_cache(args, tokenizer):
         and os.path.exists(data_path)
     ):
         print(f"INFO: Reusing HF random-access token cache from {cache_dir}")
-        return cache_dir
+        return _attach_token_cache_identity(args, cache_dir)
 
     tmp_dir = cache_dir + ".tmp"
     if os.path.exists(tmp_dir):
@@ -1211,6 +1627,10 @@ def materialize_hf_token_cache(args, tokenizer):
     rosa_sentinel = _tokenizer_vocab_size(tokenizer)
     rosa_chunk_size = int(getattr(args, "training_chunk_size", 256) or 256)
     rosa_max_context = int(getattr(args, "rosa_max_context", 512) or 512)
+    enforce_rosa_max_context = bool(
+        getattr(args, "enforce_rosa_max_context", False)
+    )
+    cached_rosa_context_mode = rosa_context_mode(enforce_rosa_max_context)
     storage_layout = _token_cache_storage_layout(
         args,
         tokenizer,
@@ -1240,6 +1660,9 @@ def materialize_hf_token_cache(args, tokenizer):
         rosa_vocab_size=rosa_sentinel,
         rosa_chunk_size=rosa_chunk_size,
         rosa_max_context=rosa_max_context,
+        enforce_rosa_max_context=enforce_rosa_max_context,
+        include_audit=True,
+        audit_source_default=getattr(args, "hf_dataset", None),
     )
     builder = create_map_style_dataloader(
         cache_dataset,
@@ -1250,7 +1673,7 @@ def materialize_hf_token_cache(args, tokenizer):
         use_length_bucketing=False,
         device=torch.device("cpu"),
         prefetch_factor=getattr(args, "prefetch_factor", None),
-        in_order=False,
+        in_order=True,
     )
     print(
         "INFO: Parallel HF cache preprocessing configured with "
@@ -1259,6 +1682,9 @@ def materialize_hf_token_cache(args, tokenizer):
 
     offsets = array("q")
     lengths = array("i")
+    cache_audit = _new_cache_audit()
+    ordered_record_hasher = hashlib.sha256()
+    ordered_record_hasher.update(b"hierarchos-token-cache-record-stream-v1\0")
     total_bytes = 0
     write_buffer = bytearray()
     flush_bytes = max(
@@ -1280,6 +1706,9 @@ def materialize_hf_token_cache(args, tokenizer):
             ):
                 if batch is None:
                     continue
+                _consume_cache_audit(batch, cache_audit)
+                if "input_ids" not in batch:
+                    continue
                 batch_lengths = _batch_effective_lengths(batch)
                 cache_batch = _prepare_token_cache_batch(
                     batch,
@@ -1300,6 +1729,7 @@ def materialize_hf_token_cache(args, tokenizer):
                         length,
                         layout=storage_layout,
                         precompute_rosa=precompute_rosa,
+                        identity_hasher=ordered_record_hasher,
                     )
                     if write_loss_weights:
                         _append_loss_weight_runs(
@@ -1324,11 +1754,24 @@ def materialize_hf_token_cache(args, tokenizer):
     finally:
         del builder
 
-    skipped = max(0, int(total_samples) - len(lengths)) if total_samples is not None else 0
+    skipped = int(cache_audit.get("rejected", 0) or 0)
+    if total_samples is not None and int(cache_audit.get("records", 0) or 0) < int(total_samples):
+        missing_records = max(0, int(total_samples) - int(cache_audit.get("records", 0) or 0))
+        skipped += missing_records
+        cache_audit["records"] += missing_records
+        cache_audit["rejected"] += missing_records
+        cache_audit["rejection_reasons"]["missing_from_loader"] = missing_records
 
     if not lengths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError("HF token cache build produced no usable samples.")
+
+    ordered_record_sha256 = ordered_record_hasher.hexdigest()
+    _enforce_cache_audit_budgets(args, cache_audit)
+    audit_path = os.path.join(tmp_dir, "cache_audit.json")
+    with open(audit_path, "w", encoding="utf-8") as audit_file:
+        json.dump(cache_audit, audit_file, indent=2, sort_keys=True)
+    audit_sha256 = _file_sha256(audit_path)
 
     index = {
         "format": cache_format,
@@ -1342,7 +1785,12 @@ def materialize_hf_token_cache(args, tokenizer):
         "has_rosa_ids": precompute_rosa,
         "rosa_sentinel": int(rosa_sentinel),
         "rosa_max_context": int(rosa_max_context),
+        "enforce_rosa_max_context": enforce_rosa_max_context,
+        "rosa_ids_context_mode": cached_rosa_context_mode,
         "rosa_training_chunk_size": int(rosa_chunk_size),
+        "ordered_record_sha256": ordered_record_sha256,
+        "ordered_record_hash_algorithm": "record-stream-v1",
+        "audit_sha256": audit_sha256,
     }
     index.update(_token_cache_index_layout(
         storage_layout,
@@ -1373,17 +1821,31 @@ def materialize_hf_token_cache(args, tokenizer):
             "rosa_dtype": storage_layout["rosa_dtype"],
             "has_rosa_ids": precompute_rosa,
             "rosa_max_context": int(rosa_max_context),
+            "enforce_rosa_max_context": enforce_rosa_max_context,
+            "rosa_ids_context_mode": cached_rosa_context_mode,
             "rosa_training_chunk_size": int(rosa_chunk_size),
+            "ordered_record_sha256": ordered_record_sha256,
+            "ordered_record_hash_algorithm": "record-stream-v1",
+            "audit_sha256": audit_sha256,
+            "audit_file": "cache_audit.json",
+            "audit": {
+                "records": cache_audit["records"],
+                "accepted": cache_audit["accepted"],
+                "rejected": cache_audit["rejected"],
+                "truncated": cache_audit["truncated"],
+                "retained_tokens": cache_audit["retained_tokens"],
+                "weighted_tokens": cache_audit["weighted_tokens"],
+            },
         }, f, indent=2)
 
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir)
-    os.replace(tmp_dir, cache_dir)
+    _replace_cache_directory_atomically(tmp_dir, cache_dir)
     print(
         f"INFO: HF random-access token cache ready in {cache_dir} "
         f"({len(lengths)} samples, skipped {skipped}, {total_bytes / (1024 ** 3):.2f} GiB)."
     )
-    return cache_dir
+    return _attach_token_cache_identity(args, cache_dir)
 
 
 def _local_token_cache_payload(args):
@@ -1417,6 +1879,7 @@ def _local_token_cache_payload(args):
 
 def materialize_local_token_cache(args, tokenizer):
     """Build/reuse the mmap token cache for local JSONL exactly once."""
+    _ensure_tokenizer_identity(args, tokenizer)
     cache_root = (
         getattr(args, "local_token_cache_dir", None)
         or getattr(args, "hf_token_cache_dir", None)
@@ -1438,7 +1901,7 @@ def materialize_local_token_cache(args, tokenizer):
         and os.path.exists(data_path)
     ):
         print(f"INFO: Reusing local JSONL random-access token cache from {cache_dir}")
-        return cache_dir
+        return _attach_token_cache_identity(args, cache_dir)
 
     tmp_dir = cache_dir + ".tmp"
     if os.path.exists(tmp_dir):
@@ -1454,12 +1917,26 @@ def materialize_local_token_cache(args, tokenizer):
             or min(512, max(64, int(getattr(args, "batch_size", 1) or 1) * 4))
         ),
     )
-    build_workers = max(0, int(getattr(args, "num_workers", 0) or 0))
+    requested_build_workers = max(0, int(getattr(args, "num_workers", 0) or 0))
+    # Iterable JSONL workers own disjoint byte ranges/shards, so changing the
+    # worker count changes interleaving even with DataLoader FIFO delivery.
+    # Use one deterministic producer for cache creation; training remains
+    # multi-worker over the finished random-access cache.
+    build_workers = 0
+    if requested_build_workers:
+        print(
+            "INFO: Local token-cache build uses one deterministic producer "
+            f"(requested training workers={requested_build_workers})."
+        )
     text_column, prompt_column, completion_column = _local_text_columns(args)
     precompute_rosa = bool(getattr(args, "use_rosa", True))
     rosa_sentinel = _tokenizer_vocab_size(tokenizer)
     rosa_chunk_size = int(getattr(args, "training_chunk_size", 256) or 256)
     rosa_max_context = int(getattr(args, "rosa_max_context", 512) or 512)
+    enforce_rosa_max_context = bool(
+        getattr(args, "enforce_rosa_max_context", False)
+    )
+    cached_rosa_context_mode = rosa_context_mode(enforce_rosa_max_context)
     write_loss_weights = _uses_weighted_token_loss(args)
     storage_layout = _token_cache_storage_layout(
         args,
@@ -1497,14 +1974,20 @@ def materialize_local_token_cache(args, tokenizer):
         rosa_vocab_size=rosa_sentinel,
         rosa_chunk_size=rosa_chunk_size,
         rosa_max_context=rosa_max_context,
+        enforce_rosa_max_context=enforce_rosa_max_context,
         use_length_bucketing=False,
         device=torch.device("cpu"),
         prefetch_factor=getattr(args, "prefetch_factor", None),
-        in_order=False,
+        in_order=True,
+        include_audit=True,
+        audit_source_default=os.path.abspath(os.path.expanduser(args.train)),
     )
 
     offsets = array("q")
     lengths = array("i")
+    cache_audit = _new_cache_audit()
+    ordered_record_hasher = hashlib.sha256()
+    ordered_record_hasher.update(b"hierarchos-token-cache-record-stream-v1\0")
     total_bytes = 0
     write_buffer = bytearray()
     flush_bytes = max(
@@ -1528,6 +2011,9 @@ def materialize_local_token_cache(args, tokenizer):
             for batch in progress:
                 if batch is None:
                     continue
+                _consume_cache_audit(batch, cache_audit)
+                if "input_ids" not in batch:
+                    continue
                 batch_lengths = _batch_effective_lengths(batch)
                 cache_batch = _prepare_token_cache_batch(
                     batch,
@@ -1548,6 +2034,7 @@ def materialize_local_token_cache(args, tokenizer):
                         length,
                         layout=storage_layout,
                         precompute_rosa=precompute_rosa,
+                        identity_hasher=ordered_record_hasher,
                     )
                     if write_loss_weights:
                         _append_loss_weight_runs(
@@ -1576,6 +2063,13 @@ def materialize_local_token_cache(args, tokenizer):
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise RuntimeError("Local JSONL token cache build produced no usable samples.")
 
+    ordered_record_sha256 = ordered_record_hasher.hexdigest()
+    _enforce_cache_audit_budgets(args, cache_audit)
+    audit_path = os.path.join(tmp_dir, "cache_audit.json")
+    with open(audit_path, "w", encoding="utf-8") as audit_file:
+        json.dump(cache_audit, audit_file, indent=2, sort_keys=True)
+    audit_sha256 = _file_sha256(audit_path)
+
     index = {
         "format": _hf_token_cache_format(args),
         "formatter": HF_CACHE_FORMATTER_VERSION,
@@ -1588,7 +2082,12 @@ def materialize_local_token_cache(args, tokenizer):
         "has_rosa_ids": precompute_rosa,
         "rosa_sentinel": int(rosa_sentinel),
         "rosa_max_context": int(rosa_max_context),
+        "enforce_rosa_max_context": enforce_rosa_max_context,
+        "rosa_ids_context_mode": cached_rosa_context_mode,
         "rosa_training_chunk_size": int(rosa_chunk_size),
+        "ordered_record_sha256": ordered_record_sha256,
+        "ordered_record_hash_algorithm": "record-stream-v1",
+        "audit_sha256": audit_sha256,
     }
     index.update(_token_cache_index_layout(
         storage_layout,
@@ -1617,16 +2116,32 @@ def materialize_local_token_cache(args, tokenizer):
             "label_encoding": storage_layout["label_encoding"],
             "rosa_dtype": storage_layout["rosa_dtype"],
             "has_rosa_ids": precompute_rosa,
+            "rosa_max_context": int(rosa_max_context),
+            "rosa_training_chunk_size": int(rosa_chunk_size),
+            "enforce_rosa_max_context": enforce_rosa_max_context,
+            "rosa_ids_context_mode": cached_rosa_context_mode,
+            "ordered_record_sha256": ordered_record_sha256,
+            "ordered_record_hash_algorithm": "record-stream-v1",
+            "audit_sha256": audit_sha256,
+            "audit_file": "cache_audit.json",
+            "audit": {
+                "records": cache_audit["records"],
+                "accepted": cache_audit["accepted"],
+                "rejected": cache_audit["rejected"],
+                "truncated": cache_audit["truncated"],
+                "retained_tokens": cache_audit["retained_tokens"],
+                "weighted_tokens": cache_audit["weighted_tokens"],
+            },
         }, success_file, indent=2)
 
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir)
-    os.replace(tmp_dir, cache_dir)
+    _replace_cache_directory_atomically(tmp_dir, cache_dir)
     print(
         f"INFO: Local JSONL token cache ready in {cache_dir} "
         f"({len(lengths)} samples, {total_bytes / (1024 ** 3):.2f} GiB)."
     )
-    return cache_dir
+    return _attach_token_cache_identity(args, cache_dir)
 
 
 def create_hf_training_dataloader(args, tokenizer, device):
@@ -2027,10 +2542,25 @@ def _read_model_config_defaults(model_path):
                 else:
                     state_source = {k: v for k, v in local_checkpoint.items() if torch.is_tensor(v)}
                 if state_source:
+                    inspected_state = sanitize_model_state_dict(
+                        state_source,
+                        reset_transient_ltm=False,
+                    )
                     _reject_unsupported_rwkv_state_dict(
-                        sanitize_model_state_dict(state_source, reset_transient_ltm=False),
+                        inspected_state,
                         local_checkpoint_path,
                     )
+                    if isinstance(local_checkpoint.get("config"), dict):
+                        inspected_config = dict(local_checkpoint["config"])
+                        _infer_arch_flags_from_state_dict(
+                            inspected_config,
+                            inspected_state,
+                        )
+                        validate_checkpoint_architecture_contract(
+                            local_checkpoint,
+                            inspected_config,
+                            local_checkpoint_path,
+                        )
         except FileNotFoundError:
             local_checkpoint = None
         except ValueError:
@@ -2044,6 +2574,22 @@ def _read_model_config_defaults(model_path):
     if local_checkpoint is not None and isinstance(local_checkpoint, dict):
         if isinstance(local_checkpoint.get("config"), dict):
             config = dict(local_checkpoint["config"])
+            effective = local_checkpoint.get("effective_training_config")
+            if isinstance(effective, dict):
+                config.update({
+                    key: value
+                    for key, value in effective.items()
+                    if value is not None
+                })
+            run_identity = local_checkpoint.get("run_identity")
+            if isinstance(run_identity, dict):
+                objective = run_identity.get("objective")
+                if isinstance(objective, dict):
+                    config.update({
+                        key: value
+                        for key, value in objective.items()
+                        if value is not None
+                    })
             if "completed_epoch" not in config and local_checkpoint.get("completed_epoch") is not None:
                 config["completed_epoch"] = local_checkpoint.get("completed_epoch")
             return config, local_checkpoint_path
@@ -2088,6 +2634,16 @@ def _hydrate_training_args_from_model_config(args, parser, explicit_dests):
     defaults = _parser_defaults(parser)
     hydrated = []
 
+    if (
+        "architecture_revision" not in saved_config
+        and "architecture_revision" not in explicit_dests
+    ):
+        # Checkpoints predating named revisions are the legacy tensor/function
+        # contract. Do not let the new-from-scratch CLI default alter their data
+        # preprocessing before the strict loader gets a chance to validate them.
+        args.architecture_revision = "legacy-v8"
+        hydrated.append("architecture_revision")
+
     completed_epoch = saved_config.get("completed_epoch")
     completed_epoch_int = None
     if completed_epoch is not None:
@@ -2117,11 +2673,6 @@ def _hydrate_training_args_from_model_config(args, parser, explicit_dests):
         if current is None or current == default:
             setattr(args, key, value)
             hydrated.append(key)
-
-    if "train_prompt_tokens" not in explicit_dests:
-        if not bool(getattr(args, "train_prompt_tokens", True)):
-            hydrated.append("train_prompt_tokens")
-        args.train_prompt_tokens = True
 
     if not hydrated and getattr(args, "base_completed_epoch", 0) <= 0:
         return
@@ -2252,7 +2803,12 @@ def main():
     path_group.add_argument("--out-dir", type=str, default="./hierarchos_model", help="Directory to save the new model/adapter.")
     path_group.add_argument("--tokenizer-path", type=str, default=None, help="Path or HF name of the tokenizer.") 
     path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="Path to a training checkpoint .pt file.")
-    path_group.add_argument("--shadow-model-path", type=str, default=None, help="Path to full-precision model for quantized learning.")
+    path_group.add_argument(
+        "--shadow-model-path",
+        type=str,
+        default=None,
+        help="Reserved legacy argument; quantized online learning is unsupported.",
+    )
 
     data_fmt_group = parser.add_mutually_exclusive_group()
     data_fmt_group.add_argument("--pre_chunked_dataset", action="store_true")
@@ -2260,6 +2816,16 @@ def main():
 
     # --- Architecture Arguments ---
     arch_group = parser.add_argument_group('Architecture')
+    arch_group.add_argument(
+        "--architecture-revision",
+        choices=("coherent-v9", "legacy-v8"),
+        default="coherent-v9",
+        help=(
+            "Learned-function contract for a new model. coherent-v9 enables "
+            "corrected recurrence, hard per-row ACT, bounded ROSA, and shared "
+            "factorized token adapters. Loaded checkpoints keep their saved contract."
+        ),
+    )
     arch_group.add_argument("--context_dim", type=int, default=448)
     arch_group.add_argument("--persistent_dim", type=int, default=128)
     arch_group.add_argument("--ltm_slots", type=int, default=1024)
@@ -2275,9 +2841,21 @@ def main():
     arch_group.add_argument("--auto-max-length", action="store_true")
     arch_group.add_argument("--use-deepembed", dest="use_deepembed", action="store_true", default=True, help="Enable V8 DeepEmbed channel-mix modulation (default).")
     arch_group.add_argument("--no-deepembed", dest="use_deepembed", action="store_false", help="Disable V8 DeepEmbed for ablations or legacy checkpoints.")
+    arch_group.add_argument("--deepembed-mode", choices=("legacy-table", "shared-factorized", "off"), default=None, help="Override the revision's DeepEmbed representation for an ablation.")
     arch_group.add_argument("--use-rosa", dest="use_rosa", action="store_true", default=True, help="Enable V8 ROSA embedding path (default).")
     arch_group.add_argument("--no-rosa", dest="use_rosa", action="store_false", help="Disable V8 ROSA for ablations or legacy checkpoints.")
-    arch_group.add_argument("--rosa-max-context", dest="rosa_max_context", type=int, default=512, help="Compatibility setting retained in checkpoints; persistent ROSA carries full token history.")
+    arch_group.add_argument("--rosa-embedding-mode", choices=("legacy-table", "shared-factorized", "off"), default=None, help="Override the revision's ROSA token representation for an ablation.")
+    arch_group.add_argument("--token-adapter-rank", type=int, default=None, help="Rank of coherent-v9 shared token adapters (default: min(64, context_dim)).")
+    arch_group.add_argument("--rosa-max-context", dest="rosa_max_context", type=int, default=512, help="ROSA context bound used when --enforce-rosa-max-context is enabled; legacy checkpoints retain full history.")
+    rosa_bound_group = arch_group.add_mutually_exclusive_group()
+    rosa_bound_group.add_argument("--enforce-rosa-max-context", dest="enforce_rosa_max_context", action="store_true", default=None, help="Enable versioned, chunk-invariant bounded ROSA state (coherent-v9 default).")
+    rosa_bound_group.add_argument("--no-enforce-rosa-max-context", dest="enforce_rosa_max_context", action="store_false", help="Retain unbounded legacy ROSA history.")
+    rosa_sentinel_group = arch_group.add_mutually_exclusive_group()
+    rosa_sentinel_group.add_argument("--rosa-zero-no-prediction", dest="rosa_zero_no_prediction", action="store_true", default=None, help="Zero-mask the ROSA no-prediction sentinel (coherent-v9 default).")
+    rosa_sentinel_group.add_argument("--no-rosa-zero-no-prediction", dest="rosa_zero_no_prediction", action="store_false", help="Use the legacy trainable no-prediction sentinel.")
+    arch_group.add_argument("--core-recurrence-version", type=int, choices=(1, 2), default=None, help="Advanced recurrent-state contract override; normally selected by --architecture-revision.")
+    arch_group.add_argument("--manager-compute-mode", choices=("soft-act", "hard-masked"), default=None, help="Advanced ACT semantic override; coherent-v9 uses train/inference-parity hard selection.")
+    arch_group.add_argument("--min-h-steps", type=int, default=1, help="Minimum manager steps before a coherent-v9 hard halt may be selected.")
     arch_group.add_argument("--rwkv-head-size", "--rwkv_head_size", dest="rwkv_head_size", type=int, default=None, help="RWKV matrix-state head size. Default auto-selects 64 when divisible, else a smaller divisor.")
     arch_group.add_argument("--rwkv-channel-mix-key-clamp", "--rwkv_channel_mix_key_clamp", dest="rwkv_channel_mix_key_clamp", type=float, default=12.0, help="Clamp RWKV channel-mix key preactivation before squared ReLU; 0 disables.")
     arch_group.add_argument("--rwkv-channel-mix-deepembed-clamp", "--rwkv_channel_mix_deepembed_clamp", dest="rwkv_channel_mix_deepembed_clamp", type=float, default=4.0, help="Clamp DeepEmbed's multiplicative RWKV channel-mix modulation before value projection; 0 disables.")
@@ -2285,8 +2863,24 @@ def main():
     # --- Training Arguments ---
     train_group = parser.add_argument_group('Training')
     train_group.add_argument("--epochs", type=int, default=3)
+    train_group.add_argument(
+        "--seed",
+        type=int,
+        default=1337,
+        help="Global Python/NumPy/PyTorch/DataLoader seed persisted in exact-resume identity.",
+    )
     train_group.add_argument("--batch_size", type=int, default=64)
     train_group.add_argument("--accumulation-steps", "--accumulation_steps", dest="accumulation_steps", type=int, default=1)
+    train_group.add_argument(
+        "--accumulation-normalization",
+        choices=("weighted-token", "microbatch"),
+        default="weighted-token",
+        help=(
+            "How accumulated microbatches are combined. weighted-token matches one "
+            "batch using supervised loss-weight mass; microbatch preserves the legacy "
+            "equal-microbatch objective."
+        ),
+    )
     train_group.add_argument("--starting-lr", type=float, default=1e-4)
     train_group.add_argument("--min-lr", type=float, default=1e-6)
     train_group.add_argument("--warmup-steps", "--warmup_steps", dest="warmup_steps", type=int, default=0, help="Optimizer update steps spent linearly warming from --min-lr to --starting-lr. Overrides --warmup-ratio when >0.")
@@ -2371,7 +2965,15 @@ def main():
     train_group.add_argument("--response-loss-weight", type=float, default=1.0, help="Per-token CE weight for completion/assistant response tokens.")
     train_group.add_argument("--response-boundary-loss-weight", type=float, default=1.0, help="Multiplier for the first N response tokens after ### Response.")
     train_group.add_argument("--response-boundary-tokens", type=int, default=0, help="Number of initial response tokens to multiply by --response-boundary-loss-weight.")
-    train_group.add_argument("--min-response-tokens", type=int, default=1, help="Minimum non-EOS assistant response tokens to keep when truncating prompt-completion rows.")
+    train_group.add_argument(
+        "--min-response-tokens",
+        type=int,
+        default=1,
+        help=(
+            "Reject prompt-completion rows whose tokenized assistant output is shorter "
+            "than this many non-EOS tokens, and preserve at least this many when truncating."
+        ),
+    )
     train_group.add_argument("--allow-empty-completions", dest="drop_empty_completions", action="store_false", help="Keep prompt-completion rows with blank completions instead of dropping them.")
     train_group.set_defaults(drop_empty_completions=True)
     train_group.add_argument(
@@ -2392,22 +2994,37 @@ def main():
     train_group.add_argument("--max-ce-loss-for-backward", type=float, default=0.0, help="Clamp finite CE loss used for backward (0 disables; recommended for from-scratch training).")
     train_group.add_argument("--max-commitment-cost-for-backward", type=float, default=2.0, help="Clamp finite commitment cost used for backward to prevent auxiliary loss explosions (0 disables).")
     train_group.add_argument("--max-ponder-cost-for-backward", type=float, default=0.0, help="Clamp finite ponder cost used for backward (0 disables).")
-    train_group.add_argument("--halt-logit-clamp", type=float, default=30.0, help="Forward-pass clamp for ACT halt logits after NaN/Inf repair.")
-    train_group.add_argument("--recurrent-state-clamp", type=float, default=50.0, help="Forward-pass clamp for H/L recurrent states after NaN/Inf repair.")
-    train_group.add_argument("--context-state-clamp", type=float, default=50.0, help="Forward-pass clamp for manager context states after NaN/Inf repair.")
-    train_group.add_argument("--drift-state-clamp", type=float, default=5.0, help="Forward-pass clamp for worker drift states after NaN/Inf repair.")
+    train_group.add_argument("--halt-logit-clamp", type=float, default=30.0, help="Clamp finite ACT halt logits; NaN/Inf trajectories are rejected.")
+    train_group.add_argument("--recurrent-state-clamp", type=float, default=50.0, help="Clamp finite H/L recurrent states; NaN/Inf trajectories are rejected.")
+    train_group.add_argument("--context-state-clamp", type=float, default=50.0, help="Clamp finite manager context states; NaN/Inf trajectories are rejected.")
+    train_group.add_argument("--drift-state-clamp", type=float, default=5.0, help="Clamp finite worker drift states; NaN/Inf trajectories are rejected.")
     train_group.add_argument("--drift-norm-clamp", type=float, default=0.0, help="Optional L2 norm clamp for worker drift states (0 disables). Useful for commit/drift rescue resumes.")
     train_group.add_argument("--drift-delta-scale", type=float, default=1.0, help="Scale applied to each worker drift update before accumulation. Values below 1 tame commit/drift growth.")
-    train_group.add_argument("--activation-clamp", type=float, default=100.0, help="Forward-pass clamp for internal manager/worker activations after NaN/Inf repair.")
+    train_group.add_argument("--activation-clamp", type=float, default=100.0, help="Clamp finite manager/worker activations; NaN/Inf trajectories are rejected.")
     train_group.add_argument("--ponder-loss-weight", type=float, default=0.01)
     train_group.add_argument("--commitment-loss-weight", type=float, default=0.5)
     train_group.add_argument("--commitment-threshold", type=float, default=0.05)
     train_group.add_argument("--l_conv_atol", "--l-conv-atol", type=float, default=1e-4, help="Converge tolerance for WorkerLoop. Default: 1e-4.")
     train_group.add_argument("--detach_every_n_steps", "--detach-every-n-steps", type=int, default=32, help="RWKV state detachment frequency. Use 0 to disable; default: 32.")
     train_group.add_argument("--h_halt_thresh", "--h-halt-thresh", type=float, default=0.9, help="H-RNN halt probability threshold. Default: 0.9.")
+    train_group.add_argument("--act-depth-temperature", type=float, default=0.05, help="Temperature of the coherent-v9 straight-through hard-depth surrogate; forward ponder cost remains the actual executed manager depth.")
     train_group.add_argument("--encourage-thinking", action="store_true", help="Invert ponder loss to REWARD thinking (for recovery training).")
-    train_group.add_argument("--adaptive-ponder", action="store_true", help="Scale ponder target based on CE loss (more thinking for harder content).")
+    adaptive_ponder_group = train_group.add_mutually_exclusive_group()
+    adaptive_ponder_group.add_argument("--adaptive-ponder", dest="adaptive_ponder", action="store_true", default=None, help="Match ACT depth to detached CE difficulty (coherent-v9 default).")
+    adaptive_ponder_group.add_argument("--no-adaptive-ponder", dest="adaptive_ponder", action="store_false", help="Use a fixed compute penalty instead of difficulty-adaptive ACT.")
     train_group.add_argument("--ponder-target-scale", type=float, default=0.5, help="Scaling factor for adaptive ponder target. Default: 0.5.")
+    train_group.add_argument(
+        "--ponder-objective",
+        choices=("auto", "symmetric-huber", "legacy-one-sided"),
+        default=None,
+        help="Adaptive ACT target loss. auto selects symmetric-huber for coherent-v9 and the historical one-sided loss for legacy-v8.",
+    )
+    train_group.add_argument(
+        "--ponder-huber-beta",
+        type=float,
+        default=0.5,
+        help="Transition width for the coherent-v9 symmetric adaptive-ponder loss.",
+    )
     train_group.add_argument("--no-memory-token-routers", dest="memory_token_routers", action="store_false", help="Disable per-token ROSA/LTM memory routers and use scalar gates only.")
     train_group.add_argument("--memory-gate-warmup-steps", "--memory_gate_warmup_steps", dest="memory_gate_warmup_steps", type=int, default=2000, help="Training batches used to softly keep ROSA/LTM gates open before decaying to learned gates.")
     train_group.add_argument("--memory-gate-warmup-floor", "--memory_gate_warmup_floor", dest="memory_gate_warmup_floor", type=float, default=0.10, help="Initial minimum memory gate floor during warmup. Decays to 0 over --memory-gate-warmup-steps.")
@@ -2417,7 +3034,20 @@ def main():
         "--override_scheduling",
         dest="override_scheduling",
         action="store_true",
-        help="When resuming, ignore optimizer/scheduler/scaler state and use the current LR schedule args.",
+        help=(
+            "Legacy compatibility alias for BOTH --reset-optimizer-state and "
+            "--rebuild-lr-schedule. Prefer the explicit flags."
+        ),
+    )
+    train_group.add_argument(
+        "--rebuild-lr-schedule",
+        action="store_true",
+        help="On resume, keep optimizer/scaler moments but rebuild LR schedules over remaining work.",
+    )
+    train_group.add_argument(
+        "--reset-optimizer-state",
+        action="store_true",
+        help="On resume, intentionally discard optimizer/scaler moments while preserving the saved LR schedule unless rebuilt explicitly.",
     )
     train_group.add_argument("--persist-state", action="store_true", default=False, help="Persist RNN/LTM states between batches. Default: False.")
     train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable recurrent-value persistence between unrelated DataLoader batches; within-sample recurrence remains active.")
@@ -2524,6 +3154,36 @@ def main():
     train_group.add_argument("--token-cache-build-batch-size", type=int, default=0, help="Local-cache preprocessing batch size (0 = auto, up to 512).")
     train_group.add_argument("--token-cache-write-buffer-mb", type=int, default=64, help="Buffered binary-cache write size in MiB.")
     train_group.add_argument("--token-cache-only", action="store_true", help="Build/reuse the selected token cache and exit before allocating the model (useful on a cheaper CPU machine).")
+    train_group.add_argument(
+        "--max-cache-rejected-samples",
+        type=int,
+        default=0,
+        help="Absolute rejected-row budget during cache construction (default 0).",
+    )
+    train_group.add_argument(
+        "--max-cache-rejected-fraction",
+        type=float,
+        default=0.0,
+        help="Rejected-row fraction budget; the larger count/fraction budget applies.",
+    )
+    train_group.add_argument(
+        "--max-cache-truncated-samples",
+        type=int,
+        default=-1,
+        help="Absolute overlength/truncated-row budget (-1 uses only the fraction budget).",
+    )
+    train_group.add_argument(
+        "--max-cache-truncated-fraction",
+        type=float,
+        default=0.05,
+        help="Maximum fraction of accepted rows that may be truncated before cache construction fails.",
+    )
+    train_group.add_argument(
+        "--max-skipped-train-batches",
+        type=int,
+        default=0,
+        help="Abort after more than this many OOM/nonfinite/unsupervised training batches.",
+    )
     train_group.add_argument("--amp", action="store_true", help="Enable mixed precision (auto-enabled on CUDA).")
     train_group.add_argument("--no-amp", dest="amp", action="store_false", help="Explicitly disable mixed precision.")
     train_group.add_argument("--dataset-size", type=int, default=None, help="Force a specific dataset size (total samples) to calculate steps for the LR scheduler.")
@@ -2567,6 +3227,19 @@ def main():
         help="Limit samples per task for fast evaluation runs (e.g., 10 for quick tests).")
     eval_group.add_argument("--eval-steps", type=int, default=None,
         help="Run evaluation every N training steps (for quick testing). Triggers periodically.")
+    eval_group.add_argument(
+        "--best-checkpoint-metric",
+        type=str,
+        default=None,
+        metavar="TASK:METRIC",
+        help="Save hierarchos_best.pt only when this finite lm-eval metric improves, e.g. hellaswag:acc_norm,none. Requires --eval-tasks and fails closed if evaluation is unavailable.",
+    )
+    eval_group.add_argument(
+        "--best-checkpoint-mode",
+        choices=("max", "min"),
+        default="max",
+        help="Whether higher or lower values improve --best-checkpoint-metric.",
+    )
     eval_group.add_argument("--benchmark-suite", type=str, nargs='+', default=None,
         help="Post-training benchmark suite(s) for benchmark mode. Examples: frontier-text, frontier, math, coding, arc-agi-family.")
     eval_group.add_argument("--benchmark", type=str, nargs='+', default=None,
@@ -2639,14 +3312,41 @@ def main():
     
     normalized_argv = _normalize_optional_bool_flags(
         sys.argv[1:],
-        ("--override-scheduling", "--override_scheduling"),
+        (
+            "--override-scheduling",
+            "--override_scheduling",
+            "--rebuild-lr-schedule",
+            "--reset-optimizer-state",
+        ),
     )
     args = parser.parse_args(normalized_argv)
+    if args.mode == "quantize":
+        print(
+            "ERROR: Quantized export is intentionally disabled for the active "
+            "RWKV matrix-state/coherent-v9 architecture."
+        )
+        print(
+            "       The legacy scalar-RWKV exporter cannot preserve DeepEmbed, "
+            "ROSA, ACT, Worker, or recurrent-state semantics. Use a full-precision "
+            ".pt checkpoint until a v8/v9 parity-tested exporter is available."
+        )
+        sys.exit(2)
     explicit_dests = _explicit_cli_dests(parser, normalized_argv)
+    args._explicit_cli_dests = sorted(explicit_dests)
     _hydrate_training_args_from_model_config(args, parser, explicit_dests)
     _apply_assistant_recovery_defaults(args, explicit_dests)
     _apply_benchmark_preset_defaults(args, explicit_dests)
+    apply_architecture_revision_defaults(args)
     _validate_resume_epoch_target(args)
+    if bool(getattr(args, "override_scheduling", False)):
+        args.rebuild_lr_schedule = True
+        args.reset_optimizer_state = True
+        print(
+            "WARNING: --override-scheduling is the legacy combined reset. "
+            "It aliases --reset-optimizer-state plus --rebuild-lr-schedule."
+        )
+    if args.mode in ("train", "finetune"):
+        set_global_training_seed(getattr(args, "seed", 1337))
 
     if args.mode == "benchmark" and args.list_benchmarks:
         if format_benchmark_catalog is None:
@@ -2666,6 +3366,15 @@ def main():
         if skipped_eval_specs:
             skipped_names = ", ".join(spec.display_name for spec in skipped_eval_specs)
             print(f"INFO: Skipping non-lm-eval benchmark entries in --eval-tasks: {skipped_names}")
+    if getattr(args, "best_checkpoint_metric", None):
+        if args.mode != "train":
+            parser.error(
+                "--best-checkpoint-metric is currently supported by train mode"
+            )
+        if not args.eval_tasks:
+            parser.error(
+                "--best-checkpoint-metric requires at least one runnable --eval-tasks entry"
+            )
 
     # Parity: hidden size auto-sync
     if args.mode == 'train' and not args.resume_from_ckpt:
@@ -2712,6 +3421,8 @@ def main():
             if tokenizer.eos_token: tokenizer.pad_token = tokenizer.eos_token
             else: tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         configure_tokenizer_length(tokenizer, args.max_length)
+        if args.mode in ("train", "finetune"):
+            _ensure_tokenizer_identity(args, tokenizer)
     except Exception as e:
         print(f"ERROR: Failed to load tokenizer: {e}"); sys.exit(1)
 
@@ -2809,6 +3520,14 @@ def main():
         
         if dataloader is None:
             print("ERROR: No dataset provided for training. Use --train or --hf_dataset."); sys.exit(1)
+        if bool(getattr(args, "persist_state", False)) and not bool(
+            getattr(getattr(dataloader, "dataset", None), "guarantees_contiguous_state", False)
+        ):
+            raise ValueError(
+                "--persist-state is unsafe for ordinary shuffled/length-bucketed "
+                "independent samples. The selected dataset does not declare contiguous "
+                "same-sequence lane ordering; use --no-persist-state."
+            )
 
         if args.dataset_size:
             dataloader_len = _steps_from_samples(args.dataset_size, args.batch_size)
@@ -3024,9 +3743,16 @@ def main():
         # Create inference-ready checkpoint. Use the same canonical filename as
         # training export so chat cannot accidentally load an older sibling.
         model_path = os.path.join(output_dir, "hierarchos.pt")
+        exported_architecture_contract = architecture_contract(config)
+        exported_architecture_hash = architecture_contract_hash(config)
+        config["architecture_contract_sha256"] = exported_architecture_hash
         inference_checkpoint = {
+            'checkpoint_version': 4,
+            'checkpoint_kind': 'inference',
             'model_state_dict': clean_state_dict,
             'config': config,
+            'architecture_contract': exported_architecture_contract,
+            'architecture_contract_sha256': exported_architecture_hash,
             'completed_epoch': completed_epoch,
             'training_complete': True,
             'converted_from': os.path.basename(ckpt_path),

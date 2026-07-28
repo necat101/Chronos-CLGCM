@@ -1,5 +1,16 @@
 # Hierarchos Architecture Audit
 
+> **2026-07-28 coherent-v9 remediation:** The issues identified after the
+> epoch-15 coherence investigation have been implemented as a new
+> learned-function revision. Corrected recurrence/ACT, bounded ROSA, shared
+> token adapters, memory and warmup-state parity, deterministic data/resume
+> identity, fail-closed non-finite handling, checkpoint contracts, and immutable
+> best-metric selection are documented in
+> [COHERENT_V9_MIGRATION.md](COHERENT_V9_MIGRATION.md). Existing v2/v3 weights
+> retain `legacy-v8` behavior; they cannot be relabeled as corrected v9 weights.
+> The supported path is full-precision `hierarchos_cli.py`. Quantized `.npz`
+> paths and direct execution of the legacy monolith now fail closed.
+
 > **2026-07-16 update:** This May audit is retained as historical architectural
 > context. The current v0.21 code and real epoch-13 checkpoint validation are
 > documented in [EPOCH13_CHECKPOINT_AUDIT.md](EPOCH13_CHECKPOINT_AUDIT.md). The
@@ -140,7 +151,9 @@ Notable mismatch:
 - The active modular `RWKVCell` uses matrix-state parameters such as `x_r`, `w0/w1/w2`, `a0/a1/a2`, `r_k`, `key_cm`, and `value_cm`.
 - The modular CLI accepts `quantize` as a mode, but the execution branch currently falls through to "not yet fully integrated."
 
-Therefore, quantized CPU/Vulkan inference should be treated as experimental or legacy until a v8-compatible exporter and loader are verified end to end.
+Therefore, current quantized CPU/Vulkan inference is disabled and fails closed.
+The older implementation remains only as historical reference until a
+matrix-state exporter and loader are verified end to end.
 
 ## Verification Performed
 
@@ -191,7 +204,7 @@ For each token, Hierarchos embeds the token id and optionally adds a learned gat
 | "ROSA is neurosymbolic reasoning" | Overstated. It is deterministic suffix-automaton pattern prediction injected as a learned feature path. |
 | "Outperforms Transformers" | Not established by this repo. |
 | "AGI path/decisive step" | Not scientifically supported. |
-| "Quantized Vulkan inference is current" | Not fully supported in the active modular path; appears legacy/stale relative to current RWKV cell. |
+| "Quantized Vulkan inference is current" | False. The legacy path is disabled; coherent-v9 is full-precision only. |
 | "GUI is part of the architecture" | No. The GUI is tooling around the Python backend, not a model component. |
 
 ## Open Scientific Questions

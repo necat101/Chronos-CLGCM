@@ -12,7 +12,9 @@ from hierarchos.training.datasets import EpochShuffleSampler, LengthGroupedBatch
 from hierarchos.training.trainer import (
     build_hierarchos_optimizer,
     build_training_checkpoint,
+    build_exact_resume_identity,
     build_lr_scheduler,
+    capture_effective_training_config,
     capture_ltm_lr_scheduler_state,
     capture_dataloader_state,
     accumulation_divisor_for_step,
@@ -23,8 +25,10 @@ from hierarchos.training.trainer import (
     advance_ltm_lr_schedule,
     restore_dataloader_state,
     restore_model_grad_state,
+    restore_scheduler_state_and_live_lrs,
     save_training_checkpoint_if_finite,
     should_step_accumulation,
+    supervised_weight_mass,
     train_step,
     training_state_is_finite,
     _sanitize_model_nonfinite_,
@@ -35,8 +39,13 @@ from hierarchos.training.trainer import (
     configure_finetune_ltm_mode,
     ltm_inner_updates_enabled,
     normalize_ltm_training_mode,
+    validate_exact_resume_identity,
 )
-from hierarchos.utils.checkpoint import sanitize_model_state_dict
+from hierarchos.utils.checkpoint import (
+    load_checkpoint_payload_compatible,
+    sanitize_model_state_dict,
+)
+from hierarchos.utils.rosa import ROSAState
 import hierarchos_cli
 
 
@@ -69,6 +78,15 @@ class _FakeDeepEmbedModel(nn.Module):
         self.l_deepemb = nn.Embedding(4, 8)
         self.tok_emb = nn.Embedding(4, 2)
         self.proj = nn.Linear(2, 2)
+
+
+class _RawRWKVMatrixModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.ones(4, 4))
+        self.a1 = nn.Parameter(torch.ones(4, 2))
+        self.r_k = nn.Parameter(torch.ones(4, 4))
+        self.norm_scale = nn.Parameter(torch.ones(4))
 
 
 class _CountingLTM:
@@ -202,6 +220,23 @@ class _FiniteLinearLossModel(_NaNLossModel):
     def forward(self, **kwargs):
         return {
             "loss": self.weight,
+            "ponder_cost": torch.zeros((), device=self.weight.device),
+            "commitment_cost": torch.zeros((), device=self.weight.device),
+            "raw_topk_vals": None,
+            "ltm_memory_state": None,
+            "h_state": None,
+            "l_state": None,
+            "prev_context": None,
+            "target_context": None,
+            "drift_state": None,
+        }
+
+
+class _InputScaledLossModel(_NaNLossModel):
+    def forward(self, **kwargs):
+        scale = kwargs["input_ids"][:, 0].to(dtype=self.weight.dtype).mean()
+        return {
+            "loss": self.weight * scale,
             "ponder_cost": torch.zeros((), device=self.weight.device),
             "commitment_cost": torch.zeros((), device=self.weight.device),
             "raw_topk_vals": None,
@@ -437,6 +472,44 @@ def test_lr_scheduler_warms_up_then_cosine_decays():
     assert 1e-5 < initial_lr < 1e-3
     assert abs(warmed_lr - 1e-3) < 1e-12
     assert abs(final_lr - 1e-5) < 1e-12
+
+
+def test_scheduler_resume_restores_live_optimizer_lr_exactly():
+    model = _FakeTrainModel()
+    args = SimpleNamespace(
+        disable_lr_schedule=False,
+        starting_lr=1e-3,
+        min_lr=1e-5,
+        warmup_steps=2,
+        warmup_ratio=0.0,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = build_lr_scheduler(optimizer, args, num_update_steps=20)
+    for _ in range(7):
+        optimizer.step()
+        scheduler.step()
+    saved_optimizer = optimizer.state_dict()
+    saved_scheduler = scheduler.state_dict()
+    expected_live_lr = optimizer.param_groups[0]["lr"]
+
+    resumed_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    resumed_optimizer.load_state_dict(saved_optimizer)
+    resumed_scheduler = build_lr_scheduler(
+        resumed_optimizer,
+        args,
+        num_update_steps=20,
+    )
+    assert resumed_optimizer.param_groups[0]["lr"] != expected_live_lr
+
+    restored = restore_scheduler_state_and_live_lrs(
+        resumed_scheduler,
+        resumed_optimizer,
+        saved_scheduler,
+        "test.pt",
+    )
+    assert restored == [expected_live_lr]
+    assert resumed_optimizer.param_groups[0]["lr"] == expected_live_lr
+    assert resumed_scheduler.get_last_lr() == [expected_live_lr]
 
 
 def test_ltm_lr_cosine_schedule_decays_and_advances():
@@ -689,6 +762,44 @@ def test_cli_checkpoint_preflight_fails_before_dataset_work_on_unsafe_payload(tm
         hierarchos_cli._read_model_config_defaults(str(checkpoint_path))
 
 
+def test_safe_checkpoint_loader_accepts_project_owned_rosa_resume_state(tmp_path):
+    checkpoint_path = tmp_path / "hierarchos_epoch_1_step_1.pt"
+    rosa_state = ROSAState.new()
+    rosa_state.tokens.extend([1, 2, 3])
+    torch.save(
+        {
+            "model_state_dict": {},
+            "config": {"completed_epoch": 0},
+            "running_states": (
+                None,
+                None,
+                None,
+                None,
+                None,
+                (None, None, None, [rosa_state]),
+            ),
+        },
+        checkpoint_path,
+    )
+
+    loaded = load_checkpoint_payload_compatible(
+        str(checkpoint_path),
+        map_location="cpu",
+    )
+
+    restored = loaded["running_states"][5][3][0]
+    assert isinstance(restored, ROSAState)
+    assert restored.tokens == [1, 2, 3]
+
+
+def test_effective_training_config_canonicalizes_detach_zero():
+    effective = capture_effective_training_config(
+        SimpleNamespace(detach_every_n_steps=0)
+    )
+
+    assert effective["detach_every_n_steps"] is None
+
+
 def test_assistant_recovery_defaults_target_large_assistant_sft():
     parser, args = _continuation_parser_and_args(epochs=3)
     args.assistant_recovery = True
@@ -769,6 +880,19 @@ def test_deepembed_weights_are_excluded_from_weight_decay():
     assert id(model.h_deepemb.weight) not in decay_params
     assert id(model.l_deepemb.weight) not in decay_params
     assert id(model.tok_emb.weight) in decay_params
+
+
+def test_raw_rwkv_matrices_receive_v2_weight_decay():
+    model = _RawRWKVMatrixModel()
+    args = SimpleNamespace(starting_lr=1e-3, rwkv_weight_decay=0.1)
+
+    optimizer = build_hierarchos_optimizer(model, args, torch.device("cpu"))
+
+    decay_params = set(map(id, optimizer.param_groups[0]["params"]))
+    no_decay_params = set(map(id, optimizer.param_groups[1]["params"]))
+    assert {id(model.w1), id(model.a1), id(model.r_k)} <= decay_params
+    assert id(model.norm_scale) in no_decay_params
+    assert args._optimizer_grouping_version == 2
 
 
 def test_read_only_ltm_training_skips_inner_update_but_carries_state():
@@ -986,6 +1110,7 @@ def test_cli_resume_checkpoint_preserves_explicit_colab_overrides():
                 "min_lr",
                 "ltm_lr",
                 "min_ltm_lr",
+                "train_prompt_tokens",
                 "rwkv_channel_mix_key_clamp",
                 "rwkv_channel_mix_deepembed_clamp",
             },
@@ -1002,6 +1127,26 @@ def test_cli_resume_checkpoint_preserves_explicit_colab_overrides():
     assert args.rwkv_channel_mix_deepembed_clamp == 2.0
     assert args.train_prompt_tokens is True
     assert args.resume_completed_epoch == 11
+
+
+def test_cli_resume_preserves_saved_masked_prompt_objective_by_default():
+    checkpoint = {
+        "config": {"train_prompt_tokens": False},
+        "completed_epoch": 1,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_path = os.path.join(tmp, "masked.pt")
+        torch.save(checkpoint, ckpt_path)
+        parser, args = _continuation_parser_and_args(
+            resume_from_ckpt=ckpt_path,
+            epochs=2,
+        )
+        hierarchos_cli._hydrate_training_args_from_model_config(
+            args,
+            parser,
+            explicit_dests={"epochs", "out_dir"},
+        )
+    assert args.train_prompt_tokens is False
 
 
 def test_inference_sanitization_still_clears_transient_ltm():
@@ -1388,6 +1533,60 @@ def test_train_step_flushes_tail_accumulation_with_real_divisor():
     assert abs(model.weight.item() - 0.9) < 1e-6
 
 
+def test_weighted_token_accumulation_matches_combined_loss_mass():
+    model = _InputScaledLossModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+    args = SimpleNamespace(
+        amp=False,
+        training_chunk_size=8,
+        compile=False,
+        pad_token_id=0,
+        padding_metrics=False,
+        cpu_chunked_lm_loss=False,
+        cuda_chunked_lm_loss=False,
+        grad_clip=100.0,
+        accumulation_normalization="weighted-token",
+    )
+    first = {
+        "input_ids": torch.tensor([[2, 1, 1]], dtype=torch.long),
+        "labels": torch.tensor([[2, 1, 1]], dtype=torch.long),
+        "loss_weights": torch.tensor([[0.0, 0.5, 0.5]]),
+    }
+    second = {
+        "input_ids": torch.tensor([[4, 1, 1]], dtype=torch.long),
+        "labels": torch.tensor([[4, 1, 1]], dtype=torch.long),
+        "loss_weights": torch.tensor([[0.0, 1.5, 1.5]]),
+    }
+    assert supervised_weight_mass(first) == 1.0
+    assert supervised_weight_mass(second) == 3.0
+
+    _outputs, states = train_step(
+        model,
+        first,
+        optimizer,
+        scaler=None,
+        accumulation_steps=2,
+        step=0,
+        args=args,
+        running_states=(None, None, None, None, None, None),
+    )
+    assert args._accumulation_weighted_token_mass == 1.0
+    _outputs, _states = train_step(
+        model,
+        second,
+        optimizer,
+        scaler=None,
+        accumulation_steps=2,
+        step=1,
+        args=args,
+        running_states=states,
+    )
+
+    # Combined objective gradient = (1*2 + 3*4) / (1+3) = 3.5.
+    assert abs(model.weight.item() - (1.0 - 3.5)) < 1e-6
+    assert args._accumulation_weighted_token_mass == 0.0
+
+
 def test_train_step_passes_one_token_label_lookahead_across_chunks():
     model = _BoundaryRecordingModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -1506,8 +1705,26 @@ def test_checkpoint_save_allows_clean_state_and_writes_file():
 
         assert saved is True
         assert os.path.exists(path)
+        assert os.path.exists(path + ".sha256")
         assert torch.all(model.ltm.fast_vals == 3.0)
         assert torch.all(loaded["model_state_dict"]["ltm.fast_vals"] == 3.0)
+        verified = load_checkpoint_payload_compatible(path, map_location="cpu")
+        assert verified["training_complete"] is False
+
+
+def test_checkpoint_checksum_rejects_post_save_corruption(tmp_path):
+    path = str(tmp_path / "corrupt.pt")
+    from hierarchos.utils.checkpoint import save_checkpoint_safely
+
+    save_checkpoint_safely({"value": torch.arange(4)}, path)
+    with open(path, "r+b") as checkpoint_file:
+        checkpoint_file.seek(-1, os.SEEK_END)
+        byte = checkpoint_file.read(1)
+        checkpoint_file.seek(-1, os.SEEK_END)
+        checkpoint_file.write(bytes([byte[0] ^ 0xFF]))
+
+    with pytest.raises(RuntimeError, match="SHA-256 verification failed"):
+        load_checkpoint_payload_compatible(path, map_location="cpu")
 
 
 def test_checkpoint_save_rejects_poisoned_gradient_without_mutating_it():
@@ -1647,3 +1864,61 @@ def test_epoch_shuffle_sampler_state_restores_epoch_order():
     assert sampler.seed == 321
     assert sampler.epoch == 3
     assert list(iter(sampler)) == expected_order
+
+
+def test_exact_resume_identity_rejects_cursor_geometry_change():
+    class _Tokenizer:
+        def __len__(self):
+            return 8
+
+    dataset = TensorDataset(torch.arange(8))
+    loader = DataLoader(dataset, batch_size=2)
+    args = SimpleNamespace(
+        seed=123,
+        batch_size=2,
+        accumulation_steps=1,
+        accumulation_normalization="weighted-token",
+        max_length=16,
+        training_chunk_size=4,
+        train_prompt_tokens=True,
+        prompt_loss_weight=1.0,
+        response_loss_weight=1.0,
+        response_boundary_loss_weight=1.0,
+        response_boundary_tokens=0,
+        min_response_tokens=1,
+        drop_empty_completions=True,
+        _optimizer_grouping_version=2,
+        _token_cache_identity={
+            "cache_key": "abc",
+            "ordered_record_sha256": "1" * 64,
+            "samples": 8,
+        },
+    )
+    architecture = {"architecture_revision": "legacy-v8"}
+    saved_identity = build_exact_resume_identity(
+        args,
+        _Tokenizer(),
+        loader,
+        len(loader),
+        architecture,
+    )
+    validate_exact_resume_identity(
+        {"run_identity": saved_identity},
+        saved_identity,
+        "checkpoint.pt",
+    )
+
+    args.batch_size = 4
+    changed_identity = build_exact_resume_identity(
+        args,
+        _Tokenizer(),
+        loader,
+        len(loader),
+        architecture,
+    )
+    with pytest.raises(RuntimeError, match="batch_size"):
+        validate_exact_resume_identity(
+            {"run_identity": saved_identity},
+            changed_identity,
+            "checkpoint.pt",
+        )
