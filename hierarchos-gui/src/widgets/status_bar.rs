@@ -1,7 +1,7 @@
 // widgets/status_bar.rs — Bottom status bar with device info and metrics
 
 use crate::theme::HierarchosColors;
-use egui::{self, Color32, RichText, Rounding, Stroke, Ui, Vec2};
+use egui::{self, RichText, Stroke, Ui};
 
 pub struct StatusBarInfo {
     pub device: String,

@@ -1,7 +1,7 @@
 // widgets/message_bubble.rs — Chat message bubble with glassmorphism styling
 
 use crate::theme::{get_accent, HierarchosColors};
-use egui::{self, Color32, Pos2, Rect, RichText, Rounding, Stroke, Ui, Vec2};
+use egui::{self, Color32, CornerRadius as Rounding, RichText, Stroke, Ui, Vec2};
 
 pub enum MessageRole {
     User,

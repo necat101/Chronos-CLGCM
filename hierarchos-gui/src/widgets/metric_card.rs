@@ -1,7 +1,7 @@
 // widgets/metric_card.rs — Dashboard metric card with glassmorphism styling
 
 use crate::theme::HierarchosColors;
-use egui::{self, Color32, RichText, Rounding, Stroke, TextStyle, Ui, Vec2};
+use egui::{self, Color32, CornerRadius as Rounding, RichText, Stroke, TextStyle, Ui, Vec2};
 
 pub struct MetricCard<'a> {
     pub title: &'a str,

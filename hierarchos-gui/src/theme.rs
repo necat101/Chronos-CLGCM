@@ -3,7 +3,10 @@
 // Runtime accent color system with 5 curated palettes.
 // All accent-dependent colors are resolved through get_accent().
 
-use egui::{epaint::Shadow, Color32, FontFamily, FontId, Rounding, Stroke, Style, Vec2, Visuals};
+use egui::{
+    epaint::Shadow, Color32, CornerRadius as Rounding, FontFamily, FontId, Stroke, Style, Vec2,
+    Visuals,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Global accent palette index — updated from Settings, read everywhere.
@@ -14,7 +17,6 @@ static ACCENT_IDX: AtomicUsize = AtomicUsize::new(0);
 pub struct AccentPalette {
     pub primary: Color32,
     pub primary_dim: Color32,
-    pub primary_hover: Color32,
     pub secondary: Color32,
     pub border: Color32,
     pub border_active: Color32,
@@ -27,7 +29,6 @@ pub const ACCENT_PALETTES: [AccentPalette; 5] = [
     AccentPalette {
         primary: Color32::from_rgb(99, 102, 241),
         primary_dim: Color32::from_rgb(67, 69, 180),
-        primary_hover: Color32::from_rgb(129, 132, 252),
         secondary: Color32::from_rgb(139, 92, 246),
         border: Color32::from_rgba_premultiplied(99, 102, 241, 40),
         border_active: Color32::from_rgba_premultiplied(99, 102, 241, 100),
@@ -37,7 +38,6 @@ pub const ACCENT_PALETTES: [AccentPalette; 5] = [
     AccentPalette {
         primary: Color32::from_rgb(139, 92, 246),
         primary_dim: Color32::from_rgb(109, 62, 206),
-        primary_hover: Color32::from_rgb(167, 139, 250),
         secondary: Color32::from_rgb(192, 132, 252),
         border: Color32::from_rgba_premultiplied(139, 92, 246, 40),
         border_active: Color32::from_rgba_premultiplied(139, 92, 246, 100),
@@ -47,7 +47,6 @@ pub const ACCENT_PALETTES: [AccentPalette; 5] = [
     AccentPalette {
         primary: Color32::from_rgb(34, 211, 238),
         primary_dim: Color32::from_rgb(22, 163, 184),
-        primary_hover: Color32::from_rgb(103, 232, 249),
         secondary: Color32::from_rgb(6, 182, 212),
         border: Color32::from_rgba_premultiplied(34, 211, 238, 40),
         border_active: Color32::from_rgba_premultiplied(34, 211, 238, 100),
@@ -57,7 +56,6 @@ pub const ACCENT_PALETTES: [AccentPalette; 5] = [
     AccentPalette {
         primary: Color32::from_rgb(16, 185, 129),
         primary_dim: Color32::from_rgb(5, 150, 105),
-        primary_hover: Color32::from_rgb(52, 211, 153),
         secondary: Color32::from_rgb(110, 231, 183),
         border: Color32::from_rgba_premultiplied(16, 185, 129, 40),
         border_active: Color32::from_rgba_premultiplied(16, 185, 129, 100),
@@ -67,7 +65,6 @@ pub const ACCENT_PALETTES: [AccentPalette; 5] = [
     AccentPalette {
         primary: Color32::from_rgb(244, 63, 94),
         primary_dim: Color32::from_rgb(190, 40, 70),
-        primary_hover: Color32::from_rgb(251, 113, 133),
         secondary: Color32::from_rgb(253, 164, 175),
         border: Color32::from_rgba_premultiplied(244, 63, 94, 40),
         border_active: Color32::from_rgba_premultiplied(244, 63, 94, 100),

@@ -3,7 +3,7 @@
 // Allows searching, browsing, and downloading Hierarchos models directly
 // from the HuggingFace Hub.
 
-use egui::{self, ProgressBar, RichText, Rounding, ScrollArea, Stroke, Vec2};
+use egui::{self, CornerRadius as Rounding, ProgressBar, RichText, ScrollArea, Stroke, Vec2};
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};

@@ -3,7 +3,7 @@
 // Manages navigation, routes events from the Python bridge to panels,
 // and renders the top bar, active panel, and status bar.
 
-use egui::{self, Color32, RichText, Rounding, Stroke};
+use egui::{self, Color32, CornerRadius as Rounding, RichText, Stroke};
 
 use crate::bridge::{BridgeEvent, PythonBridge};
 use crate::panels::chat::{draw_chat_panel, ChatState};
@@ -102,10 +102,23 @@ impl HierarchosApp {
                 }
                 BridgeEvent::GenerationComplete => {
                     self.chat_state.on_generation_complete();
-                    if self.bridge.is_connected() {
+                    if self.bridge.is_connected()
+                        && !self.bridge.is_training()
+                        && !self.bridge.is_loading()
+                    {
                         self.bridge
                             .save_chat_runtime_state(self.chat_state.runtime_state_path_string());
                     }
+                }
+                BridgeEvent::TrainingComplete { status } => {
+                    self.training_state.is_training = false;
+                    let message = match status.as_str() {
+                        "completed" => "Training completed.".to_string(),
+                        "stopped" => "Training stopped safely.".to_string(),
+                        "rejected" => "Training request was rejected.".to_string(),
+                        _ => "Training ended with an error.".to_string(),
+                    };
+                    self.training_state.log_messages.push(message);
                 }
                 BridgeEvent::TrainingMetrics {
                     epoch,
@@ -148,8 +161,9 @@ impl HierarchosApp {
                             "Full Precision"
                         }
                     ));
-                    // Auto-request model info
-                    self.bridge.request_model_info();
+                    // Full per-parameter statistics require reductions over
+                    // every weight tensor. Keep that cost on the Inspector's
+                    // explicit Refresh action instead of every model load.
                     if self.chat_state.runtime_state_exists() {
                         self.bridge
                             .load_chat_runtime_state(self.chat_state.runtime_state_path_string());

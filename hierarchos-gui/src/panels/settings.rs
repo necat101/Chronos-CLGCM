@@ -4,7 +4,7 @@
 
 use crate::bridge::PythonBridge;
 use crate::theme::{self, get_accent, HierarchosColors};
-use egui::{self, Color32, RichText, Rounding, ScrollArea, Stroke, Vec2};
+use egui::{self, Color32, CornerRadius as Rounding, RichText, ScrollArea, Stroke, Vec2};
 
 /// Application settings state.
 pub struct AppSettings {

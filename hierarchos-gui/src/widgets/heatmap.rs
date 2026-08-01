@@ -1,7 +1,7 @@
 // widgets/heatmap.rs — LTM Memory Heatmap Visualization
 
 use crate::theme::HierarchosColors;
-use egui::{self, Color32, Pos2, Rect, RichText, Rounding, Stroke, Ui, Vec2};
+use egui::{self, Color32, CornerRadius as Rounding, Pos2, Rect, RichText, Stroke, Ui, Vec2};
 
 /// Renders a heatmap grid for LTM memory values.
 pub fn draw_heatmap(ui: &mut Ui, data: &[Vec<f32>], title: &str, width: f32, height: f32) {

@@ -7,7 +7,7 @@
 use crate::bridge::{PythonBridge, SamplingParams};
 use crate::theme::{get_accent, HierarchosColors};
 use crate::widgets::message_bubble::{typing_indicator, MessageBubble, MessageRole};
-use egui::{self, Color32, RichText, Rounding, ScrollArea, Stroke, Vec2};
+use egui::{self, Color32, CornerRadius as Rounding, RichText, ScrollArea, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -646,8 +646,11 @@ fn draw_input_area(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBrid
                 }
             } else {
                 // Send button
+                let can_submit =
+                    !bridge.is_generating() && !bridge.is_training() && !bridge.is_loading();
                 let send_clicked = ui
-                    .add(
+                    .add_enabled(
+                        can_submit,
                         egui::Button::new(
                             RichText::new("Send →")
                                 .color(HierarchosColors::TEXT_ON_PRIMARY)
@@ -659,7 +662,10 @@ fn draw_input_area(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBrid
                     )
                     .clicked();
 
-                if (send_clicked || enter_pressed) && !state.input_text.trim().is_empty() {
+                if can_submit
+                    && (send_clicked || enter_pressed)
+                    && !state.input_text.trim().is_empty()
+                {
                     let text = state.input_text.trim().to_string();
                     state.input_text.clear();
 

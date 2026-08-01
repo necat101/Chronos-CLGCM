@@ -6,7 +6,7 @@
 use crate::bridge::{PythonBridge, TrainingConfig};
 use crate::theme::{get_accent, HierarchosColors};
 use crate::widgets::metric_card::{progress_bar_labeled, MetricCard};
-use egui::{self, Color32, RichText, Rounding, ScrollArea, Stroke, Vec2};
+use egui::{self, CornerRadius as Rounding, RichText, ScrollArea, Stroke};
 use egui_plot::{Line, Plot, PlotPoints};
 
 /// Training state.
@@ -125,8 +125,13 @@ pub fn draw_training_panel(ui: &mut egui::Ui, state: &mut TrainingState, bridge:
                             state.is_training = false;
                         }
                     } else {
+                        let can_start = bridge.is_model_loaded()
+                            && !bridge.is_generating()
+                            && !bridge.is_loading()
+                            && !bridge.is_training();
                         if ui
-                            .add(
+                            .add_enabled(
+                                can_start,
                                 egui::Button::new(
                                     RichText::new("▶ Start Training")
                                         .color(HierarchosColors::TEXT_ON_PRIMARY)
@@ -137,16 +142,14 @@ pub fn draw_training_panel(ui: &mut egui::Ui, state: &mut TrainingState, bridge:
                             )
                             .clicked()
                         {
-                            if bridge.is_model_loaded() {
-                                state.is_training = true;
-                                state.loss_history.clear();
-                                state.lr_history.clear();
-                                state.ponder_history.clear();
-                                state.commitment_history.clear();
-                                state.tps_history.clear();
-                                state.log_messages.clear();
-                                bridge.start_training(state.config.clone());
-                            }
+                            state.is_training = true;
+                            state.loss_history.clear();
+                            state.lr_history.clear();
+                            state.ponder_history.clear();
+                            state.commitment_history.clear();
+                            state.tps_history.clear();
+                            state.log_messages.clear();
+                            bridge.start_training(state.config.clone());
                         }
                     }
 
@@ -459,6 +462,10 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                     && state.config.full_sample_bptt
                 {
                     state.config.persist_state = false;
+                    // Exact full-sample recurrence retains the entire graph.
+                    // Start in the memory-safe mode; advanced users can still
+                    // explicitly turn recomputation back off afterwards.
+                    state.config.full_sample_activation_checkpointing = true;
                 }
                 ui.label(
                     RichText::new("Activation Recompute")
@@ -474,6 +481,24 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                 )
                 .on_hover_text("Recompute the full forward during backward to save VRAM without truncating gradients.");
                 ui.end_row();
+
+                ui.label(
+                    RichText::new("Checkpoint Segment")
+                        .color(HierarchosColors::TEXT_SECONDARY)
+                        .size(12.0),
+                );
+                ui.add_enabled(
+                    state.config.full_sample_bptt
+                        && state.config.full_sample_activation_checkpointing,
+                    egui::DragValue::new(
+                        &mut state.config.full_sample_checkpoint_segment_size,
+                    )
+                    .range(1..=4096),
+                )
+                .on_hover_text("Tokens per activation-recompute segment; smaller values reduce peak VRAM at extra compute cost.");
+                ui.label("");
+                ui.label("");
+                ui.end_row();
             });
 
         ui.add_space(8.0);
@@ -482,18 +507,11 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("Model Architecture")
+                RichText::new("Loaded Model Architecture (locked)")
                     .color(HierarchosColors::TEXT_PRIMARY)
                     .size(13.0)
                     .strong(),
             );
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Tie H/L to Context").clicked() {
-                    state.config.h_hidden = state.config.context_dim;
-                    state.config.l_hidden = state.config.context_dim;
-                }
-            });
         });
         ui.add_space(6.0);
 
@@ -506,7 +524,10 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.context_dim).range(32..=4096));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.context_dim).range(32..=4096),
+                );
                 ui.label(
                     RichText::new("Max Length")
                         .color(HierarchosColors::TEXT_SECONDARY)
@@ -526,13 +547,19 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.h_hidden).range(32..=4096));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.h_hidden).range(32..=4096),
+                );
                 ui.label(
                     RichText::new("L Hidden")
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.l_hidden).range(32..=4096));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.l_hidden).range(32..=4096),
+                );
                 ui.end_row();
 
                 ui.label(
@@ -540,13 +567,19 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.persistent_dim).range(1..=2048));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.persistent_dim).range(1..=2048),
+                );
                 ui.label(
                     RichText::new("H Stride")
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.h_stride).range(1..=64));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.h_stride).range(1..=64),
+                );
                 ui.end_row();
 
                 ui.label(
@@ -554,13 +587,19 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.ltm_slots).range(1..=65536));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.ltm_slots).range(1..=65536),
+                );
                 ui.label(
                     RichText::new("LTM Top-K")
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.ltm_topk).range(1..=64));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.ltm_topk).range(1..=64),
+                );
                 ui.end_row();
 
                 ui.label(
@@ -568,13 +607,19 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.ltm_key_dim).range(8..=2048));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.ltm_key_dim).range(8..=2048),
+                );
                 ui.label(
                     RichText::new("LTM Val Dim")
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.ltm_val_dim).range(8..=2048));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.ltm_val_dim).range(8..=2048),
+                );
                 ui.end_row();
 
                 ui.label(
@@ -582,13 +627,19 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.max_h_steps).range(1..=64));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.max_h_steps).range(1..=64),
+                );
                 ui.label(
                     RichText::new("Max L Steps")
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.add(egui::DragValue::new(&mut state.config.max_l_steps).range(1..=64));
+                ui.add_enabled(
+                    false,
+                    egui::DragValue::new(&mut state.config.max_l_steps).range(1..=64),
+                );
                 ui.end_row();
             });
 

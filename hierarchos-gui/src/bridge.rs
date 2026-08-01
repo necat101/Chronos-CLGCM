@@ -24,6 +24,8 @@ pub enum BridgeEvent {
     Token(String),
     /// Generation has completed.
     GenerationComplete,
+    /// Training reached a terminal state.
+    TrainingComplete { status: String },
     /// Training metrics for a step.
     TrainingMetrics {
         epoch: u32,
@@ -81,6 +83,14 @@ pub struct ModelConfig {
     pub max_h_steps: u32,
     pub max_l_steps: u32,
     pub persistent_dim: u32,
+    #[serde(default = "default_training_chunk_size")]
+    pub training_chunk_size: u32,
+    #[serde(default)]
+    pub full_sample_bptt: bool,
+    #[serde(default = "default_activation_checkpointing")]
+    pub full_sample_activation_checkpointing: bool,
+    #[serde(default = "default_checkpoint_segment_size")]
+    pub full_sample_checkpoint_segment_size: u32,
     pub is_quantized: bool,
     pub device: String,
     #[serde(default)]
@@ -152,6 +162,18 @@ fn default_cpu_threads() -> u32 {
         .max(1)
 }
 
+fn default_training_chunk_size() -> u32 {
+    256
+}
+
+fn default_activation_checkpointing() -> bool {
+    true
+}
+
+fn default_checkpoint_segment_size() -> u32 {
+    128
+}
+
 /// Training configuration sent to the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -164,6 +186,7 @@ pub struct TrainingConfig {
     pub training_chunk_size: u32,
     pub full_sample_bptt: bool,
     pub full_sample_activation_checkpointing: bool,
+    pub full_sample_checkpoint_segment_size: u32,
     pub accumulation_steps: u32,
     pub grad_clip: f32,
     pub persist_state: bool,
@@ -193,9 +216,10 @@ impl Default for TrainingConfig {
             batch_size: 64,
             learning_rate: 1e-4,
             min_lr: 1e-6,
-            training_chunk_size: 256,
+            training_chunk_size: default_training_chunk_size(),
             full_sample_bptt: false,
             full_sample_activation_checkpointing: true,
+            full_sample_checkpoint_segment_size: 128,
             accumulation_steps: 1,
             grad_clip: 1.0,
             persist_state: false,
@@ -233,6 +257,10 @@ impl TrainingConfig {
         self.max_h_steps = model.max_h_steps;
         self.max_l_steps = model.max_l_steps;
         self.max_length = model.max_length;
+        self.training_chunk_size = model.training_chunk_size;
+        self.full_sample_bptt = model.full_sample_bptt;
+        self.full_sample_activation_checkpointing = model.full_sample_activation_checkpointing;
+        self.full_sample_checkpoint_segment_size = model.full_sample_checkpoint_segment_size;
     }
 }
 
@@ -303,7 +331,10 @@ fn resolve_backend_launch(python_path: &str) -> Result<BackendLaunch, String> {
 
     let script = crate::embedded::extract_embedded_python()?;
     let pythonpath = crate::embedded::get_python_base_dir();
-    let python = if requested.is_empty() || requested.eq_ignore_ascii_case("bundled") {
+    let python = if requested.is_empty()
+        || requested.eq_ignore_ascii_case("auto")
+        || requested.eq_ignore_ascii_case("bundled")
+    {
         "python".to_string()
     } else {
         requested.to_string()
@@ -508,6 +539,15 @@ impl PythonBridge {
                                 generating.store(false, Ordering::SeqCst);
                                 tx.send(BridgeEvent::GenerationComplete).ok();
                             }
+                            "training_complete" => {
+                                training.store(false, Ordering::SeqCst);
+                                let status = msg
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("completed")
+                                    .to_string();
+                                tx.send(BridgeEvent::TrainingComplete { status }).ok();
+                            }
                             "training_metrics" => {
                                 tx.send(BridgeEvent::TrainingMetrics {
                                     epoch: msg.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
@@ -633,6 +673,8 @@ impl PythonBridge {
         let connected = self.connected.clone();
         let connecting = self.connecting.clone();
         let model_loaded = self.model_loaded.clone();
+        let generating = self.generating.clone();
+        let training = self.training.clone();
         let loading = self.loading.clone();
 
         self.runtime.spawn(async move {
@@ -651,6 +693,8 @@ impl PythonBridge {
             connected.store(false, Ordering::SeqCst);
             connecting.store(false, Ordering::SeqCst);
             model_loaded.store(false, Ordering::SeqCst);
+            generating.store(false, Ordering::SeqCst);
+            training.store(false, Ordering::SeqCst);
             loading.store(false, Ordering::SeqCst);
         });
     }
@@ -707,6 +751,22 @@ impl PythonBridge {
 
     /// Load a model from the given directory path.
     pub fn load_model(&self, model_path: String, device: String) {
+        if !self.connected.load(Ordering::SeqCst) {
+            self.event_tx
+                .send(BridgeEvent::Error(
+                    "Connect to the backend before loading a model.".to_string(),
+                ))
+                .ok();
+            return;
+        }
+        if self.generating.load(Ordering::SeqCst) || self.training.load(Ordering::SeqCst) {
+            self.event_tx
+                .send(BridgeEvent::Error(
+                    "Stop generation or training before loading another model.".to_string(),
+                ))
+                .ok();
+            return;
+        }
         if self.loading.swap(true, Ordering::SeqCst) {
             self.event_tx
                 .send(BridgeEvent::Status(
@@ -769,7 +829,32 @@ impl PythonBridge {
 
     /// Send a chat message and stream tokens back.
     pub fn send_message(&self, message: String, params: SamplingParams) {
-        self.generating.store(true, Ordering::SeqCst);
+        if !self.connected.load(Ordering::SeqCst) || !self.model_loaded.load(Ordering::SeqCst) {
+            self.event_tx
+                .send(BridgeEvent::Error(
+                    "Connect and load a model before generating.".to_string(),
+                ))
+                .ok();
+            self.event_tx.send(BridgeEvent::GenerationComplete).ok();
+            return;
+        }
+        if self.loading.load(Ordering::SeqCst) || self.training.load(Ordering::SeqCst) {
+            self.event_tx
+                .send(BridgeEvent::Error(
+                    "Generation is unavailable while loading or training.".to_string(),
+                ))
+                .ok();
+            self.event_tx.send(BridgeEvent::GenerationComplete).ok();
+            return;
+        }
+        if self.generating.swap(true, Ordering::SeqCst) {
+            self.event_tx
+                .send(BridgeEvent::Status(
+                    "Generation is already in progress.".to_string(),
+                ))
+                .ok();
+            return;
+        }
         self.send_rpc(
             "generate",
             serde_json::json!({
@@ -798,7 +883,40 @@ impl PythonBridge {
 
     /// Start a training run.
     pub fn start_training(&self, config: TrainingConfig) {
-        self.training.store(true, Ordering::SeqCst);
+        if !self.connected.load(Ordering::SeqCst) || !self.model_loaded.load(Ordering::SeqCst) {
+            self.event_tx
+                .send(BridgeEvent::Error(
+                    "Connect and load a model before training.".to_string(),
+                ))
+                .ok();
+            self.event_tx
+                .send(BridgeEvent::TrainingComplete {
+                    status: "rejected".to_string(),
+                })
+                .ok();
+            return;
+        }
+        if self.loading.load(Ordering::SeqCst) || self.generating.load(Ordering::SeqCst) {
+            self.event_tx
+                .send(BridgeEvent::Error(
+                    "Training is unavailable while loading or generating.".to_string(),
+                ))
+                .ok();
+            self.event_tx
+                .send(BridgeEvent::TrainingComplete {
+                    status: "rejected".to_string(),
+                })
+                .ok();
+            return;
+        }
+        if self.training.swap(true, Ordering::SeqCst) {
+            self.event_tx
+                .send(BridgeEvent::Status(
+                    "Training is already in progress.".to_string(),
+                ))
+                .ok();
+            return;
+        }
         self.send_rpc(
             "start_training",
             serde_json::json!({
@@ -810,6 +928,7 @@ impl PythonBridge {
                 "training_chunk_size": config.training_chunk_size,
                 "full_sample_bptt": config.full_sample_bptt,
                 "full_sample_activation_checkpointing": config.full_sample_activation_checkpointing,
+                "full_sample_checkpoint_segment_size": config.full_sample_checkpoint_segment_size,
                 "accumulation_steps": config.accumulation_steps,
                 "grad_clip": config.grad_clip,
                 "persist_state": config.persist_state,
@@ -835,13 +954,11 @@ impl PythonBridge {
 
     /// Stop ongoing generation.
     pub fn stop_generation(&self) {
-        self.generating.store(false, Ordering::SeqCst);
         self.send_rpc("stop_generation", serde_json::json!({}));
     }
 
     /// Stop ongoing training.
     pub fn stop_training(&self) {
-        self.training.store(false, Ordering::SeqCst);
         self.send_rpc("stop_training", serde_json::json!({}));
     }
 

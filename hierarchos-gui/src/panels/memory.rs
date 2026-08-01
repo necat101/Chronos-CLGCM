@@ -6,7 +6,7 @@
 use crate::bridge::PythonBridge;
 use crate::theme::{get_accent, HierarchosColors};
 use crate::widgets::heatmap::draw_heatmap;
-use egui::{self, Color32, RichText, Rounding, ScrollArea, Stroke, Vec2};
+use egui::{self, CornerRadius as Rounding, RichText, ScrollArea, Stroke, Vec2};
 
 /// Memory visualizer state.
 pub struct MemoryVisualizerState {
@@ -87,6 +87,10 @@ pub fn draw_memory_panel(
     state: &mut MemoryVisualizerState,
     bridge: &PythonBridge,
 ) {
+    let can_snapshot = bridge.is_model_loaded()
+        && !bridge.is_generating()
+        && !bridge.is_training()
+        && !bridge.is_loading();
     ui.vertical(|ui| {
         // Header
         ui.horizontal(|ui| {
@@ -109,7 +113,7 @@ pub fn draw_memory_panel(
                 ui.separator();
 
                 // Manual refresh
-                if ui.add(egui::Button::new(
+                if ui.add_enabled(can_snapshot, egui::Button::new(
                     RichText::new("↻ Snapshot")
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
@@ -125,7 +129,10 @@ pub fn draw_memory_panel(
         ui.add_space(8.0);
 
         // Auto-refresh logic
-        if state.auto_refresh && state.last_refresh.elapsed().as_millis() > state.refresh_interval_ms as u128 {
+        if can_snapshot
+            && state.auto_refresh
+            && state.last_refresh.elapsed().as_millis() > state.refresh_interval_ms as u128
+        {
             bridge.request_ltm_snapshot();
         }
 

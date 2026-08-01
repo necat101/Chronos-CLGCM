@@ -3,9 +3,9 @@
 // Displays a tree view of model layers, parameter counts,
 // weight statistics, and hyperparameter configuration.
 
-use crate::bridge::{LayerInfo, ModelConfig, ModelInspection, PythonBridge};
+use crate::bridge::{ModelConfig, ModelInspection, PythonBridge};
 use crate::theme::{get_accent, HierarchosColors};
-use egui::{self, Color32, RichText, Rounding, ScrollArea, Stroke, Vec2};
+use egui::{self, CornerRadius as Rounding, RichText, ScrollArea, Stroke};
 
 /// Inspector state.
 pub struct InspectorState {
@@ -30,6 +30,10 @@ impl Default for InspectorState {
 
 /// Draw the model inspector panel.
 pub fn draw_inspector_panel(ui: &mut egui::Ui, state: &mut InspectorState, bridge: &PythonBridge) {
+    let can_inspect = bridge.is_model_loaded()
+        && !bridge.is_generating()
+        && !bridge.is_training()
+        && !bridge.is_loading();
     ui.vertical(|ui| {
         // Header
         ui.horizontal(|ui| {
@@ -42,7 +46,8 @@ pub fn draw_inspector_panel(ui: &mut egui::Ui, state: &mut InspectorState, bridg
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add(
+                    .add_enabled(
+                        can_inspect,
                         egui::Button::new(
                             RichText::new("↻ Refresh")
                                 .color(HierarchosColors::TEXT_SECONDARY)
