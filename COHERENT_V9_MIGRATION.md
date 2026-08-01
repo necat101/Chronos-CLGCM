@@ -28,6 +28,13 @@ Existing checkpoints without an architecture revision are loaded as
 - Token-cache format v6 records ordered dataset content, tokenizer identity,
   formatting, truncation/rejection statistics, and ROSA semantics. Exact resume
   checks those identities before training.
+- Cached ROSA training consumes the precomputed prediction stream directly. It
+  no longer copies every accelerator chunk back to the host merely to rebuild a
+  duplicate token-history carrier that cannot affect cached predictions.
+- The canonical trainer validates right-padding, labels, and loss weights once
+  on the host and reuses the checked padding geometry across TBPTT chunks. Long
+  CUDA samples no longer incur one device synchronization per chunk merely to
+  repeat an unchanged batch-contract audit.
 - Gradient accumulation defaults to supervised-token-weighted normalization.
   New optimizers use corrected parameter grouping; legacy exact resumes retain
   their saved grouping.
@@ -36,7 +43,12 @@ Existing checkpoints without an architecture revision are loaded as
   warmup schedule unless explicitly requested.
 - Checkpoint format v4 stores a hashed architecture contract. Current
   checkpoints reject contract, tensor-geometry, tokenizer, or exact-run drift.
-- Chat-state v4 records that same contract plus exact recurrent layouts.
+- Independent-sample runs omit terminal recurrent/ROSA carriers from periodic
+  checkpoints because the next batch is guaranteed to reset them. Explicitly
+  contiguous streams still preserve the complete state for exact resume.
+- Chat-state v4 records that same contract plus exact recurrent layouts and is
+  bound to the originating model weights and tokenizer; it is not a portable,
+  model-neutral conversation file.
 - Optional best-checkpoint selection accepts one immutable, finite lm-eval
   metric and saves an exact-resume `hierarchos_best.pt` only on improvement.
 
@@ -48,6 +60,7 @@ Existing checkpoints without an architecture revision are loaded as
 | Chat with a coherent-v9 inference checkpoint | Supported full-precision path; architecture contract is verified before construction. |
 | Resume or chat with v2/v3 | Loaded as `legacy-v8`; its historical learned function is preserved. |
 | Turn v2/v3 into coherent-v9 by changing a flag | Unsupported. The adapter geometry and recurrent/objective semantics differ; train coherent-v9 from a fresh initialization. |
+| Expand a model's dimensions | Supported only within the authenticated source revision. `expand_model.py` binds the exact tokenizer IDs, uses semantic-block projection mapping, releases resume-only optimizer state before allocating the larger model, and atomically publishes a hashed package. Vocabulary-ID or legacy-v8-to-v9 migration is intentionally refused. |
 | Continue only the weights with a fresh optimizer | Use `--model-path`, understanding that this begins a new run rather than an exact resume. |
 | Quantized `.npz` chat/export | Intentionally unsupported. The old scalar-RWKV implementation cannot reproduce the active matrix-state architecture. |
 | Run the top-level `hierarchos.py` monolith | Unsupported. Use `hierarchos_cli.py`; the monolith is historical reference code. |
@@ -228,9 +241,11 @@ tokenizer and cache. Verify:
 5. no skipped training batch is tolerated unless an explicit nonzero budget was
    reviewed in advance.
 
-The remediation tree was validated with `389 passed, 4 skipped, 4 subtests
-passed` and `73 passed, 0 warnings, 0 failures` from the strict executable
-architecture audit. A separate CLI smoke run verified fresh checkpoint v4
+The strict executable architecture audit currently validates all `89/89`
+checks. The broad pytest count is intentionally not frozen in this document as
+the regression suite grows; a release candidate is ready only when both
+commands above finish without failures. A separate CLI smoke run verified fresh checkpoint v4
 training, safe `ROSAState` serialization, exact mid-epoch optimizer/scheduler
 resume, matching subsequent losses, final inference export, architecture-hash
-verification, and finite reloaded logits.
+verification, finite reloaded logits, and authenticated atomic expansion with
+tokenizer/provenance verification.

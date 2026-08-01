@@ -31,7 +31,9 @@ def create_test_config(compile=False):
         'max_h_steps': 5,
         'max_l_steps': 10,
         'l_conv_atol': 2e-4,
-        'h_stride': 1.5,
+        # Stride is discrete recurrence geometry; fractional values must fail
+        # closed instead of being silently truncated by the model constructor.
+        'h_stride': 2,
         'commitment_threshold': 0.055,
         'compile': compile,
         'gradient_checkpointing': False,

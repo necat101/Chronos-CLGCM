@@ -11,12 +11,13 @@
 > The supported path is full-precision `hierarchos_cli.py`. Quantized `.npz`
 > paths and direct execution of the legacy monolith now fail closed.
 
-> **2026-07-16 update:** This May audit is retained as historical architectural
-> context. The current v0.21 code and real epoch-13 checkpoint validation are
-> documented in [EPOCH13_CHECKPOINT_AUDIT.md](EPOCH13_CHECKPOINT_AUDIT.md). The
-> current executable audit reports `65 passed`, `1` documented legacy-quantization
-> warning, and `0` failures. v0.21 changes training/data execution and exact
-> recurrence semantics without adding, removing, or reshaping learned tensors.
+> **2026-08-01 release-gate status:** This May audit is retained as historical
+> architectural context. The supported coherent-v9 tree currently passes all
+> `89/89` strict executable architecture checks. Run both release-gate commands
+> in [COHERENT_V9_MIGRATION.md](COHERENT_V9_MIGRATION.md) on the candidate tree;
+> the broad pytest total is intentionally not hardcoded because the regression
+> suite grows with each remediation. The older epoch-13 control remains
+> documented in [EPOCH13_CHECKPOINT_AUDIT.md](EPOCH13_CHECKPOINT_AUDIT.md).
 
 Audit date: 2026-05-23
 
@@ -155,9 +156,13 @@ Therefore, current quantized CPU/Vulkan inference is disabled and fails closed.
 The older implementation remains only as historical reference until a
 matrix-state exporter and loader are verified end to end.
 
-## Verification Performed
+## Historical May Verification
 
-Full `pytest` execution could not be used because `pytest` is not installed in the available Python runtime. The Python 3.12.13 executable visible through the Python launcher also lacks `torch`, so it cannot run Hierarchos. The torch-capable runtime available during this audit was the PowerShell-resolved Python 3.13 WindowsApps executable.
+The following list records the environment-limited May audit, not the current
+release gate. Current candidates must use the two commands linked in the status
+note above.
+
+Full `pytest` execution could not be used in that historical environment because `pytest` was not installed in its available Python runtime. The Python 3.12.13 executable visible through the Python launcher also lacked `torch`, so it could not run Hierarchos. The torch-capable runtime available during that audit was the PowerShell-resolved Python 3.13 WindowsApps executable.
 
 Direct checks run successfully:
 

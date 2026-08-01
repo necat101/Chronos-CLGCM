@@ -54,7 +54,15 @@ from hierarchos.utils.rosa import (
     precompute_rosa_ids_for_chunks,
     rosa_context_mode,
 )
+from hierarchos.utils.tokenizer import (
+    tokenizer_identity as _tokenizer_identity,
+    tokenizer_vocab_size as _tokenizer_vocab_size,
+    validate_inference_tokenizer_identity,
+)
+from hierarchos.utils.lora_merge import merge_lora_adapter
+from hierarchos.utils.safe_loading import load_tensor_payload_safely
 from hierarchos.models.revisions import (
+    COHERENT_TRAINING_CHUNK_SIZE,
     apply_architecture_revision_defaults,
     architecture_contract,
     architecture_contract_hash,
@@ -62,6 +70,8 @@ from hierarchos.models.revisions import (
 
 HF_CACHE_FORMATTER_VERSION = "alpaca-previous-context-v6-min-response-filter"
 _RETRY_CACHE_DIRECTORY_PERMISSION_ERRORS = os.name == "nt"
+DEFAULT_TRAINING_CHUNK_SIZE = COHERENT_TRAINING_CHUNK_SIZE
+DEFAULT_CHAT_TEMPERATURE = 0.7
 
 
 def _replace_cache_directory_atomically(tmp_dir, cache_dir, *, attempts=5):
@@ -202,10 +212,16 @@ def _parse_hf_split_count(base_count, selector):
     return end - start
 
 
-def estimate_hf_dataset_size(dataset_name, dataset_config=None, split="train"):
+def estimate_hf_dataset_size(
+    dataset_name,
+    dataset_config=None,
+    split="train",
+    revision=None,
+):
     from datasets import load_dataset_builder
 
-    builder = load_dataset_builder(dataset_name, dataset_config)
+    kwargs = {"revision": revision} if revision else {}
+    builder = load_dataset_builder(dataset_name, dataset_config, **kwargs)
     info = builder.info
     split = split or "train"
     if split in info.splits:
@@ -239,54 +255,6 @@ def _batch_effective_lengths(batch):
 
 def _is_jsonl_path(path):
     return str(path).lower().endswith((".jsonl", ".ndjson"))
-
-
-def _tokenizer_vocab_size(tokenizer):
-    try:
-        return int(len(tokenizer))
-    except Exception:
-        vocab_size = getattr(tokenizer, "vocab_size", None)
-        if vocab_size is not None:
-            return int(vocab_size)
-        return 50257
-
-
-def _tokenizer_identity(tokenizer):
-    """Return a content identity, not merely a mutable tokenizer path."""
-    hasher = hashlib.sha256()
-    identity = {
-        "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
-        "vocab_size": _tokenizer_vocab_size(tokenizer),
-    }
-    name_or_path = getattr(tokenizer, "name_or_path", None)
-    if name_or_path:
-        identity["name_or_path"] = str(name_or_path)
-    try:
-        vocab = tokenizer.get_vocab()
-    except Exception:
-        vocab = None
-    if isinstance(vocab, dict):
-        for token, token_id in sorted(vocab.items(), key=lambda item: (int(item[1]), str(item[0]))):
-            encoded = str(token).encode("utf-8", errors="surrogatepass")
-            hasher.update(len(encoded).to_bytes(4, "little", signed=False))
-            hasher.update(encoded)
-            hasher.update(int(token_id).to_bytes(8, "little", signed=True))
-    else:
-        hasher.update(json.dumps(identity, sort_keys=True).encode("utf-8"))
-    special_map = getattr(tokenizer, "special_tokens_map", None)
-    if isinstance(special_map, dict):
-        normalized_specials = {
-            str(key): str(value)
-            for key, value in sorted(special_map.items())
-        }
-        hasher.update(json.dumps(
-            normalized_specials,
-            sort_keys=True,
-            ensure_ascii=False,
-        ).encode("utf-8", errors="surrogatepass"))
-        identity["special_tokens_map"] = normalized_specials
-    identity["sha256"] = hasher.hexdigest()
-    return identity
 
 
 def _ensure_tokenizer_identity(args, tokenizer):
@@ -686,7 +654,11 @@ def auto_tune_length_bucket_size_from_token_cache(args, cache_dir):
         return None
     tuning_path = os.path.join(cache_dir, "bucket_tuning.json")
     try:
-        index = torch.load(index_path, map_location="cpu")
+        index = load_tensor_payload_safely(index_path, map_location="cpu")
+        if not isinstance(index, dict) or not torch.is_tensor(index.get("lengths")):
+            raise ValueError(
+                f"Token-cache index has no tensor lengths payload: {index_path}"
+            )
         lengths = index["lengths"].to(dtype=torch.long, device="cpu")
         max_length = int(getattr(args, "max_length", 0) or 0)
         if max_length > 0:
@@ -700,7 +672,10 @@ def auto_tune_length_bucket_size_from_token_cache(args, cache_dir):
             "cache_key": index.get("cache_key"),
             "source_samples": int(lengths.numel()),
             "batch_size": int(getattr(args, "batch_size", 1) or 1),
-            "training_chunk_size": int(getattr(args, "training_chunk_size", 256) or 256),
+            "training_chunk_size": int(
+                getattr(args, "training_chunk_size", DEFAULT_TRAINING_CHUNK_SIZE)
+                or DEFAULT_TRAINING_CHUNK_SIZE
+            ),
             "max_length": max_length,
             "tolerance": float(getattr(args, "length_bucket_auto_tolerance", 0.005) or 0.0),
             "sample_limit": sample_limit,
@@ -1173,7 +1148,10 @@ def _hf_cache_key_payload(args, *, format_name, num_shards=None):
         "rosa_ids_context_mode": rosa_context_mode(
             getattr(args, "enforce_rosa_max_context", False)
         ),
-        "training_chunk_size": int(getattr(args, "training_chunk_size", 256) or 256),
+        "training_chunk_size": int(
+            getattr(args, "training_chunk_size", DEFAULT_TRAINING_CHUNK_SIZE)
+            or DEFAULT_TRAINING_CHUNK_SIZE
+        ),
     }
     if num_shards is not None:
         payload["num_shards"] = int(num_shards)
@@ -1213,7 +1191,10 @@ def _legacy_hf_shard_cache_key(args, num_shards):
         "completion_column": getattr(args, "completion_column", None),
         "precompute_rosa": bool(getattr(args, "use_rosa", True)),
         "rosa_max_context": int(getattr(args, "rosa_max_context", 512) or 512),
-        "training_chunk_size": int(getattr(args, "training_chunk_size", 256) or 256),
+        "training_chunk_size": int(
+            getattr(args, "training_chunk_size", DEFAULT_TRAINING_CHUNK_SIZE)
+            or DEFAULT_TRAINING_CHUNK_SIZE
+        ),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -1227,6 +1208,7 @@ def _estimate_hf_total_for_progress(args):
             args.hf_dataset,
             args.hf_dataset_config,
             args.hf_dataset_split,
+            revision=_hf_revision_for_load(args),
         )
     except Exception:
         return None
@@ -1251,7 +1233,11 @@ def _processed_sample_to_cached_item(processed, args=None, tokenizer=None):
             precompute_rosa_ids_for_chunks(
                 input_ids[:length].tolist(),
                 vocab_size=rosa_sentinel,
-                chunk_size=getattr(args, "training_chunk_size", 256),
+                chunk_size=getattr(
+                    args,
+                    "training_chunk_size",
+                    DEFAULT_TRAINING_CHUNK_SIZE,
+                ),
                 rosa_max_ctx=getattr(args, "rosa_max_context", 512),
                 enforce_max_context=bool(
                     getattr(args, "enforce_rosa_max_context", False)
@@ -1393,7 +1379,12 @@ def materialize_hf_dataset_pt_cache(args, tokenizer, num_shards):
                 getattr(args, "rosa_max_context", 512) or 512
             ),
             "rosa_training_chunk_size": int(
-                getattr(args, "training_chunk_size", 256) or 256
+                getattr(
+                    args,
+                    "training_chunk_size",
+                    DEFAULT_TRAINING_CHUNK_SIZE,
+                )
+                or DEFAULT_TRAINING_CHUNK_SIZE
             ),
             "enforce_rosa_max_context": bool(
                 getattr(args, "enforce_rosa_max_context", False)
@@ -1454,7 +1445,10 @@ def _legacy_hf_token_cache_key(args):
         "completion_column": getattr(args, "completion_column", None),
         "precompute_rosa": bool(getattr(args, "use_rosa", True)),
         "rosa_max_context": int(getattr(args, "rosa_max_context", 512) or 512),
-        "training_chunk_size": int(getattr(args, "training_chunk_size", 256) or 256),
+        "training_chunk_size": int(
+            getattr(args, "training_chunk_size", DEFAULT_TRAINING_CHUNK_SIZE)
+            or DEFAULT_TRAINING_CHUNK_SIZE
+        ),
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -1470,15 +1464,69 @@ def _file_sha256(path, *, chunk_bytes=8 << 20):
     return hasher.hexdigest()
 
 
+def _is_sha256_digest(value):
+    normalized = str(value or "").strip()
+    return (
+        len(normalized) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in normalized)
+    )
+
+
 def _read_token_cache_identity(cache_dir):
     index_path = os.path.join(cache_dir, "index.pt")
     success_path = os.path.join(cache_dir, "_SUCCESS")
     data_path = os.path.join(cache_dir, "tokens.bin")
     with open(success_path, "r", encoding="utf-8") as stream:
         success = json.load(stream)
-    index = torch.load(index_path, map_location="cpu", weights_only=True)
+    index = load_tensor_payload_safely(index_path, map_location="cpu")
+    if not isinstance(index, dict) or not torch.is_tensor(index.get("lengths")):
+        raise ValueError(
+            f"Token-cache index has no tensor lengths payload: {index_path}"
+        )
+    for field_name in ("cache_key", "format", "cache_payload", "audit_sha256"):
+        index_value = index.get(field_name)
+        success_value = success.get(field_name)
+        if (
+            index_value is not None
+            and success_value is not None
+            and index_value != success_value
+        ):
+            raise RuntimeError(
+                f"Token cache {field_name} metadata disagrees between index.pt "
+                f"and _SUCCESS: {cache_dir}"
+            )
+    length_count = int(index["lengths"].numel())
+    if success.get("samples") is not None:
+        try:
+            success_samples = int(success["samples"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"Token cache has an invalid sample count in _SUCCESS: {cache_dir}"
+            ) from exc
+        if success_samples != length_count:
+            raise RuntimeError(
+                f"Token cache sample count mismatch: _SUCCESS={success_samples}, "
+                f"index.pt={length_count}"
+            )
+    if success.get("bytes") is not None:
+        try:
+            success_bytes = int(success["bytes"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"Token cache has an invalid byte count in _SUCCESS: {cache_dir}"
+            ) from exc
+        actual_bytes = os.path.getsize(data_path)
+        if success_bytes != actual_bytes:
+            raise RuntimeError(
+                f"Token cache byte count mismatch: _SUCCESS={success_bytes}, "
+                f"tokens.bin={actual_bytes}"
+            )
     audit_path = os.path.join(cache_dir, str(success.get("audit_file") or "cache_audit.json"))
     expected_audit_hash = success.get("audit_sha256") or index.get("audit_sha256")
+    if expected_audit_hash and not _is_sha256_digest(expected_audit_hash):
+        raise RuntimeError(
+            f"Token cache has a malformed audit checksum: {cache_dir}"
+        )
     if expected_audit_hash and (
         not os.path.exists(audit_path)
         or _file_sha256(audit_path) != str(expected_audit_hash)
@@ -1494,6 +1542,10 @@ def _read_token_cache_identity(cache_dir):
         )
     if ordered_hash or success_hash:
         digest = str(ordered_hash or success_hash)
+        if not _is_sha256_digest(digest):
+            raise RuntimeError(
+                f"Token cache has a malformed ordered-record identity: {cache_dir}"
+            )
         algorithm = str(
             index.get("ordered_record_hash_algorithm")
             or success.get("ordered_record_hash_algorithm")
@@ -1518,8 +1570,31 @@ def _read_token_cache_identity(cache_dir):
         ).encode("utf-8"))
         digest = hasher.hexdigest()
         algorithm = "legacy-token-cache-file-v1"
-    samples = int(success.get("samples", len(index.get("lengths", []))) or 0)
-    return {
+    index_tokens_hash = index.get("tokens_sha256")
+    success_tokens_hash = success.get("tokens_sha256")
+    if (
+        index_tokens_hash
+        and success_tokens_hash
+        and str(index_tokens_hash) != str(success_tokens_hash)
+    ):
+        raise RuntimeError(
+            f"Token cache binary checksum metadata disagrees in {cache_dir}"
+        )
+    expected_tokens_hash = index_tokens_hash or success_tokens_hash
+    if expected_tokens_hash:
+        if not _is_sha256_digest(expected_tokens_hash):
+            raise RuntimeError(
+                f"Token cache has a malformed binary checksum: {cache_dir}"
+            )
+        actual_tokens_hash = _file_sha256(data_path)
+        if actual_tokens_hash != str(expected_tokens_hash):
+            raise RuntimeError(
+                "Token cache binary checksum failed for "
+                f"{data_path}: expected={str(expected_tokens_hash)!r}, "
+                f"actual={actual_tokens_hash!r}. Rebuild the cache before training."
+            )
+    samples = length_count
+    identity = {
         "cache_key": str(success.get("cache_key") or index.get("cache_key") or ""),
         "format": str(success.get("format") or index.get("format") or ""),
         "ordered_record_sha256": digest,
@@ -1532,6 +1607,11 @@ def _read_token_cache_identity(cache_dir):
         ).encode("utf-8")).hexdigest(),
         "audit_sha256": success.get("audit_sha256") or index.get("audit_sha256"),
     }
+    # Preserve exact-resume compatibility for pre-checksum v6 caches: only new
+    # caches that persisted a verifiable physical digest add this identity field.
+    if expected_tokens_hash:
+        identity["tokens_sha256"] = str(expected_tokens_hash)
+    return identity
 
 
 def _attach_token_cache_identity(args, cache_dir):
@@ -1625,7 +1705,10 @@ def materialize_hf_token_cache(args, tokenizer):
 
     precompute_rosa = bool(getattr(args, "use_rosa", True))
     rosa_sentinel = _tokenizer_vocab_size(tokenizer)
-    rosa_chunk_size = int(getattr(args, "training_chunk_size", 256) or 256)
+    rosa_chunk_size = int(
+        getattr(args, "training_chunk_size", DEFAULT_TRAINING_CHUNK_SIZE)
+        or DEFAULT_TRAINING_CHUNK_SIZE
+    )
     rosa_max_context = int(getattr(args, "rosa_max_context", 512) or 512)
     enforce_rosa_max_context = bool(
         getattr(args, "enforce_rosa_max_context", False)
@@ -1685,6 +1768,7 @@ def materialize_hf_token_cache(args, tokenizer):
     cache_audit = _new_cache_audit()
     ordered_record_hasher = hashlib.sha256()
     ordered_record_hasher.update(b"hierarchos-token-cache-record-stream-v1\0")
+    tokens_hasher = hashlib.sha256()
     total_bytes = 0
     write_buffer = bytearray()
     flush_bytes = max(
@@ -1743,9 +1827,11 @@ def materialize_hf_token_cache(args, tokenizer):
                         )
 
                     if len(write_buffer) >= flush_bytes:
+                        tokens_hasher.update(write_buffer)
                         data_file.write(write_buffer)
                         write_buffer.clear()
             if write_buffer:
+                tokens_hasher.update(write_buffer)
                 data_file.write(write_buffer)
                 write_buffer.clear()
     except Exception:
@@ -1767,6 +1853,7 @@ def materialize_hf_token_cache(args, tokenizer):
         raise RuntimeError("HF token cache build produced no usable samples.")
 
     ordered_record_sha256 = ordered_record_hasher.hexdigest()
+    tokens_sha256 = tokens_hasher.hexdigest()
     _enforce_cache_audit_budgets(args, cache_audit)
     audit_path = os.path.join(tmp_dir, "cache_audit.json")
     with open(audit_path, "w", encoding="utf-8") as audit_file:
@@ -1790,6 +1877,7 @@ def materialize_hf_token_cache(args, tokenizer):
         "rosa_training_chunk_size": int(rosa_chunk_size),
         "ordered_record_sha256": ordered_record_sha256,
         "ordered_record_hash_algorithm": "record-stream-v1",
+        "tokens_sha256": tokens_sha256,
         "audit_sha256": audit_sha256,
     }
     index.update(_token_cache_index_layout(
@@ -1826,6 +1914,7 @@ def materialize_hf_token_cache(args, tokenizer):
             "rosa_training_chunk_size": int(rosa_chunk_size),
             "ordered_record_sha256": ordered_record_sha256,
             "ordered_record_hash_algorithm": "record-stream-v1",
+            "tokens_sha256": tokens_sha256,
             "audit_sha256": audit_sha256,
             "audit_file": "cache_audit.json",
             "audit": {
@@ -1931,7 +2020,10 @@ def materialize_local_token_cache(args, tokenizer):
     text_column, prompt_column, completion_column = _local_text_columns(args)
     precompute_rosa = bool(getattr(args, "use_rosa", True))
     rosa_sentinel = _tokenizer_vocab_size(tokenizer)
-    rosa_chunk_size = int(getattr(args, "training_chunk_size", 256) or 256)
+    rosa_chunk_size = int(
+        getattr(args, "training_chunk_size", DEFAULT_TRAINING_CHUNK_SIZE)
+        or DEFAULT_TRAINING_CHUNK_SIZE
+    )
     rosa_max_context = int(getattr(args, "rosa_max_context", 512) or 512)
     enforce_rosa_max_context = bool(
         getattr(args, "enforce_rosa_max_context", False)
@@ -1988,6 +2080,7 @@ def materialize_local_token_cache(args, tokenizer):
     cache_audit = _new_cache_audit()
     ordered_record_hasher = hashlib.sha256()
     ordered_record_hasher.update(b"hierarchos-token-cache-record-stream-v1\0")
+    tokens_hasher = hashlib.sha256()
     total_bytes = 0
     write_buffer = bytearray()
     flush_bytes = max(
@@ -2048,9 +2141,11 @@ def materialize_local_token_cache(args, tokenizer):
                         )
 
                     if len(write_buffer) >= flush_bytes:
+                        tokens_hasher.update(write_buffer)
                         data_file.write(write_buffer)
                         write_buffer.clear()
             if write_buffer:
+                tokens_hasher.update(write_buffer)
                 data_file.write(write_buffer)
                 write_buffer.clear()
     except Exception:
@@ -2064,6 +2159,7 @@ def materialize_local_token_cache(args, tokenizer):
         raise RuntimeError("Local JSONL token cache build produced no usable samples.")
 
     ordered_record_sha256 = ordered_record_hasher.hexdigest()
+    tokens_sha256 = tokens_hasher.hexdigest()
     _enforce_cache_audit_budgets(args, cache_audit)
     audit_path = os.path.join(tmp_dir, "cache_audit.json")
     with open(audit_path, "w", encoding="utf-8") as audit_file:
@@ -2087,6 +2183,7 @@ def materialize_local_token_cache(args, tokenizer):
         "rosa_training_chunk_size": int(rosa_chunk_size),
         "ordered_record_sha256": ordered_record_sha256,
         "ordered_record_hash_algorithm": "record-stream-v1",
+        "tokens_sha256": tokens_sha256,
         "audit_sha256": audit_sha256,
     }
     index.update(_token_cache_index_layout(
@@ -2122,6 +2219,7 @@ def materialize_local_token_cache(args, tokenizer):
             "rosa_ids_context_mode": cached_rosa_context_mode,
             "ordered_record_sha256": ordered_record_sha256,
             "ordered_record_hash_algorithm": "record-stream-v1",
+            "tokens_sha256": tokens_sha256,
             "audit_sha256": audit_sha256,
             "audit_file": "cache_audit.json",
             "audit": {
@@ -2802,6 +2900,20 @@ def main():
     path_group.add_argument("--model-path", type=str, default=None, help="Path to the model directory.")
     path_group.add_argument("--out-dir", type=str, default="./hierarchos_model", help="Directory to save the new model/adapter.")
     path_group.add_argument("--tokenizer-path", type=str, default=None, help="Path or HF name of the tokenizer.") 
+    path_group.add_argument(
+        "--lora-adapter-path",
+        type=str,
+        default=None,
+        help="[merge-lora] Local PEFT LoRA adapter directory saved as safetensors.",
+    )
+    path_group.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help=(
+            "Explicitly allow Hugging Face tokenizer repositories to execute "
+            "custom Python code. Disabled by default."
+        ),
+    )
     path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="Path to a training checkpoint .pt file.")
     path_group.add_argument(
         "--shadow-model-path",
@@ -2831,19 +2943,37 @@ def main():
     arch_group.add_argument("--ltm_slots", type=int, default=1024)
     arch_group.add_argument("--ltm_key_dim", type=int, default=128)
     arch_group.add_argument("--ltm_val_dim", type=int, default=128)
-    arch_group.add_argument("--h_hidden", type=int, default=None, help="H-module hidden size. Defaults to context_dim; 448 gives a 64-wide RWKV head and ~233M params with GPT-2 vocab.")
-    arch_group.add_argument("--l_hidden", type=int, default=None, help="L-module hidden size. Defaults to context_dim; 448 gives a 64-wide RWKV head and ~233M params with GPT-2 vocab.")
+    arch_group.add_argument(
+        "--h_hidden",
+        type=int,
+        default=None,
+        help=(
+            "H-module hidden size. Defaults to context_dim; the complete "
+            "448/448/448 coherent-v9 model has ~30.2M parameters with the "
+            "GPT-2 vocabulary (legacy-v8 was ~232.5M)."
+        ),
+    )
+    arch_group.add_argument(
+        "--l_hidden",
+        type=int,
+        default=None,
+        help=(
+            "L-module hidden size. Defaults to context_dim; the complete "
+            "448/448/448 coherent-v9 model has ~30.2M parameters with the "
+            "GPT-2 vocabulary (legacy-v8 was ~232.5M)."
+        ),
+    )
     arch_group.add_argument("--h_stride", type=int, default=4)
     arch_group.add_argument("--max_h_steps", type=int, default=5)
     arch_group.add_argument("--max_l_steps", type=int, default=5)
     arch_group.add_argument("--ltm_topk", type=int, default=4)
     arch_group.add_argument("--max_length", type=int, default=1024)
     arch_group.add_argument("--auto-max-length", action="store_true")
-    arch_group.add_argument("--use-deepembed", dest="use_deepembed", action="store_true", default=True, help="Enable V8 DeepEmbed channel-mix modulation (default).")
-    arch_group.add_argument("--no-deepembed", dest="use_deepembed", action="store_false", help="Disable V8 DeepEmbed for ablations or legacy checkpoints.")
+    arch_group.add_argument("--use-deepembed", dest="use_deepembed", action="store_true", default=True, help="Enable DeepEmbed channel-mix modulation (default).")
+    arch_group.add_argument("--no-deepembed", dest="use_deepembed", action="store_false", help="Disable DeepEmbed for ablations or legacy checkpoints.")
     arch_group.add_argument("--deepembed-mode", choices=("legacy-table", "shared-factorized", "off"), default=None, help="Override the revision's DeepEmbed representation for an ablation.")
-    arch_group.add_argument("--use-rosa", dest="use_rosa", action="store_true", default=True, help="Enable V8 ROSA embedding path (default).")
-    arch_group.add_argument("--no-rosa", dest="use_rosa", action="store_false", help="Disable V8 ROSA for ablations or legacy checkpoints.")
+    arch_group.add_argument("--use-rosa", dest="use_rosa", action="store_true", default=True, help="Enable the ROSA embedding path (default).")
+    arch_group.add_argument("--no-rosa", dest="use_rosa", action="store_false", help="Disable ROSA for ablations or legacy checkpoints.")
     arch_group.add_argument("--rosa-embedding-mode", choices=("legacy-table", "shared-factorized", "off"), default=None, help="Override the revision's ROSA token representation for an ablation.")
     arch_group.add_argument("--token-adapter-rank", type=int, default=None, help="Rank of coherent-v9 shared token adapters (default: min(64, context_dim)).")
     arch_group.add_argument("--rosa-max-context", dest="rosa_max_context", type=int, default=512, help="ROSA context bound used when --enforce-rosa-max-context is enabled; legacy checkpoints retain full history.")
@@ -2894,10 +3024,12 @@ def main():
         "--ltm_training_mode",
         dest="ltm_training_mode",
         choices=("inner-update", "read-only"),
-        default="inner-update",
+        default=None,
         help=(
             "How training handles LTM fast memory across TBPTT chunks. "
-            "inner-update uses supervised gradient fast-memory writes; read-only carries ROSA/history state without writes, matching normal chat inference."
+            "read-only (the coherent-v9 default) carries ROSA/history state "
+            "without target-gradient writes and matches normal chat inference; "
+            "inner-update is an explicit legacy/Titans ablation."
         ),
     )
     train_group.add_argument(
@@ -3051,7 +3183,16 @@ def main():
     )
     train_group.add_argument("--persist-state", action="store_true", default=False, help="Persist RNN/LTM states between batches. Default: False.")
     train_group.add_argument("--no-persist-state", dest="persist_state", action="store_false", help="Disable recurrent-value persistence between unrelated DataLoader batches; within-sample recurrence remains active.")
-    train_group.add_argument("--training-chunk-size", "--training_chunk_size", type=int, default=256, help="TBPTT chunk size. Default 256 targets 96GB Blackwell CUDA runs; use 128 if memory gets tight.")
+    train_group.add_argument(
+        "--training-chunk-size",
+        "--training_chunk_size",
+        type=int,
+        default=None,
+        help=(
+            "TBPTT chunk size. Revision default: 256 for coherent-v9 and 128 "
+            "for legacy-v8; reduce it further if memory gets tight."
+        ),
+    )
     full_bptt_group = train_group.add_mutually_exclusive_group()
     full_bptt_group.add_argument(
         "--full-sample-bptt",
@@ -3269,7 +3410,7 @@ def main():
 
     # --- Inference & Sampling ---
     infer_group = parser.add_argument_group('Inference')
-    infer_group.add_argument("--temperature", type=float, default=1.0)
+    infer_group.add_argument("--temperature", type=float, default=DEFAULT_CHAT_TEMPERATURE)
     infer_group.add_argument("--top-k", type=int, default=40)
     infer_group.add_argument("--top-p", type=float, default=0.9)
     infer_group.add_argument("--repetition-penalty", type=float, default=1.2, help="Penalty for repeating tokens (1.0=none, >1.0=discourage). Default: 1.2.")
@@ -3279,11 +3420,15 @@ def main():
     infer_group.add_argument("--entropy-stop-top-prob", type=float, default=0.05, help="Entropy stop only triggers when the top raw token probability is at or below this value.")
     infer_group.add_argument("--eos-stop-prob", type=float, default=0.0, help="Stop once EOS has at least this raw probability after generation has started. Default 0 disables this guard.")
     infer_group.add_argument("--device", type=str, default=None, choices=["cuda", "cpu", "dml"])
-    infer_group.add_argument("--threads", type=int, default=max(1, os.cpu_count() // 2))
+    infer_group.add_argument(
+        "--threads",
+        type=int,
+        default=max(1, (os.cpu_count() or 1) // 2),
+    )
     
     # --- Chat-specific (Online Learning) ---
     chat_group = parser.add_argument_group('Chat Online Learning')
-    chat_group.add_argument("--enable-quantized-learning", action="store_true", help="Enable LTM updates for quantized models.")
+    chat_group.add_argument("--enable-quantized-learning", action="store_true", help="Reserved legacy flag; quantized online learning is unsupported by the active matrix-state architecture.")
     chat_group.add_argument("--ltm-lora-path", type=str, default=None, help="Path to save/load LTM updates as delta file.")
     chat_group.add_argument("--static-ltm-lr", action="store_true", default=True, help="Use a fixed LR for LTM updates (default).")
     chat_group.add_argument("--dynamic-ltm-lr", dest="static_ltm_lr", action="store_false", help="Enable cosine annealing for LTM updates.")
@@ -3297,8 +3442,8 @@ def main():
     chat_group.add_argument("--passive-lr", type=float, default=5e-6, help="Learning rate for passive LTM updates (default: 5e-6, very conservative).")
     chat_group.add_argument("--online-ltm-grad-clip", type=float, default=0.75, help="Value/global-norm clip for finite online LTM gradients; non-finite gradients are always rejected.")
     chat_group.add_argument("--surprise-threshold", type=float, default=1.0, help="Passive learning only writes when loss <= this threshold (default: 1.0; lower is stricter).")
-    chat_group.add_argument("--chat-state-file", type=str, nargs="?", const="auto", default=None, help="Autosave a new tiny model-neutral hierarchical chat state .pt file. Pass no value for an auto path.")
-    chat_group.add_argument("--resume-chat-from-state-file", type=str, default=None, help="Resume and autosave a tiny model-neutral hierarchical chat state .pt file.")
+    chat_group.add_argument("--chat-state-file", type=str, nargs="?", const="auto", default=None, help="Autosave a new tiny model/tokenizer-bound hierarchical chat state .pt file. Pass no value for an auto path.")
+    chat_group.add_argument("--resume-chat-from-state-file", type=str, default=None, help="Resume and autosave a model/tokenizer-bound hierarchical chat state .pt file.")
     chat_group.add_argument("--carry-chat-state", action="store_true", default=False, help="Carry recurrent/hierarchical state across user turns. Default OFF for Alpaca train/chat parity; use Previous Context text for history instead.")
     chat_group.add_argument("--chat-prefill-chunk-size", type=int, default=None, help="Chunk prompt prefill like TBPTT training. Default: checkpoint training_chunk_size; use 0 for one full prompt forward.")
     chat_group.add_argument("--chat-input-history-turns", type=int, default=0, help="For Alpaca chat, put this many previous turns in the ### Previous Context field. Default 0 matches independent SFT samples.")
@@ -3309,6 +3454,14 @@ def main():
     util_group.add_argument("--ckpt-input", type=str, default=None, help="Input checkpoint path for ckpt-2-inf mode.")
     util_group.add_argument("--inf-output", type=str, default=None, help="Output inference model path for ckpt-2-inf mode.")
     util_group.add_argument("--ckpt-tok-path", type=str, default=None, help="HuggingFace tokenizer name/path to embed in the inference model (e.g., 'gpt2', 'openai-community/gpt2').")
+    util_group.add_argument(
+        "--overwrite-merge-output",
+        action="store_true",
+        help=(
+            "[merge-lora] Atomically replace an existing output package after "
+            "the merged replacement passes full validation."
+        ),
+    )
     
     normalized_argv = _normalize_optional_bool_flags(
         sys.argv[1:],
@@ -3320,6 +3473,13 @@ def main():
         ),
     )
     args = parser.parse_args(normalized_argv)
+    if args.mode == "merge-lora":
+        if not args.model_path:
+            parser.error("merge-lora requires --model-path for the full-precision base model.")
+        if not args.lora_adapter_path:
+            parser.error("merge-lora requires --lora-adapter-path.")
+        if not args.out_dir:
+            parser.error("merge-lora requires a non-empty --out-dir.")
     if args.mode == "quantize":
         print(
             "ERROR: Quantized export is intentionally disabled for the active "
@@ -3331,6 +3491,12 @@ def main():
             ".pt checkpoint until a v8/v9 parity-tested exporter is available."
         )
         sys.exit(2)
+    if args.enable_quantized_learning or args.shadow_model_path:
+        parser.error(
+            "quantized online learning is unsupported by the active matrix-state "
+            "architecture; --enable-quantized-learning and --shadow-model-path "
+            "cannot be used"
+        )
     explicit_dests = _explicit_cli_dests(parser, normalized_argv)
     args._explicit_cli_dests = sorted(explicit_dests)
     _hydrate_training_args_from_model_config(args, parser, explicit_dests)
@@ -3416,7 +3582,10 @@ def main():
         args.model_path or args.resume_from_ckpt,
     )
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source,
+            trust_remote_code=bool(args.trust_remote_code),
+        )
         if tokenizer.pad_token is None:
             if tokenizer.eos_token: tokenizer.pad_token = tokenizer.eos_token
             else: tokenizer.add_special_tokens({'pad_token': '[PAD]'})
@@ -3540,7 +3709,12 @@ def main():
                 if args.hf_dataset:
                     print(f"INFO: Estimating size for HF dataset: {args.hf_dataset}...")
                     try:
-                        count = estimate_hf_dataset_size(args.hf_dataset, args.hf_dataset_config, args.hf_dataset_split)
+                        count = estimate_hf_dataset_size(
+                            args.hf_dataset,
+                            args.hf_dataset_config,
+                            args.hf_dataset_split,
+                            revision=_hf_revision_for_load(args),
+                        )
                         if count is not None:
                             dataloader_len = _steps_from_samples(count, args.batch_size)
                             print(f"INFO: Automatic HF session detection found {count} samples -> {dataloader_len} steps per epoch.")
@@ -3571,6 +3745,16 @@ def main():
         try:
             model, benchmark_config = load_full_model_with_config(args.model_path, pt_device)
             validate_tokenizer_vocab(tokenizer, benchmark_config, args.model_path)
+            if validate_inference_tokenizer_identity(
+                tokenizer,
+                getattr(model, "_hierarchos_checkpoint_metadata", {}),
+            ):
+                print("INFO: Benchmark tokenizer content fingerprint verified.")
+            else:
+                print(
+                    "WARNING: This legacy benchmark checkpoint has no strong "
+                    "tokenizer fingerprint; only vocabulary size was checked."
+                )
             clear_ltm_working_memory(model)
             model.suppress_hebbian = True
         except Exception as e:
@@ -3654,7 +3838,12 @@ def main():
                 if args.hf_dataset:
                     print(f"INFO: Estimating size for HF dataset: {args.hf_dataset}...")
                     try:
-                        count = estimate_hf_dataset_size(args.hf_dataset, args.hf_dataset_config, args.hf_dataset_split)
+                        count = estimate_hf_dataset_size(
+                            args.hf_dataset,
+                            args.hf_dataset_config,
+                            args.hf_dataset_split,
+                            revision=_hf_revision_for_load(args),
+                        )
                         if count is not None:
                             dataloader_len = _steps_from_samples(count, args.batch_size)
                             print(f"INFO: Automatic HF session detection found {count} samples -> {dataloader_len} steps per epoch.")
@@ -3674,6 +3863,28 @@ def main():
                     print("ERROR: Dataset size could not be determined automatically. Please use --dataset-size to specify the number of steps per epoch."); sys.exit(1)
 
         finetune(args, pt_device, tokenizer, dataloader, dataloader_len)
+    elif args.mode == "merge-lora":
+        try:
+            merged_output = merge_lora_adapter(
+                base_model_path=args.model_path,
+                adapter_path=args.lora_adapter_path,
+                output_dir=args.out_dir,
+                tokenizer=tokenizer,
+                overwrite=bool(args.overwrite_merge_output),
+            )
+        except Exception as exc:
+            print(f"ERROR: LoRA merge failed: {exc}")
+            sys.exit(1)
+        print("\n" + "=" * 60)
+        print("LORA MERGE COMPLETE")
+        print("=" * 60)
+        print(f"Standalone model: {merged_output}")
+        print("Adapter wrappers: removed")
+        print("Transient LTM state: reset")
+        print("Validation: architecture, tensor geometry, finiteness, tied weights, tokenizer")
+        print("\nTo use the merged model:")
+        print(f'  python hierarchos_cli.py chat --model-path "{merged_output}"')
+        print("=" * 60)
     elif args.mode == "ckpt-2-inf":
         # Convert checkpoint to inference model (HuggingFace-style directory)
         ckpt_path = args.ckpt_input or args.resume_from_ckpt or args.model_path
@@ -3719,7 +3930,15 @@ def main():
         
         # Load and verify tokenizer
         try:
-            inf_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+            inf_tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                trust_remote_code=bool(args.trust_remote_code),
+            )
+            if inf_tokenizer.pad_token is None:
+                if inf_tokenizer.eos_token:
+                    inf_tokenizer.pad_token = inf_tokenizer.eos_token
+                else:
+                    inf_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
             vocab_size = len(inf_tokenizer)
             print(f"  Vocab size: {vocab_size}")
             
@@ -3729,6 +3948,13 @@ def main():
                 print(f"ERROR: Model vocab_size ({model_vocab}) != tokenizer vocab_size ({vocab_size})")
                 print("       Refusing to export an inference package with an incompatible tokenizer.")
                 sys.exit(1)
+            if validate_inference_tokenizer_identity(inf_tokenizer, checkpoint):
+                print("  Tokenizer fingerprint: verified against training")
+            else:
+                print(
+                    "WARNING: Source checkpoint has no strong tokenizer fingerprint; "
+                    "the export can verify vocabulary size only."
+                )
         except Exception as e:
             print(f"ERROR: Failed to load tokenizer '{tokenizer_name}': {e}")
             sys.exit(1)
@@ -3746,9 +3972,22 @@ def main():
         exported_architecture_contract = architecture_contract(config)
         exported_architecture_hash = architecture_contract_hash(config)
         config["architecture_contract_sha256"] = exported_architecture_hash
+        carries_persistent_ltm = (
+            checkpoint.get("checkpoint_kind") == "inference-ltm-consolidated"
+            and "ltm_persistent_metadata" in checkpoint
+        )
         inference_checkpoint = {
-            'checkpoint_version': 4,
-            'checkpoint_kind': 'inference',
+            'checkpoint_version': max(
+                4,
+                int(checkpoint.get("checkpoint_version", 0) or 0),
+            ),
+            'checkpoint_kind': (
+                "inference-ltm-consolidated"
+                if carries_persistent_ltm
+                else "inference"
+            ),
+            'derived_from_checkpoint_kind': checkpoint.get("checkpoint_kind"),
+            'derived_from_checkpoint_version': checkpoint.get("checkpoint_version"),
             'model_state_dict': clean_state_dict,
             'config': config,
             'architecture_contract': exported_architecture_contract,
@@ -3758,6 +3997,22 @@ def main():
             'converted_from': os.path.basename(ckpt_path),
             'tokenizer_name': tokenizer_name,
         }
+        # Keep the exact tokenizer/run proof and any explicitly consolidated
+        # user-memory metadata. Dropping either would turn a coherent source
+        # checkpoint into an inference package whose parity or retrieval
+        # filters could no longer be verified.
+        for metadata_key in (
+            "tokenizer_identity",
+            "expansion_provenance",
+            "run_identity",
+            "best_metric_state",
+            "selection_metric",
+            "effective_training_config",
+            "optimizer_grouping_version",
+            "ltm_persistent_metadata",
+        ):
+            if metadata_key in checkpoint:
+                inference_checkpoint[metadata_key] = checkpoint[metadata_key]
         save_checkpoint_safely(inference_checkpoint, model_path)
         
         # Save config as JSON for easy inspection

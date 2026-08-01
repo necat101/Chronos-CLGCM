@@ -1,6 +1,8 @@
 import os
 import random
 import tempfile
+import hashlib
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,9 +17,13 @@ from hierarchos.inference.chat import (
     _checkpoint_has_trained_hebbian_writer,
     advance_chat_model_state,
     boundary_drift_seed,
+    build_ltm_delta_overlay,
     consolidate_ltm_state_for_save,
+    load_ltm_delta_overlay,
     ltm_replay_seed_state,
     prepare_online_ltm_gradients,
+    replay_online_feedback_with_training_recurrence,
+    resolve_wallclock_filter,
     reset_active_ltm_state,
     sample_next_token,
     tbptt_chunk_ranges,
@@ -31,6 +37,10 @@ from hierarchos.utils.checkpoint import (
     load_full_model_with_config,
     sanitize_model_state_dict,
     save_checkpoint_safely,
+)
+from hierarchos.utils.tokenizer import (
+    tokenizer_identity,
+    validate_inference_tokenizer_identity,
 )
 from test_rwkv_v8_integrity import _tiny_config
 
@@ -53,6 +63,276 @@ def test_legacy_hebbian_writer_is_blocked_until_trained():
         model(ids, allow_hebbian_update=True)
     assert not torch.equal(model.ltm.fast_vals, before)
     assert _checkpoint_has_trained_hebbian_writer(config)
+
+
+def test_versioned_ltm_overlay_load_is_cumulative_and_restores_metadata(tmp_path):
+    source = SimpleNamespace(
+        ltm=LTMModule(n_slots=4, key_dim=2, val_dim=3, forget_rate=0.2)
+    )
+    delta = torch.arange(12, dtype=torch.float32).view(4, 3) / 100.0
+    source.ltm.ltm_deltas.copy_(delta)
+    source.ltm.timestamps.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    source.ltm.sources.copy_(torch.tensor([0, 1, 2, 3]))
+    source.ltm.wallclock_timestamps.copy_(
+        torch.tensor([10.0, 20.0, 30.0, 40.0], dtype=torch.float64)
+    )
+    overlay_path = tmp_path / "memory-overlay.pt"
+    torch.save(build_ltm_delta_overlay(source), overlay_path)
+
+    target = SimpleNamespace(
+        ltm=LTMModule(n_slots=4, key_dim=2, val_dim=3, forget_rate=0.2)
+    )
+    initial_vals = target.ltm.vals.detach().clone()
+    version = load_ltm_delta_overlay(target, overlay_path)
+    assert version == 2
+    torch.testing.assert_close(target.ltm.vals, initial_vals + delta)
+    torch.testing.assert_close(target.ltm.ltm_deltas, delta)
+    torch.testing.assert_close(target.ltm.timestamps, source.ltm.timestamps)
+    assert torch.equal(target.ltm.sources, source.ltm.sources)
+    torch.testing.assert_close(
+        target.ltm.wallclock_timestamps,
+        source.ltm.wallclock_timestamps,
+    )
+
+    target.ltm.accumulate_deltas = True
+    before_fast = target.ltm.fast_vals.clone()
+    target.ltm.inner_update(
+        torch.tensor([[[0]]]),
+        torch.ones(1, 1, 1, 3),
+        current_lr=0.05,
+        timestamp=5.0,
+        tokens_covered=2,
+        inplace=True,
+    )
+    torch.testing.assert_close(
+        target.ltm.ltm_deltas,
+        delta + (target.ltm.fast_vals - before_fast),
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata_key", "metadata_value", "message"),
+    [
+        ("sources", torch.tensor([0.0, 1.0, 2.0, 3.0]), "torch.int64"),
+        (
+            "wallclock_timestamps",
+            torch.tensor([0.0, -1.0, 2.0, 3.0], dtype=torch.float64),
+            "negative",
+        ),
+    ],
+)
+def test_ltm_overlay_rejects_invalid_filter_metadata(
+    tmp_path,
+    metadata_key,
+    metadata_value,
+    message,
+):
+    target = SimpleNamespace(
+        ltm=LTMModule(n_slots=4, key_dim=2, val_dim=3, forget_rate=0.2)
+    )
+    payload = {
+        "version": 2,
+        "delta": torch.zeros_like(target.ltm.vals),
+        metadata_key: metadata_value,
+    }
+    overlay_path = tmp_path / f"invalid-{metadata_key}.pt"
+    torch.save(payload, overlay_path)
+    before_vals = target.ltm.vals.detach().clone()
+    before_deltas = target.ltm.ltm_deltas.detach().clone()
+
+    with pytest.raises(ValueError, match=message):
+        load_ltm_delta_overlay(target, overlay_path)
+    assert torch.equal(target.ltm.vals, before_vals)
+    assert torch.equal(target.ltm.ltm_deltas, before_deltas)
+
+
+def test_wallclock_filter_parser_distinguishes_relative_and_absolute_time():
+    assert resolve_wallclock_filter(0, now=100.0) == 0.0
+    assert resolve_wallclock_filter(-30, now=100.0) == 70.0
+    assert resolve_wallclock_filter(1_700_000_000, now=100.0) == 1_700_000_000
+    with pytest.raises(ValueError, match="finite"):
+        resolve_wallclock_filter(float("nan"), now=100.0)
+
+
+class _IdentityTokenizer:
+    name_or_path = "unit-test"
+    special_tokens_map = {"eos_token": "<eos>", "pad_token": "<eos>"}
+
+    def __init__(self, vocab):
+        self._vocab = dict(vocab)
+
+    def __len__(self):
+        return len(self._vocab)
+
+    def get_vocab(self):
+        return dict(self._vocab)
+
+
+class _SerializedBackend:
+    def __init__(self, normalizer):
+        self.normalizer = normalizer
+
+    def to_str(self):
+        return json.dumps({
+            "model": {"type": "WordPiece"},
+            "normalizer": {"type": self.normalizer},
+        })
+
+
+class _BehaviorIdentityTokenizer(_IdentityTokenizer):
+    def __init__(self, vocab, normalizer):
+        super().__init__(vocab)
+        self.backend_tokenizer = _SerializedBackend(normalizer)
+
+
+def test_inference_rejects_same_size_tokenizer_with_different_token_ids():
+    trained = _IdentityTokenizer({"<eos>": 0, "alpha": 1, "beta": 2})
+    current = _IdentityTokenizer({"<eos>": 0, "alpha": 2, "beta": 1})
+    metadata = {
+        "run_identity": {
+            "tokenizer": tokenizer_identity(trained),
+        }
+    }
+
+    with pytest.raises(ValueError, match="content fingerprint"):
+        validate_inference_tokenizer_identity(current, metadata)
+    assert validate_inference_tokenizer_identity(trained, metadata)
+    assert not validate_inference_tokenizer_identity(trained, {})
+
+
+def test_tokenizer_v2_identity_rejects_same_vocab_with_different_behavior():
+    vocab = {"<eos>": 0, "alpha": 1, "beta": 2}
+    trained = _BehaviorIdentityTokenizer(vocab, "NFC")
+    changed = _BehaviorIdentityTokenizer(vocab, "NFKC")
+    trained_identity = tokenizer_identity(trained)
+    changed_identity = tokenizer_identity(changed)
+
+    assert trained_identity["sha256"] == changed_identity["sha256"]
+    assert (
+        trained_identity["behavior_sha256_v2"]
+        != changed_identity["behavior_sha256_v2"]
+    )
+    with pytest.raises(ValueError, match="behavior fingerprint"):
+        validate_inference_tokenizer_identity(
+            changed,
+            {"tokenizer_identity": trained_identity},
+        )
+    assert validate_inference_tokenizer_identity(
+        trained,
+        {"tokenizer_identity": trained_identity},
+    )
+
+
+def test_legacy_tokenizer_identity_remains_vocabulary_compatible():
+    vocab = {"<eos>": 0, "alpha": 1, "beta": 2}
+    trained = _BehaviorIdentityTokenizer(vocab, "NFC")
+    changed = _BehaviorIdentityTokenizer(vocab, "NFKC")
+    legacy_identity = tokenizer_identity(trained)
+    legacy_identity.pop("behavior_sha256_v2")
+
+    # Legacy artifacts never authenticated tokenizer rules beyond the vocab.
+    # Preserve that established compatibility while all new artifacts use v2.
+    assert validate_inference_tokenizer_identity(
+        changed,
+        {"tokenizer_identity": legacy_identity},
+    )
+
+
+def test_redundant_legacy_tokenizer_copy_cannot_downgrade_v2_identity():
+    vocab = {"<eos>": 0, "alpha": 1, "beta": 2}
+    trained = _BehaviorIdentityTokenizer(vocab, "NFC")
+    changed = _BehaviorIdentityTokenizer(vocab, "NFKC")
+    strong_identity = tokenizer_identity(trained)
+    legacy_copy = dict(strong_identity)
+    legacy_copy.pop("behavior_sha256_v2")
+
+    metadata = {
+        "tokenizer_identity": legacy_copy,
+        "run_identity": {"tokenizer": strong_identity},
+    }
+    with pytest.raises(ValueError, match="behavior fingerprint"):
+        validate_inference_tokenizer_identity(changed, metadata)
+
+
+def test_tokenizer_v2_identity_fails_closed_if_backend_cannot_serialize():
+    class _BrokenBackend:
+        def to_str(self):
+            raise RuntimeError("broken backend")
+
+    tokenizer = _IdentityTokenizer({"<eos>": 0, "alpha": 1})
+    tokenizer.backend_tokenizer = _BrokenBackend()
+    with pytest.raises(ValueError, match="Could not serialize fast-tokenizer behavior"):
+        tokenizer_identity(tokenizer)
+
+
+def test_checkpoint_rejects_tampered_run_identity_metadata():
+    identity = {"version": 1, "tokenizer": {"sha256": "a" * 64}}
+    identity["sha256"] = hashlib.sha256(
+        json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    identity["tokenizer"]["sha256"] = "b" * 64
+
+    with pytest.raises(ValueError, match="Run identity SHA-256 verification"):
+        checkpoint_utils._validate_run_identity_digest(
+            {"run_identity": identity},
+            "tampered.pt",
+        )
+
+
+def test_online_feedback_replay_matches_manual_tbptt_recurrence():
+    torch.manual_seed(44)
+    config = _tiny_config()
+    config.use_deepembed = False
+    config.full_sample_bptt = False
+    config.inference_recurrence_mode = "tbptt"
+    config.training_chunk_size = 3
+    model = HierarchosCore(config).eval()
+    input_ids = torch.tensor([[1, 2, 1, 2, 3, 1, 2, 4]], dtype=torch.long)
+
+    with torch.no_grad():
+        replay = replay_online_feedback_with_training_recurrence(
+            model,
+            input_ids,
+            config=config,
+        )
+
+        state = (None, None, None, None, None, None)
+        expected_parts = []
+        for start in range(0, input_ids.shape[1], config.training_chunk_size):
+            end = min(start + config.training_chunk_size, input_ids.shape[1])
+            h, l, prev, target, drift, ltm_state = state
+            outputs, state = advance_chat_model_state(
+                model,
+                input_ids[:, start:end],
+                device=torch.device("cpu"),
+                h_state=h,
+                l_state=l,
+                prev_context=prev,
+                target_context=target,
+                drift_state=drift,
+                drift_seed=boundary_drift_seed(
+                    drift,
+                    start,
+                    config.training_chunk_size,
+                ),
+                ltm_state=ltm_state,
+                global_pos_offset=start,
+            )
+            expected_parts.append(outputs["logits"])
+
+    torch.testing.assert_close(
+        replay["logits"],
+        torch.cat(expected_parts, dim=1),
+        rtol=1e-6,
+        atol=5e-7,
+    )
+    assert len(replay["raw_topk_vals"]) == input_ids.shape[1]
+    assert replay["topk_idx"].shape[:2] == input_ids.shape
 
 
 def test_ltm_value_alignment_trains_existing_writer_without_layout_or_logit_drift():
@@ -336,6 +616,20 @@ class _LTMModel(nn.Module):
         self.ltm = LTMModule(n_slots=4, key_dim=2, val_dim=3)
 
 
+def test_inference_sanitization_clears_wallclock_working_metadata():
+    state = sanitize_model_state_dict(
+        {
+            "ltm.wallclock_timestamps": torch.full(
+                (4,),
+                1_700_000_000.0,
+                dtype=torch.float64,
+            ),
+        }
+    )
+
+    assert torch.count_nonzero(state["ltm.wallclock_timestamps"]) == 0
+
+
 def _active_ltm_state(model):
     return (
         torch.ones_like(model.ltm.fast_vals),
@@ -373,6 +667,21 @@ def test_ltm_replay_and_momentum_helpers_do_not_duplicate_context():
     reset = zero_ltm_momentum_state(model, state)
     assert torch.count_nonzero(reset[1]).item() == 0
     assert torch.count_nonzero(model.ltm._mom_vals).item() == 0
+
+
+def test_ltm_feedback_replay_materializes_inference_mode_memory_tensors():
+    with torch.inference_mode():
+        fast_vals = torch.ones(4, 3)
+        mom_vals = torch.ones(4, 3)
+        timestamps = torch.zeros(4)
+        sources = torch.zeros(4, dtype=torch.long)
+        wallclock = torch.zeros(4, dtype=torch.float64)
+    replay = ltm_replay_seed_state(
+        (fast_vals, mom_vals, None, None, timestamps, sources, wallclock)
+    )
+    for value in (replay[0], replay[1], replay[4], replay[5], replay[6]):
+        assert torch.is_tensor(value)
+        assert not torch.is_inference(value)
 
 
 def test_online_ltm_gradients_reject_nonfinite_and_clip_finite_norm():
@@ -460,12 +769,19 @@ def test_chat_state_step_uses_absolute_tbptt_boundaries_and_updates_once():
         global_pos_offset=4,
         min_timestamp=2.0,
         source_filter=3,
+        return_last_logit_only=True,
     )
 
     assert outputs["logits"].shape == (1, 1, 7)
     assert len(model.calls) == 1
     assert model.calls[0]["global_pos_offset"] == 4
     assert model.calls[0]["drift_state"] is drift
+    assert model.calls[0]["return_last_logit_only"] is True
+    assert model.calls[0]["return_topk_values"] is False
+    assert model.calls[0]["return_raw_topk_values"] is False
+    assert model.calls[0]["return_topk_indices"] is False
+    assert model.calls[0]["return_step_telemetry"] is False
+    assert model.calls[0]["return_numerics"] is False
     assert torch.equal(state[0], one + 1)
     assert state[-1] == ("updated",)
 
@@ -644,3 +960,17 @@ def test_lm_eval_rolling_scores_first_token_and_returns_float():
     assert len(result) == 1
     assert isinstance(result[0], float)
     assert result[0] < 0.0
+
+
+def test_lm_eval_long_continuation_keeps_its_true_predecessor():
+    wrapper = object.__new__(HierarchosLM)
+    wrapper._max_length = 3
+    wrapper._eot_token_id = 0
+
+    context, continuation = wrapper._truncate_scoring_pair(
+        [7, 8],
+        [10, 11, 12, 13, 14],
+    )
+
+    assert context == [11]
+    assert continuation == [12, 13, 14]

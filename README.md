@@ -1,25 +1,112 @@
 -----
 
-# Hierarchos v0.21 (alpha): Exact Full-Sample BPTT + Blackwell Training Pipeline
+# Hierarchos Alpha v0.30
 
-> **Current safety release — coherent-v9:** New models now default to a
-> versioned learned-function contract with corrected manager/worker recurrence,
-> hard per-row ACT, bounded ROSA, shared factorized token adapters, persisted
-> memory-gate schedule state, strict full-precision train/chat parity, and
-> fail-closed checkpoints/resumes. Existing v2/v3 checkpoints remain
-> `legacy-v8`; they are not silently reinterpreted as v9. Quantized `.npz`
-> export/inference is intentionally disabled until it can reproduce the active
-> matrix-state architecture. Read
-> [COHERENT_V9_MIGRATION.md](COHERENT_V9_MIGRATION.md) before starting or
-> resuming an expensive run.
+> **Current release: Hierarchos Alpha v0.30.** New training runs use the
+> RWKV-v9 core with corrected manager/worker recurrence, hard per-row ACT,
+> bounded ROSA, shared factorized token adapters, persisted memory-gate schedule
+> state, full-precision train/chat parity controls, and fail-closed
+> checkpoint/resume boundaries. A reference `448/448/448` Alpha v0.30 model
+> with the GPT-2 vocabulary has `30,227,653` unique parameters and `102`
+> state-dict entries. The historical RWKV-v8 design has `232,516,229`
+> parameters and `95` state-dict entries.
 >
-> Current validation: `389 passed, 4 skipped, 4 subtests passed`; the strict
-> executable architecture audit reports `73 passed, 0 warnings, 0 failures`.
-> A separate CLI smoke run completed fresh training, reproduced the
-> uninterrupted post-checkpoint losses and live LR on exact mid-epoch resume,
-> and reloaded the final inference export to finite logits.
+> **Naming boundary:** `v0.30` is the Hierarchos product release. RWKV-v8 and
+> RWKV-v9 identify core architecture generations; they are not Hierarchos
+> release numbers. The literal values `legacy-v8` and `coherent-v9` remain in
+> CLI/config/checkpoint metadata solely as compatibility-stable internal
+> architecture identifiers.
+>
+> v2/v3 checkpoints remain on the internal `legacy-v8` contract; they are not
+> silently reinterpreted as RWKV-v9. Quantized `.npz` export/inference is
+> intentionally unsupported because the old scalar-RWKV path cannot reproduce
+> the active matrix-state contract. Read the
+> [RWKV-v9 migration notes](COHERENT_V9_MIGRATION.md) before starting,
+> resuming, fine-tuning, or merging an expensive run.
+>
+> Release-gate totals are deliberately not frozen as the regression suite grows.
+> Before a paid run, execute `python -m pytest -q` and
+> `python tools/check_architecture_integrity.py --strict`, then record the
+> resulting output with the run manifest.
 
-**v0.21 focus**: add checkpoint-compatible exact per-sample BPTT, train/chat recurrence parity, and a compact high-throughput input pipeline for multi-billion-token training. The learned architecture is unchanged: the reference `448/448/448` model remains `232,516,229` unique parameters with `95` state tensors, so coherent v0.20.x checkpoints strict-load without tensor conversion.
+## RWKV core v8 to v9 architecture flow
+
+The diagram compares core architecture generations inside Hierarchos. The
+right-hand side is the core used by **Hierarchos Alpha v0.30**.
+
+```text
+                RWKV CORE v8                                  RWKV CORE v9
+       (historical Hierarchos core)                    (Hierarchos Alpha v0.30 core)
+
+     +-------------------------+                       +-------------------------+
+     | Input token IDs         |                       | Input token IDs         |
+     +------------+------------+                       +------------+------------+
+                  |                                                     |
+                  v                                                     v
+     +-------------------------+                       +-------------------------+
+     | Tied token embedding    |                       | Tied token embedding    |
+     | and language-model head |                       | and language-model head |
+     +------------+------------+                       +------------+------------+
+                  |                                                     |
+                  v                                                     v
+     +-------------------------+                       +-------------------------+
+     | Three extra full-vocab  |                       | Shared low-rank token   |
+     | feature tables:         |                       | adapters for H, L, and  |
+     | H DeepEmbed,            |                       | ROSA features           |
+     | L DeepEmbed, and ROSA   |                       | No duplicate vocab      |
+     +------------+------------+                       | tables                  |
+                  |                                    +------------+------------+
+                  v                                                     |
+     +-------------------------+                                        v
+     | Legacy ROSA history and |                       +-------------------------+
+     | no-prediction sentinel  |                       | Bounded deterministic   |
+     | behavior                |                       | ROSA; zero-valued       |
+     +------------+------------+                       | no-prediction sentinel  |
+                  |                                    +------------+------------+
+                  v                                                     |
+     +-------------------------+                                        v
+     | LTM retrieval with      |                       +-------------------------+
+     | legacy clock/filter     |                       | Valid-slot-masked LTM   |
+     | semantics; supervised   |                       | with token/wall clocks, |
+     | inner updates by default |                      | source metadata, and    |
+     +------------+------------+                       | read-only parity default |
+                  |                                    +------------+------------+
+                  v                                                     |
+     +-------------------------+                                        v
+     | Manager soft ACT and    |                       +-------------------------+
+     | legacy state commit     |                       | Hard per-row cumulative |
+     +------------+------------+                       | ACT and selected-state  |
+                  |                                    | commit                  |
+                  v                                    +------------+------------+
+     +-------------------------+                                        |
+     | Worker recurrence v1;   |                                        v
+     | legacy refinement and   |                       +-------------------------+
+     | sum-square commitment   |                       | Corrected matrix-state  |
+     +------------+------------+                       | recurrence, row-local   |
+                  |                                    | refinement, mean-square |
+                  v                                    | commitment              |
+     +-------------------------+                       +------------+------------+
+     | Tied LM head -> logits  |                                    |
+     +------------+------------+                                    v
+                  |                                    +-------------------------+
+                  v                                    | Tied LM head -> logits  |
+       232,516,229 parameters                          +------------+------------+
+       95 state-dict entries                                        |
+                                                                    v
+                                                         30,227,653 parameters
+                                                         102 state-dict entries
+                                                         86.9998% fewer params
+```
+
+The parameter reduction comes primarily from replacing three vocabulary-sized
+feature tables with shared low-rank adapters. The output embedding remains tied,
+so Alpha v0.30 keeps the normal full-vocabulary language-model objective without
+adding a second output matrix.
+
+**Historical Alpha v0.21 / RWKV-v8 focus**: the v0.21 material immediately below
+describes the checkpoint-compatible RWKV-v8 full-sample-BPTT and input
+pipeline work. Its `232,516,229` parameter, `95` tensor, and historical test
+figures are not claims about Hierarchos Alpha v0.30.
 
 **Exact per-sample gradient connectivity**: `--full-sample-bptt` removes recurrent gradient detachment across every active token in a dataset sample. Non-reentrant activation checkpointing rematerializes bounded temporal segments during one global backward pass; segment boundaries never truncate gradients or externally reseed drift. This gives full BPTT within each row up to `max_length`, but deliberately does not connect unrelated dataset rows or guarantee semantic coherence by itself.
 
@@ -27,9 +114,9 @@
 
 **Input-pipeline savings**: Hugging Face revisions are pinned to immutable SHAs, fast tokenizers process native batches, Arrow rows use batched fetches, compact schema-v6 caches are mmap-backed, and length buckets are deterministically auto-tuned. The weighted GPT-2+ROSA profile with prompt-token training uses about 4 token-data bytes/token, approximately 20 GB decimal for 5B tokens before index/RLE metadata.
 
-**Precision, clipping, and parity**: Blackwell training uses BF16 autocast while parameters, AdamW state, sensitive recurrence, LTM math, and loss accumulation retain FP32 precision. Finite loss/gradient rejection, unscale-before-clip ordering, global gradient clipping, state/context/drift bounds, and channel-mix clamps remain active. Exact checkpoints use the aligned full-precision chat/evaluation recurrence. Quantized inference is unavailable for coherent-v9 and fails closed rather than claiming control-flow or logit parity.
+**Precision, clipping, and parity**: Blackwell training uses BF16 autocast while parameters, AdamW state, sensitive recurrence, LTM math, and loss accumulation retain FP32 precision. Finite loss/gradient rejection, unscale-before-clip ordering, global gradient clipping, state/context/drift bounds, and channel-mix clamps remain active. Exact checkpoints use the aligned full-precision chat/evaluation recurrence. Quantized inference is unavailable for the Alpha v0.30 RWKV-v9 core and fails closed rather than claiming control-flow or logit parity.
 
-**Verification**: `python -m pytest -q` reports `283 passed, 4 skipped`; `python tools/check_architecture_integrity.py` reports `65 passed, 1` documented legacy-quantization warning, and `0 failures`. Direct-versus-checkpointed exact-BPTT tests preserve all gradients with maximum observed parameter-gradient delta `1.49e-08`; correct segmented recurrence matches monolithic logits within `2.38e-07` in the boundary control.
+**Historical verification**: this legacy-v8 release recorded `283 passed, 4 skipped`; `python tools/check_architecture_integrity.py` reported `65 passed`, `1` documented legacy-quantization warning, and `0 failures`. Direct-versus-checkpointed exact-BPTT tests preserved all gradients with maximum observed parameter-gradient delta `1.49e-08`; correct segmented recurrence matched monolithic logits within `2.38e-07` in the boundary control.
 
 ## Previous v0.20.7 Notes: Epoch-13 Compatibility + Safe LTM Writers
 
@@ -219,6 +306,7 @@ max_ce_loss_for_backward=0.0
 
 #### CUDA Training Loop
 - **Throttled Progress Metrics**: `train_step` only returns display metrics on scheduled progress updates, so CUDA scalar `.item()` calls no longer synchronize every batch by default.
+- **One Host Contract Audit per Batch**: Right-padding, labels, and loss weights are validated before accelerator transfer, then the checked padding geometry is reused across TBPTT chunks instead of forcing a CUDA-to-host synchronization for every chunk.
 - **Configurable Logging Interval**: Use `--progress-log-steps N` to update tqdm scalar metrics every N steps. Default is `25`; use `1` for the old every-step behavior.
 - **Non-Destructive Runtime Patch**: This changes only metric reporting cadence. Model architecture, dataset formatting, labels, losses, optimizer steps, and scheduler behavior are unchanged.
 - **Alpaca Prompt String Documented**: `--alpaca` uses `### Instruction:`, optional `### Input:`, and `### Response:` formatting before the supervised output text.
@@ -325,12 +413,19 @@ An experimental dual-module design in which a high-level "Manager" and low-level
   * 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
   * 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
   * 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
-  * 🚀 **PyTorch 2.0+ torch.compile Support**: Auto-enabled on CUDA, optional on CPU with `--compile` / `--force-compile`.
+  * 🚀 **PyTorch 2.4+ Runtime Contract**: The supported full-precision path
+    requires PyTorch 2.4 or newer for restricted artifact loading; CUDA builds
+    can use `torch.compile` with `--compile` / `--force-compile`.
   * 🛡️ **Training Guardrails**: Finite-gradient rejection, gradient clipping (`--grad-clip`), Z-loss regularization, and state/activation clamps reduce instability risk. Clamps intentionally alter values when triggered and cannot guarantee convergence.
   * 📦 **Self-Contained & Portable Models**: Models are saved as HuggingFace-style directories containing weights, tokenizer, and architecture config for easy sharing and deployment.
   * 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones.
-  * 🛡️ **Fail-Closed Deployment Contract**: Full-precision `.pt` inference is the supported path. Legacy scalar-RWKV `.npz`, automatic re-quantization, and Vulkan model inference are disabled until a coherent-v9 implementation passes recurrent-state and logit-parity tests.
-  * 🐍 **Python 3.13 Support**: Full compatibility with Python 3.13, including automatic build environment setup.
+  * 🛡️ **Fail-Closed Deployment Contract**: Full-precision artifacts load only
+    through PyTorch's restricted `weights_only` path with narrowly allowlisted
+    project types. Legacy scalar-RWKV `.npz`, automatic re-quantization, and
+    Vulkan model inference are unsupported for the Alpha v0.30 RWKV-v9 core.
+  * 🐍 **Runtime Versions**: Python 3.10+ and PyTorch 2.4+ are required for the
+    supported path. Python 3.13 is usable only with a compatible PyTorch build;
+    DirectML currently requires Python 3.10–3.12.
 
 -----
 
@@ -340,9 +435,10 @@ Follow these steps to get a local copy up and running.
 
 ### Prerequisites
 
-  * **Python 3.8+ (Python 3.13 recommended)**
+  * **Python 3.10+**
+  * **PyTorch 2.4+** (required by the fail-closed checkpoint and cache loaders)
   * **For Hugging Face Datasets:** `pip install datasets`
-  * **For AMD GPU Training (Windows):** Install DirectML via `pip install torch-directml` and follow [README_ZLUDA.md](README_ZLUDA.md)
+  * **For AMD GPU Training (Windows):** Install DirectML via `pip install torch-directml` and follow [README_ZLUDA.md](README_ZLUDA.md). Its current Python support is 3.10–3.12; do not use a Python 3.13 DirectML environment.
   * **Optional (AMP Training/Gradient Checkpointing):** NVIDIA GPU with CUDA support (Compute Capability 7.0+ recommended) and a PyTorch build with CUDA enabled.
 
 ### Installation
@@ -382,7 +478,7 @@ Follow these steps to get a local copy up and running.
     *(Note: `requirements_kernel.txt` includes `datasets`)*
 
 4.  **Compile Historical C++ Kernel (Developer Reference Only):**
-    This step is not required or supported for coherent-v9 inference:
+    This step is not required or supported for Alpha v0.30 inference:
 
     ```bash
     # Ensure you have CMake, a C++ compiler, and installed dependencies from requirements_kernel.txt
@@ -393,7 +489,7 @@ Follow these steps to get a local copy up and running.
     ```
 
     This creates `Hierarchos_matmul.*` in your project root for legacy
-    experiments. It does not enable coherent-v9 quantization: current `.npz`
+    experiments. It does not enable Alpha v0.30 RWKV-v9 quantization: current `.npz`
     export, quantized chat, and Vulkan model inference are intentionally
     unsupported because the old kernel path does not reproduce the active
     matrix-state recurrence.
@@ -412,6 +508,13 @@ This guide covers common scenarios from data preparation to inference.
 |-------------|--------|-------------|
 | `hierarchos_cli.py` | ✅ **Recommended** | Modular CLI - faster, stable, actively maintained |
 | `hierarchos.py` | ⚠️ **Legacy** | Unmaintained monolith (5,600 lines). Kept only as reference for agentic AI workflows. | <-- DO NOT USE THIS! ITS 16 VERSIONS OUT OF DATE!!
+
+> **Product version boundary:** Hierarchos Alpha v0.30 is the current release.
+> Fresh Alpha v0.30 configs use the internal `coherent-v9` identifier for the
+> RWKV-v9 core. Use the [RWKV-v9 migration notes](COHERENT_V9_MIGRATION.md) for
+> its preflight and release-gate command. Examples or performance figures below
+> that explicitly say `232M`, `232.5M`, or `95` state tensors describe the
+> historical RWKV-v8 core (`legacy-v8`) unless they say otherwise.
 
 **Example:**
 ```bash
@@ -439,7 +542,7 @@ python hierarchos_cli.py train \
     --batch_size 64 \
     --accumulation-steps 1 \
     --auto-max-length `# Automatically determines max sequence length` \
-    --context_dim 448 `# ~233M params with GPT-2 vocab, DeepEmbed, ROSA` \
+    --context_dim 448 `# ~30.2M Alpha v0.30/RWKV-v9 params; RWKV-v8 was ~232.5M` \
     --h_hidden 448 \
     --l_hidden 448 \
     --rwkv-head-size 64 \
@@ -533,7 +636,12 @@ python hierarchos_cli.py train \
 💡 **CUDA Auto-Optimization:** On NVIDIA GPUs, AMP, TF32, cuDNN benchmark, and torch.compile are **auto-enabled**. Long CUDA runs default to `--compile-mode max-autotune-no-cudagraphs`, static RWKV worker-loop capture, and H-RNN cell compilation. This keeps autotuned CUDA kernels while avoiding CUDA graph fast-path warnings from TBPTT submodule calls. Use `--compile-mode max-autotune --compile-cudagraphs` only when benchmarking CUDA graphs explicitly.
 💾 **Training on Low Memory:** For TBPTT/finetuning, `--gradient-checkpointing` reduces VRAM at the cost of recomputation. Exact full-sample training instead uses `--full-sample-activation-checkpointing`; lower `--full-sample-checkpoint-segment-size` when exact-mode VRAM is tight.
 🎮 **AMD GPU Training:** Use `--device dml` to train on AMD Radeon GPUs via DirectML. AMP is automatically disabled for stability.
-🚀 **Datacenter Training:** the default CUDA profile targets the 232M `448/448/448` run on a 96GB Blackwell-class NVIDIA card: `--batch_size 64`, `--training-chunk-size 256`, HF token cache, length bucketing, auto CUDA workers up to 8, BF16 AMP, TF32, and `torch.compile --compile-mode max-autotune-no-cudagraphs`. The v0.21 exact-gradient profile additionally sets `--full-sample-bptt --full-sample-activation-checkpointing --full-sample-checkpoint-segment-size 224`, with `224` conditional on a longest-batch memory preflight. With the HF token cache, CUDA batch>=64 auto-tunes the length bucket window from cached sample lengths to reduce padding; runtime `tok_eff` diagnostics are opt-in via `--padding-metric-steps N`.
+🚀 **Datacenter Training:** Alpha v0.30's RWKV-v9 `448/448/448` reference is
+30.2M parameters, not the 232M RWKV-v8 reference. Start from the Alpha v0.30
+command in the [RWKV-v9 migration notes](COHERENT_V9_MIGRATION.md), then size batch,
+activation-checkpoint segments, and compilation settings from a measured
+maximum-length preflight on the actual GPU. The old 96GB Blackwell `232M`
+profile is a historical planning reference, not an Alpha v0.30 capacity guarantee.
 
 ## ⚠️ **HRM Convergence & Training Speed:** Higher `--max_h_steps` and `--max_l_steps` allow deeper reasoning but **significantly increase training time** per batch due to the iterative HRM process. Adjust based on your task and compute resources.
 
@@ -594,9 +702,9 @@ The benchmark uses synchronized device timing and `torch.cuda.max_memory_allocat
 
 Keep AMP mixed precision enabled. On supported Blackwell CUDA builds, Hierarchos selects BF16 autocast for eligible Tensor Core work while keeping FP32 parameters, gradients, AdamW moments, recurrent matrix state, LTM updates, ACT weighting, and language-loss accumulation. PyTorch explicitly recommends leaving the model in default precision under autocast rather than calling `model.half()` or `model.bfloat16()`: [PyTorch AMP documentation](https://docs.pytorch.org/docs/stable/amp.html).
 
-Pure FP16/BF16 model and optimizer state would save only about `1.73 GiB` for the 232.5M model and would not remove checkpoint recomputation. At the v0.21 continuation LR (`1e-5` down to `1e-7`), low-precision parameter storage can round updates away; pure FP16 also risks second-moment underflow. Quantization-aware training is intended to adapt a model for later quantized serving, not to accelerate this exact pretraining loop: [TorchAO QAT documentation](https://docs.pytorch.org/ao/stable/workflows/qat.html). Hierarchos v0.21 implements neither a QAT training flag nor a validated FP8 recipe; FP8 remains a separate architecture-specific experiment for eligible linear layers: [TorchAO quantized-training documentation](https://docs.pytorch.org/ao/stable/workflows/training.html).
+For the historical 232.5M legacy-v8 profile, pure FP16/BF16 model and optimizer state would save only about `1.73 GiB` and would not remove checkpoint recomputation. At the v0.21 continuation LR (`1e-5` down to `1e-7`), low-precision parameter storage can round updates away; pure FP16 also risks second-moment underflow. Quantization-aware training is intended to adapt a model for later quantized serving, not to accelerate this exact pretraining loop: [TorchAO QAT documentation](https://docs.pytorch.org/ao/stable/workflows/qat.html). Hierarchos v0.21 implements neither a QAT training flag nor a validated FP8 recipe; FP8 remains a separate architecture-specific experiment for eligible linear layers: [TorchAO quantized-training documentation](https://docs.pytorch.org/ao/stable/workflows/training.html).
 
-### Assistant SFT Profile for 232M / ~1B Tokens
+### Historical Legacy-v8 Assistant SFT Profile for 232M / ~1B Tokens
 
 For a 232M `448/448/448` assistant run on a large Alpaca-style instruction dataset, start with the assistant recovery preset. Explicit CLI values override the preset, so a full-budget 10-epoch run can keep the v0.20 safety settings while setting `--epochs 10`:
 
@@ -686,6 +794,13 @@ python hierarchos_cli.py finetune \
     --gradient-checkpointing `# Use if fine-tuning large models on limited VRAM`
 ```
 
+Fine-tuning writes a local PEFT LoRA adapter in `safetensors` format together
+with a Hierarchos adapter manifest. The manifest binds the adapter to the
+source architecture contract, tokenizer fingerprint, LoRA geometry, and file
+hashes. Treat the adapter as a delta for that exact base model, not as a
+standalone chat model or an exact-resume training checkpoint. Pickle-based
+adapter weights and adapters without the bound manifest are rejected.
+
 ### Workflow 3: Merging LoRA Adapter
 
 Combine the base model and the LoRA adapter into a new, standalone model.
@@ -697,13 +812,24 @@ python hierarchos_cli.py merge-lora \
     --out-dir "./my_model_merged_squad"
 ```
 
+`merge-lora` verifies the adapter manifest, adapter hashes, architecture
+contract, and tokenizer identity before asking PEFT for its checked
+`safe_merge=True` path. It validates the merged full-precision state and
+publishes the standalone package atomically. An existing output directory is
+refused unless `--overwrite-merge-output` is explicit. A merged package is for
+inference or a fresh weights-only continuation; it does not contain the
+optimizer, scheduler, sampler cursor, or gradient state required for exact
+training resume.
+
 ### Workflow 4: Quantization *(Currently Unsupported)*
 
 The former `.npz` exporter and CPU/Vulkan loader implement an older
 scalar-state RWKV model and omit parts of the active manager/worker,
 DeepEmbed/ROSA, ACT, and state contract. The modular CLI therefore rejects
 quantized export and loading. Use a full-precision `.pt` checkpoint until a
-matrix-state coherent-v9 implementation passes the same logit-parity suite.
+matrix-state RWKV-v9 quantized implementation has its own complete
+recurrent-state and logit-parity validation. It is not a supported release
+path today.
 
 ### Workflow 5: Running Chat Inference
 
@@ -731,12 +857,16 @@ python hierarchos_cli.py chat \
     --chat-input-history-turns 0
 ```
 
-Use this profile as the static coherence baseline before enabling chat history or passive learning. It keeps inference close to the training/benchmark path: no passive LTM writes and no previous-turn text injected into the Alpaca `### Input:` field. Exact v0.21 checkpoints default to monolithic prompt prefill, fixed refinement policy, and no external drift seed at artificial boundaries; legacy TBPTT checkpoints retain their saved chunk-boundary behavior. Leave recurrent chat-state carry disabled unless you are intentionally testing multi-turn stateful behavior. Full-precision parity means the same checkpoint, tokenizer, runtime policy, dtype/backend, and state boundaries within floating tolerance—not bitwise equality across different hardware, AMP versus FP32, sampling, or quantization.
+Use this profile as the static coherence baseline before enabling chat history or passive learning. It keeps inference close to the training/benchmark path: no passive LTM writes and no previous-turn text injected into the Alpaca `### Input:` field. Exact v0.21 checkpoints default to monolithic prompt prefill, fixed refinement policy, and no external drift seed at artificial boundaries; legacy TBPTT checkpoints retain their saved chunk-boundary behavior. Leave recurrent chat-state carry disabled unless you are intentionally testing multi-turn stateful behavior. Saved recurrent chat states are model/tokenizer-bound continuation artifacts, not portable model-neutral conversation files. Full-precision parity means the same checkpoint, tokenizer, runtime policy, dtype/backend, and state boundaries within floating tolerance—not bitwise equality across different hardware, AMP versus FP32, sampling, or quantization.
 
 If a model directory contains both a stale `.npz` file and a coherent
 full-precision checkpoint, chat ignores the unsupported archive and loads the
 full-precision checkpoint. A directory containing only `.npz` artifacts is
 rejected.
+
+Tokenizer repositories do not execute remote Python by default. Use
+`--trust-remote-code` only for a tokenizer repository whose code you have
+reviewed and explicitly trust.
 
 ### Workflow 6: Resuming Interrupted Training
 
@@ -752,24 +882,53 @@ python hierarchos_cli.py train \
     --gradient-checkpointing # Ensure flag is consistent with the resumed run if needed
 ```
 
-  * A normal exact resume restores the live optimizer LR and does not warm up again.
-  * Use `--rebuild-lr-schedule` only when intentionally changing the remaining schedule while keeping optimizer/scaler moments.
-  * `--override-scheduling` is the legacy combined reset and also discards optimizer/scaler state; do not use it accidentally.
+  * A normal exact resume restores optimizer, scaler, scheduler, pending
+    gradients, RNG, and sampler state. It restores the saved LR curve rather
+    than starting warmup again.
+  * Schedule-defining settings (including start/min LR, warmup, and LTM
+    schedule settings) are part of the exact-run identity. A conflicting CLI
+    value is rejected instead of silently changing the next update.
+  * Use `--rebuild-lr-schedule` only when intentionally changing the remaining
+    schedule while keeping optimizer/scaler moments. `--reset-optimizer-state`
+    is a separate fresh-moments experiment.
+  * Exact mid-epoch replay requires a proven immutable random-access source and
+    sampler cursor. Mutable or non-replayable iterable sources fail closed
+    rather than skip or reorder batches.
+  * `--override-scheduling` is the legacy combined reset and also discards
+    optimizer/scaler state; do not use it accidentally.
 
 ### Workflow 7: Expanding a Model *(Requires `expand_model.py`)*
 
-Create a larger model architecture initialized with weights from a smaller trained one.
+Create a larger model within the same authenticated architecture revision and
+initialize its compatible subspaces from a smaller trained model.
 
 ```bash
 python expand_model.py \
-    --old-model-path "./my_Hierarchos_model/Hierarchos.pt" `# Trained smaller model .pt file` \
-    --output-path "./expanded_model/Hierarchos.pt" `# Path for the new, expanded .pt file` \
-    --context_dim 1024 `# New larger dimension` \
-    --h_hidden 1024 \
-    --l_hidden 1024
-    # Note: expand_model.py takes specific architecture args to change.
-    # Other config values are copied from the old model's checkpoint.
+    --old-model-path "./my_Hierarchos_model" \
+    --output-dir "./expanded_model" \
+    --context-dim 1024 \
+    --persistent-dim 256 \
+    --ltm-slots 4096 \
+    --ltm-key-dim 256 \
+    --ltm-val-dim 256 \
+    --rwkv-head-size 64
 ```
+
+Expansion now produces one atomic model package containing `hierarchos.pt`, its
+SHA-256 sidecar, the resolved config, the exact tokenizer, and hashed expansion
+provenance. Concatenated projections are transplanted by semantic block, so
+token, context, persistent, and individual LTM-slot coordinates cannot slide
+into one another when dimensions change. The source checkpoint is loaded once,
+and optimizer/scaler/scheduler state is released before the larger model is
+allocated.
+
+The tokenizer must be present in the source package and its IDs must match the
+source embedding rows. `vocab_size` cannot be changed by this tool because that
+requires a separately audited tokenizer-ID migration. Expansion also cannot
+turn internal `legacy-v8` weights into internal `coherent-v9` RWKV-v9 weights;
+it preserves the authenticated
+source revision. Use `--overwrite-output` only when intentionally replacing an
+existing output package atomically.
 
 ### Workflow 8: Continuing Training (After Expanding or from Inference Checkpoint)
 
@@ -988,14 +1147,14 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--pre_chunked_dataset`        | `train`, `finetune`                 | Load pre-chunked **JSONL** dataset iteratively (requires `--max_length`). Mutually Exclusive with `--pre_pt_dataset` & `--hf_dataset`.     | `False`                 |
 | `--pre_pt_dataset`             | `train`, `finetune`                 | Load pre-chunked **consolidated `.pt` tensor** dataset from directory specified in `--train` (requires `--max_length`). Mutually Exclusive with `--pre_chunked_dataset` & `--hf_dataset`. | `False`                 |
 | `--model-path`                 | `train`, `finetune`, `merge`, `chat` | Path to model directory. **[Train]**: Loads old weights unchanged as a clean base with a fresh optimizer/schedule; use a new output directory. **[Other]**: Loads for the specified mode. | `None`                  |
-| `--out-dir`                    | `train`, `finetune`, `merge` | Directory to save new models, checkpoints, or adapters.                                                                                | `./Hierarchos_model`       |
+| `--out-dir`                    | `train`, `finetune`, `merge` | Directory to save new models, checkpoints, or adapters.                                                                                | `./hierarchos_model`       |
 | `--tokenizer-path`             | `train`, `finetune`, `merge` | Path or HF name of tokenizer (if not loading from model-path).                                                                           | `openai-community/gpt2` |
 | `--resume-from-ckpt`           | `train`                             | Path to a training `.pt` checkpoint for exact same-run continuation, including optimizer/scheduler/scaler/data state. Do not use it to warm-start a different dataset/schedule. | `None`                  |
 | `--shadow-model-path`          | reserved                            | Legacy compatibility argument; quantized online learning is disabled.                                                                   | `None`                  |
 | `--lora-adapter-path`          | `merge`, `finetune`                 | Path to the trained LoRA adapter directory.                                                                                            | `None`                  |
 | **Training/Fine-Tuning** |                                     |                                                                                                                                          |                         |
 | `--epochs`                     | `train`, `finetune`                 | Number of training epochs.                                                                                                               | `3`                     |
-| `--batch_size`                 | `train`, `finetune`                 | Number of samples per forward pass. Default targets the 96GB Blackwell 232M training profile.                                             | `64`                    |
+| `--batch_size`                 | `train`, `finetune`                 | Number of samples per forward pass. The throughput-oriented default targets the documented 96GB Blackwell profile; reduce it on smaller devices. | `64`                    |
 | `--accumulation-steps`         | `train`, `finetune`                 | Number of steps to accumulate gradients over (simulates larger batch size).                                                              | `1`                     |
 | `--gradient-checkpointing`     | `train`, `finetune`                 | **Enable gradient checkpointing to save VRAM (trades compute for memory).** | `False`                 |
 | `--full-sample-bptt`           | `train`                             | Use one attached graph over each complete active sample; forces `detach_every_n_steps=0`, disables unrelated cross-sample recurrent carry, and preserves cache metadata. | `False` |
@@ -1006,7 +1165,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--max-ce-loss-for-backward`   | `train`, `finetune`                 | Optional finite cap on CE used for backward only. `0` disables the cap and is recommended for from-scratch LM/assistant SFT training.     | `0.0`                   |
 | `--ponder-loss-weight`         | `train`, `finetune`                 | Weight for the Ponder Cost auxiliary loss.                                                                                               | `0.01`                  |
 | `--encourage-thinking`         | `train`                             | **Invert ponder loss to REWARD thinking.** Useful for ACT recovery training.                                                              | `False`                 |
-| `--adaptive-ponder`            | `train`                             | **Scale ponder target with CE loss.** Harder content triggers more thinking.                                                              | `False`                 |
+| `--adaptive-ponder`            | `train`                             | **Scale ponder target with CE loss.** Harder content triggers more thinking.                                                              | `True` for Alpha v0.30 |
 | `--ponder-target-scale`        | `train`                             | Scaling factor for adaptive ponder target (target = loss × scale).                                                                        | `0.5`                   |
 | `--reset-halt-bias`            | `train`                             | **SURGICAL FIX:** Reset `h_halt_proj.bias` to this value on checkpoint load (e.g., `-2.0` for ~12% halt prob).                            | `None`                  |
 | `--commitment-loss-weight`     | `train`, `finetune`                 | Weight for the commitment auxiliary loss to prevent posterior collapse.                                                                  | `0.5`                   |
@@ -1029,7 +1188,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--warmup-ratio`               | `train`, `finetune`                 | Fraction of optimizer updates used for LR warmup before cosine decay.                                                                    | `0.0`                   |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
 | `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `1e-3`                  |
-| `--ltm-training-mode`          | `train`                             | LTM fast-memory training mode. `inner-update` keeps supervised gradient fast-memory writes; `read-only` carries ROSA/history state only and better matches normal chat inference. | `inner-update`          |
+| `--ltm-training-mode`          | `train`                             | LTM fast-memory training mode. `inner-update` keeps supervised gradient fast-memory writes; `read-only` carries ROSA/history state only and better matches normal chat inference. | `read-only` for Alpha v0.30 |
 | `--inference-like-ltm-training` | `train`                            | Shortcut for `--ltm-training-mode read-only`; recommended for assistant rescue/coherence runs.                                         | `False`                 |
 | `--ltm-value-alignment-weight` | `train`, `finetune`                 | Opt-in energy-normalized auxiliary for training the Hebbian `val_proj` writer. It affects only that existing tensor; `0` preserves the legacy objective. | `0.0`                   |
 | `--ltm-value-alignment-min-updates` | `train`, `finetune`             | Successful writer-training optimizer updates required before a checkpoint enables Hebbian validation writes.                           | `100`                   |
@@ -1071,12 +1230,12 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--kayla`                      | `train`, `finetune`                 | Enable Kayla-style instruction tuning format (with thought-process). **Ignored if using pre-chunked formats or --text\_column.** | `False`                 |
 | `--alpaca`                     | `train`, `finetune`                 | Enable Alpaca `instruction`/`input`/`output` formatting. Defaults prompt/completion columns to `instruction`/`output` and includes `input` as a `### Input:` context block. | `False`                 |
 | **Inference** |                                     |                                                                                                                                          |                         |
-| `quantize` mode                | unsupported                         | Exits with code 2. Legacy `.npz` export/loading cannot reproduce coherent-v9 and is deliberately fail-closed.                            | N/A                     |
+| `quantize` mode                | unsupported                         | Exits with code 2. Legacy `.npz` export/loading cannot reproduce the Alpha v0.30 RWKV-v9 core and is deliberately fail-closed.           | N/A                     |
 | `--device`                     | `chat`, `train`                     | Device for inference/training (`cpu`, `cuda`, or `dml`). **Note:** `dml` requires `torch-directml` and Windows. DirectML requires explicit opt-in. | `auto`                   |
 | `--h-halt-thresh`              | `chat`                              | Probability threshold for early exiting the HRM reasoning loop during inference.                                                         | `0.9`                   |
 | `--max-new-tokens`             | `chat`                              | Maximum number of tokens to generate in chat mode.                                                                                       | `512`                   |
 | `--ltm-lora-path`              | `chat`                              | Optional: Path to save/load LTM updates as a separate delta file in chat mode.                                                           | `None`                  |
-| `--static-ltm-lr`              | `chat`                              | Disable cosine annealing for chat LTM updates, use fixed `--ltm_lr`.                                                                     | `False`                 |
+| `--static-ltm-lr`              | `chat`                              | Disable cosine annealing for chat LTM updates, use fixed `--ltm_lr`; pass `--dynamic-ltm-lr` to opt into cosine annealing.               | `True`                  |
 | `--ltm-schedule-steps`         | `chat`                              | Number of chat updates per LTM LR cosine cycle.                                                                                          | `100`                   |
 | `--ltm-schedule-min-lr`        | `chat`                              | Minimum LR for chat LTM cosine schedule.                                                                                                 | `1e-5`                  |
 | **Benchmarking** |                                     |                                                                                                                                          |                         |
@@ -1087,7 +1246,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--eval-limit`                 | `train`, `benchmark`                | Limit eval samples per task. Use `100` for the recommended ROG Ally confidence check, or omit with `--benchmark-preset rog-ally` for a faster 25-sample smoke run. | `None`                  |
 | `--eval-batch-size`            | `train`, `benchmark`                | Evaluation batch size. Use `1` on consumer/handheld hardware.                                                                            | `1`                     |
 | **Architecture (Train)** |                                     | *(Used only if starting train from scratch)* |                         |
-| `--context_dim`                | `train`                             | Core embedding dimension. The default 448 keeps full RWKV matrix-state heads at 64-wide geometry and lands near 233M params with GPT-2 vocab + DeepEmbed/ROSA. | `448`                   |
+| `--context_dim`                | `train`                             | Core embedding dimension. The default 448 keeps 64-wide RWKV matrix-state heads; the complete Alpha v0.30 RWKV-v9 model is about 30.2M parameters with the GPT-2 vocabulary (RWKV-v8 was about 232.5M). | `448`                   |
 | `--persistent_dim`             | `train`                             | Dimension of the fixed Persistent Memory.                                                                                                | `128`                   |
 | `--ltm_slots`                  | `train`                             | Number of slots in the Long-Term Memory.                                                                                                 | `1024`                  |
 | `--ltm_key_dim`                | `train`                             | Dimension of LTM keys.                                                                                                                   | `128`                   |
@@ -1117,14 +1276,18 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 
 ### `expand_model.py` Arguments 🌱
 
-| Argument             | Description                                                                         | Required | Default |
-| :------------------- | :-------------------------------------------------------------------------------- | :------- | :------ |
-| `--old-model-path`   | Path to the trained smaller model ***.pt checkpoint file***.                        | Yes      |         |
-| `--output-path`      | Path to save the new, expanded ***.pt model file***.                                | Yes      |         |
-| `--context_dim`      | ***Required:*** New context dimension.                                                | Yes      |         |
-| `--h_hidden`         | ***Required:*** New H-RNN hidden size.                                                | Yes      |         |
-| `--l_hidden`         | ***Required:*** New L-RNN hidden size.                                                | Yes      |         |
-| *Other Arch Args* | *Optional:* Add other architectural args like `--ltm_slots`, `--max_length`, etc., if changing them. | No       | *(Uses old model's value)* |
+| Argument | Description | Required | Default |
+| :--- | :--- | :--- | :--- |
+| `--old-model-path` | Source model directory or direct `.pt` checkpoint. A local tokenizer must be available beside the resolved checkpoint. | Yes | |
+| `--output-dir` / `--output-path` | Output model-package directory. A legacy `.pt` value is converted to a package-directory name. | Yes | |
+| `--context-dim` | New context width. `h_hidden` follows it unless explicitly supplied; `l_hidden` follows only when context width changes. | No | Source value |
+| `--persistent-dim` | New persistent-vector width. | No | Source value |
+| `--ltm-slots`, `--ltm-key-dim`, `--ltm-val-dim`, `--ltm-topk` | Resize associative-memory geometry using slot-aware transplantation. | No | Source values |
+| `--h-hidden`, `--l-hidden`, `--rwkv-head-size` | Override recurrent widths/head geometry. A shared head-size override updates both recurrent cells. | No | Source values |
+| `--token-adapter-rank` | Override the shared Alpha v0.30 RWKV-v9 token-adapter rank. An inherited rank is capped when shrinking below it. | No | Source value |
+| `--new-max-length` / `--auto-max-length` | Update sequence-length metadata directly or by scanning a dataset. | No | Source value |
+| `--overwrite-output` | Atomically replace an existing package after the staged package passes checkpoint and tokenizer verification. | No | `False` |
+| `--trust-remote-code` | Permit custom tokenizer code. Disabled by default and unnecessary for normal local packages. | No | `False` |
 
 -----
 
@@ -1159,6 +1322,13 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **DirectML/ZLUDA communities** for enabling AMD GPU acceleration on Windows.
 
 ## Changelog
+
+### v0.30 (alpha)
+
+  * **Product and Core Naming**: The public release is **Hierarchos Alpha v0.30**. RWKV-v8 and RWKV-v9 identify core architecture generations only; `legacy-v8` and `coherent-v9` remain compatibility-stable internal checkpoint/config identifiers.
+  * **RWKV-v9 Core**: Introduces the corrected matrix-state recurrence, per-row hard ACT, bounded deterministic ROSA, isolated metadata-safe LTM, and shared factorized token adapters.
+  * **Affordable Reference Architecture**: The `448/448/448` reference has `30,227,653` parameters and `102` state-dict entries, versus `232,516,229` parameters and `95` entries for the historical RWKV-v8 reference—an `86.9998%` parameter reduction.
+  * **End-to-End Coherence**: Hardens checkpoint/resume, cache/tokenizer, CLI/GUI, packaging, and inference boundaries, with an ASCII RWKV-v8-to-v9 architecture flowchart near the top of this README.
 
 ### v0.21 (alpha)
 

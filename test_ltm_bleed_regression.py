@@ -1,3 +1,4 @@
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -9,6 +10,48 @@ from hierarchos.training.trainer import (
     estimate_cuda_loss_chunk_rows,
     train_step,
 )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    (
+        ({"n_slots": 0}, "n_slots"),
+        ({"key_dim": 2.5}, "key_dim"),
+        ({"val_dim": float("inf")}, "val_dim"),
+        ({"reference_chunk_len": 0}, "reference_chunk_len"),
+        ({"lr": -1e-3}, "lr"),
+        ({"momentum": 1.01}, "momentum"),
+        ({"wd": -1e-4}, "wd"),
+        ({"forget_rate": 1.01}, "forget_rate"),
+        ({"score_grad_scale": float("nan")}, "score_grad_scale"),
+    ),
+)
+def test_ltm_constructor_rejects_invalid_numeric_state_policy(kwargs, field):
+    parameters = {"n_slots": 4, "key_dim": 3, "val_dim": 2}
+    parameters.update(kwargs)
+    with pytest.raises(ValueError, match=field):
+        LTMModule(**parameters)
+
+
+def test_ltm_constructor_preserves_valid_zero_and_boundary_controls():
+    ltm = LTMModule(
+        n_slots=4,
+        key_dim=3,
+        val_dim=2,
+        lr=0,
+        momentum=1,
+        wd=0,
+        forget_rate=1,
+        reference_chunk_len=1,
+        score_grad_scale=0,
+    )
+
+    assert ltm.lr == 0.0
+    assert ltm.momentum == 1.0
+    assert ltm.weight_decay == 0.0
+    assert ltm.forget_rate == 1.0
+    assert ltm.reference_chunk_len == 1
+    assert ltm.score_grad_scale == 0.0
 
 
 def _config():
@@ -49,9 +92,277 @@ def test_plain_eval_forward_is_read_only_by_default():
         out = model(input_ids)
 
     ltm_state = out["ltm_memory_state"]
-    assert ltm_state[0].shape == (2, model.config.ltm_slots, model.config.ltm_val_dim)
+    # A read-only batch shares one immutable 2-D memory store. Expanding it to
+    # [batch, slots, dim] makes ``slow + fast`` allocate a full batched memory at
+    # every token despite never writing it.
+    assert ltm_state[0].shape == (model.config.ltm_slots, model.config.ltm_val_dim)
+    assert ltm_state[0].data_ptr() == model.ltm.fast_vals.data_ptr()
     assert torch.allclose(model.ltm.fast_vals, initial_fast)
-    assert torch.allclose(ltm_state[0], initial_fast.unsqueeze(0).expand_as(ltm_state[0]))
+    assert torch.allclose(ltm_state[0], initial_fast)
+
+
+def test_read_only_training_gathers_slow_and_fast_without_batched_full_store():
+    torch.manual_seed(71)
+    config = _config()
+    config.ltm_training_mode = "read-only"
+    model = HierarchosCore(config).train()
+    gathered_memories = []
+    original_gather = model.ltm._gather_slot_values
+
+    def capture_gather(index, memory):
+        gathered_memories.append(memory)
+        return original_gather(index, memory)
+
+    model.ltm._gather_slot_values = capture_gather
+    input_ids = torch.tensor([[1, 2, 3], [31, 32, 33]], dtype=torch.long)
+    outputs = model(
+        input_ids,
+        return_topk_values=False,
+        return_raw_topk_values=False,
+        return_topk_indices=False,
+        return_step_telemetry=False,
+    )
+
+    assert outputs["ltm_memory_state"][0].ndim == 2
+    # Each token gathers once from slow values and once from fast values. No
+    # [batch, slots, dim] slow+fast temporary is ever materialized.
+    assert len(gathered_memories) == input_ids.shape[1] * 2
+    assert {
+        tuple(memory.shape)
+        for memory in gathered_memories
+    } == {(model.config.ltm_slots, model.config.ltm_val_dim)}
+    assert {
+        memory.data_ptr()
+        for memory in gathered_memories
+    } == {
+        model.ltm.vals.data_ptr(),
+        model.ltm.fast_vals.data_ptr(),
+    }
+
+
+def test_shared_ltm_state_is_isolated_before_batched_runtime_writes():
+    torch.manual_seed(711)
+    config = _config()
+    config.ltm_training_mode = "read-only"
+    model = HierarchosCore(config).eval()
+    shared_state = (
+        model.ltm.fast_vals.clone(),
+        model.ltm._mom_vals.clone(),
+        None,
+        None,
+        model.ltm.timestamps.clone(),
+        model.ltm.sources.clone(),
+        model.ltm.wallclock_timestamps.clone(),
+    )
+    input_ids = torch.tensor([[1, 2], [31, 32]], dtype=torch.long)
+
+    with torch.no_grad():
+        outputs = model(
+            input_ids,
+            ltm_memory_state=shared_state,
+            suppress_hebbian=False,
+        )
+
+    runtime_state = outputs["ltm_memory_state"]
+    assert runtime_state[0].shape == (
+        2,
+        model.config.ltm_slots,
+        model.config.ltm_val_dim,
+    )
+    assert runtime_state[1].shape == runtime_state[0].shape
+    assert runtime_state[4].shape == (2, model.config.ltm_slots)
+    assert runtime_state[5].shape == (2, model.config.ltm_slots)
+    assert runtime_state[6].shape == (2, model.config.ltm_slots)
+    assert runtime_state[0][0].data_ptr() != runtime_state[0][1].data_ptr()
+
+
+def test_last_logit_only_is_exact_and_does_not_build_step_telemetry():
+    torch.manual_seed(72)
+    model = HierarchosCore(_config()).eval()
+    input_ids = torch.tensor([[7, 8, 9, 10]], dtype=torch.long)
+
+    with torch.no_grad():
+        full = model(input_ids)
+        last = model(
+            input_ids,
+            return_last_logit_only=True,
+            return_step_telemetry=False,
+            return_topk_values=False,
+            return_raw_topk_values=False,
+            return_topk_indices=False,
+        )
+
+    torch.testing.assert_close(
+        last["logits"],
+        full["logits"][:, -1:],
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    torch.testing.assert_close(last["h_state"], full["h_state"], rtol=0, atol=0)
+    torch.testing.assert_close(last["l_state"], full["l_state"], rtol=0, atol=0)
+    assert last["step_telemetry"] is None
+
+
+def test_last_logit_only_selects_each_rows_last_active_token():
+    torch.manual_seed(721)
+    model = HierarchosCore(_config()).eval()
+    input_ids = torch.tensor(
+        [[7, 8, 9, 10], [11, 12, 0, 0]],
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor(
+        [[1, 1, 1, 1], [1, 1, 0, 0]],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        full = model(input_ids, attention_mask=attention_mask)
+        last = model(
+            input_ids,
+            attention_mask=attention_mask,
+            return_last_logit_only=True,
+            return_step_telemetry=False,
+        )
+
+    expected = torch.stack(
+        [full["logits"][0, 3], full["logits"][1, 1]],
+        dim=0,
+    ).unsqueeze(1)
+    torch.testing.assert_close(last["logits"], expected, rtol=1e-5, atol=1e-6)
+
+
+def test_fully_filtered_ltm_slots_inject_no_timestamp_positional_signal():
+    torch.manual_seed(8)
+    model = HierarchosCore(_config()).eval()
+    captured_mac_inputs = []
+
+    def capture_mac_input(_module, inputs):
+        captured_mac_inputs.append(inputs[0].detach().clone())
+
+    handle = model.in_proj.register_forward_pre_hook(capture_mac_input)
+    try:
+        with torch.no_grad():
+            outputs = model(
+                torch.tensor([[1, 2, 3]], dtype=torch.long),
+                min_timestamp=1.0,
+                suppress_hebbian=True,
+            )
+    finally:
+        handle.remove()
+
+    assert torch.all(outputs["topk_idx"] == -1)
+    memory_width = model.config.ltm_topk * model.config.ltm_val_dim
+    for mac_input in captured_mac_inputs:
+        assert torch.count_nonzero(mac_input[..., -memory_width:]) == 0
+
+
+def test_ltm_write_metadata_keeps_token_wallclock_and_source_clocks_separate():
+    torch.manual_seed(9)
+    ltm = LTMModule(
+        n_slots=4,
+        key_dim=2,
+        val_dim=3,
+        forget_rate=0.0,
+    )
+    with torch.no_grad():
+        ltm.keys.zero_()
+        ltm.keys[0, 0] = 10.0
+
+    topk_idx = torch.tensor([[[0]]], dtype=torch.long)
+    grads = torch.ones(1, 1, 1, 3)
+    ltm.inner_update(
+        topk_idx,
+        grads,
+        current_lr=0.1,
+        timestamp=17.0,
+        source=LTMModule.SRC_CORRECTION,
+        wallclock_timestamp=1_700_000_000.0,
+        tokens_covered=1,
+        inplace=True,
+    )
+
+    assert ltm.timestamps[0].item() == 17.0
+    assert ltm.sources[0].item() == LTMModule.SRC_CORRECTION
+    assert ltm.wallclock_timestamps[0].item() == 1_700_000_000.0
+
+    query = torch.tensor([[1.0, 0.0]])
+    _vals, idx, _ts = ltm.retrieve_topk(
+        query,
+        topk=1,
+        source_filter=LTMModule.SRC_CORRECTION,
+        min_wallclock_timestamp=1_699_999_999.0,
+    )
+    assert idx.item() == 0
+    _vals, idx, _ts = ltm.retrieve_topk(
+        query,
+        topk=1,
+        source_filter=LTMModule.SRC_TRAINING_DATA,
+    )
+    assert idx.item() == -1
+    _vals, idx, _ts = ltm.retrieve_topk(
+        query,
+        topk=1,
+        min_wallclock_timestamp=1_700_000_001.0,
+    )
+    assert idx.item() == -1
+
+
+def test_core_hebbian_write_propagates_requested_source_and_clocks():
+    torch.manual_seed(10)
+    model = HierarchosCore(_config()).eval()
+    with torch.no_grad():
+        outputs = model(
+            torch.tensor([[4, 5, 6]], dtype=torch.long),
+            allow_hebbian_update=True,
+            memory_write_source=LTMModule.SRC_CORRECTION,
+            memory_write_timestamp=123.0,
+            memory_write_wallclock_timestamp=456.0,
+        )
+
+    state = outputs["ltm_memory_state"]
+    touched = torch.unique(outputs["topk_idx"][outputs["topk_idx"] >= 0])
+    assert touched.numel() > 0
+    assert torch.all(state[4][touched] == 123.0)
+    assert torch.all(state[5][touched] == LTMModule.SRC_CORRECTION)
+    assert torch.all(state[6][touched] == 456.0)
+
+
+def test_ltm_delta_accumulator_records_global_decay_exactly_and_cumulatively():
+    ltm = LTMModule(
+        n_slots=5,
+        key_dim=2,
+        val_dim=3,
+        momentum=0.0,
+        wd=0.0,
+        forget_rate=0.25,
+        reference_chunk_len=4,
+    )
+    with torch.no_grad():
+        ltm.fast_vals.fill_(1.0)
+    ltm.accumulate_deltas = True
+    initial = ltm.fast_vals.clone()
+    topk_idx = torch.tensor([[[0]]], dtype=torch.long)
+    zero_grads = torch.zeros(1, 1, 1, 3)
+
+    ltm.inner_update(
+        topk_idx,
+        zero_grads,
+        current_lr=0.0,
+        timestamp=1.0,
+        tokens_covered=4,
+        inplace=True,
+    )
+    torch.testing.assert_close(ltm.ltm_deltas, ltm.fast_vals - initial)
+
+    ltm.inner_update(
+        topk_idx,
+        zero_grads,
+        current_lr=0.0,
+        timestamp=2.0,
+        tokens_covered=4,
+        inplace=True,
+    )
+    torch.testing.assert_close(ltm.ltm_deltas, ltm.fast_vals - initial)
 
 
 def test_validation_hebbian_batch_ltm_state_is_isolated_from_global_buffer():
@@ -371,6 +682,32 @@ def test_cpu_gather_retrieval_default_matches_dense_cpu_math():
     assert torch.allclose(gather_vals, dense_vals, atol=1e-6)
     assert torch.equal(gather_idx, dense_idx)
     assert torch.allclose(gather_ts, dense_ts, atol=1e-6)
+
+
+def test_batched_gather_adds_only_selected_slow_and_fast_slots():
+    torch.manual_seed(223)
+    ltm = LTMModule(
+        n_slots=9,
+        key_dim=5,
+        val_dim=4,
+        cpu_gather_retrieval=True,
+    )
+    queries = torch.randn(3, 5)
+    fast_vals = torch.randn(3, 9, 4) * 0.1
+    timestamps = torch.arange(9, dtype=torch.float32).expand(3, -1).clone()
+
+    with torch.no_grad():
+        retrieved, indices, _timestamps = ltm.retrieve_topk(
+            queries,
+            topk=3,
+            fast_vals=fast_vals,
+            timestamps=timestamps,
+        )
+        effective = ltm.vals.unsqueeze(0) + fast_vals
+        batch_index = torch.arange(queries.shape[0]).unsqueeze(1)
+        expected = effective[batch_index, indices]
+
+    torch.testing.assert_close(retrieved, expected, rtol=0, atol=0)
 
 
 def test_cpu_sparse_update_default_matches_dense_cpu_math():

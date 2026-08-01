@@ -1,9 +1,9 @@
-# Core dependencies for running and training
-torch
-transformers
+# Core dependencies for running and training. PyTorch 2.4+ supplies the
+# fail-closed safe_globals checkpoint-loading boundary used by the active CLI.
+torch>=2.4
+transformers>=4.30.0
 datasets
 numpy
-datasets
 
 # Optional, but highly recommended for fine-tuning, building the C++ kernel,
 # and enabling all features.
@@ -12,7 +12,7 @@ cmake
 peft
 accelerate
 bitsandbytes
-numba  # ROSA JIT acceleration (10-50x speedup for suffix automaton)
+numba  # Optional ROSA reference/debug JIT; the persistent production path is pure Python.
 
 # Optional: lm-evaluation-harness for benchmark evaluation during training
 # Install with: pip install lm-eval

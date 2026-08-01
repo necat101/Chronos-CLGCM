@@ -30,6 +30,7 @@ def _hf_args(revision=None):
         completion_column=None,
         use_rosa=True,
         rosa_max_context=512,
+        enforce_rosa_max_context=False,
         training_chunk_size=256,
     )
 
@@ -55,6 +56,27 @@ def test_hf_cache_key_is_pinned_to_resolved_commit(monkeypatch):
 
     args._resolved_hf_dataset_revision = "b" * 40
     assert hierarchos_cli._hf_token_cache_key(args) != first_key
+
+
+def test_hf_cache_key_versions_bounded_rosa_semantics():
+    args = _hf_args("a" * 40)
+    args._resolved_hf_dataset_revision = "a" * 40
+    legacy_key = hierarchos_cli._hf_token_cache_key(args)
+    legacy_payload = hierarchos_cli._hf_cache_key_payload(
+        args,
+        format_name=hierarchos_cli._hf_token_cache_format(args),
+    )
+    assert legacy_payload["rosa_ids_context_mode"] == "legacy-unbounded-v1"
+
+    args.enforce_rosa_max_context = True
+    bounded_key = hierarchos_cli._hf_token_cache_key(args)
+    bounded_payload = hierarchos_cli._hf_cache_key_payload(
+        args,
+        format_name=hierarchos_cli._hf_token_cache_format(args),
+    )
+    assert bounded_key != legacy_key
+    assert bounded_payload["enforce_rosa_max_context"] is True
+    assert bounded_payload["rosa_ids_context_mode"] == "bounded-segment-v1"
 
 
 def test_nonstreaming_hf_load_parallelizes_arrow_preparation(monkeypatch):
@@ -83,6 +105,26 @@ def test_nonstreaming_hf_load_parallelizes_arrow_preparation(monkeypatch):
         num_proc=8,
     )
     assert "num_proc" not in calls[-1][1]
+
+
+def test_hf_size_estimate_uses_the_same_pinned_revision_as_training(monkeypatch):
+    import datasets
+
+    calls = []
+
+    def _fake_builder(*args, **kwargs):
+        calls.append((args, kwargs))
+        split = types.SimpleNamespace(num_examples=123)
+        return types.SimpleNamespace(info=types.SimpleNamespace(splits={"train": split}))
+
+    monkeypatch.setattr(datasets, "load_dataset_builder", _fake_builder)
+
+    assert hierarchos_cli.estimate_hf_dataset_size(
+        "owner/dataset",
+        split="train",
+        revision="c" * 40,
+    ) == 123
+    assert calls[-1][1] == {"revision": "c" * 40}
 
 
 def test_bucket_auto_tuning_is_sampled_once_and_persisted(tmp_path, monkeypatch):

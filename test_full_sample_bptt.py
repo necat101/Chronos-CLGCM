@@ -547,6 +547,71 @@ def test_segmented_checkpointed_train_step_matches_direct_full_sample_math():
     _assert_parameter_gradients_close(segmented_model, direct_model)
 
 
+def test_segmented_checkpointed_live_rosa_is_precomputed_for_pure_replay():
+    """Live mutable ROSA must match one direct whole-sample forward exactly."""
+
+    torch.manual_seed(4701)
+    direct_config = _tiny_config(use_rosa=True, detach_every_n_steps=None)
+    direct_config.architecture_revision = "coherent-v9"
+    direct_config.h_stride = 4
+    direct_config.commitment_threshold = 0.0
+    direct_model = HierarchosCore(direct_config)
+    segmented_model = HierarchosCore(AttrDict(dict(direct_model.config)))
+    segmented_model.load_state_dict(direct_model.state_dict())
+
+    input_ids = torch.tensor(
+        [[3, 5, 3, 5, 7, 3, 5, 7, 9, 3]],
+        dtype=torch.long,
+    )
+    labels = input_ids.clone()
+    attention_mask = torch.ones_like(input_ids)
+    batch = {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+    }
+    common_args = dict(
+        training_chunk_size=3,
+        full_sample_checkpoint_segment_size=3,
+        full_sample_bptt=True,
+        persist_state=False,
+        adaptive_ponder=True,
+        ponder_target_scale=0.65,
+        max_h_steps=2,
+        ponder_loss_weight=0.003,
+        commitment_loss_weight=0.5,
+        max_ce_loss_for_backward=0.0,
+        max_ponder_cost_for_backward=0.0,
+        max_commitment_cost_for_backward=4.0,
+        ltm_value_alignment_weight=0.0,
+    )
+
+    direct_outputs, _direct_states = _run_without_optimizer_step(
+        direct_model,
+        batch,
+        _step_args(full_sample_activation_checkpointing=False, **common_args),
+    )
+    segmented_outputs, segmented_states = _run_without_optimizer_step(
+        segmented_model,
+        batch,
+        _step_args(full_sample_activation_checkpointing=True, **common_args),
+    )
+
+    assert direct_outputs is not None
+    assert segmented_outputs is not None
+    for key in ("loss", "ponder_cost", "commitment_cost"):
+        torch.testing.assert_close(
+            segmented_outputs[key],
+            direct_outputs[key],
+            rtol=2e-5,
+            atol=2e-6,
+        )
+    # Checkpointed full-sample training does not need a mutable terminal ROSA
+    # history because persist_state is forbidden for this mode.
+    assert segmented_states[-1][3] is None
+    _assert_parameter_gradients_close(segmented_model, direct_model)
+
+
 def test_segmented_checkpointed_full_bptt_does_not_detach_boundary_states():
     torch.manual_seed(73)
     direct_config = _tiny_config(use_rosa=False, detach_every_n_steps=None)

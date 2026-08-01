@@ -1,6 +1,6 @@
 import os
 import sys
-from setuptools import setup, Extension
+from setuptools import setup, Extension, find_namespace_packages
 from setuptools.command.build_ext import build_ext
 import subprocess
 
@@ -69,7 +69,7 @@ class CMakeBuild(build_ext):
             cmake_args += [f'-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE={extdir}']
             build_args += ['--', '/m']
         else:
-            build_args += ['--', '-j' + str(os.cpu_count())]
+            build_args += ['--', '-j' + str(os.cpu_count() or 1)]
 
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)
@@ -85,8 +85,15 @@ setup(
     author_email='saltpepper312@gmail.com', # Placeholder
     description='Custom C++ kernel with optional Vulkan support for the Hierarchos project',
     long_description='',
+    # Include the modular Python runtime as well as the optional native
+    # accelerator. Most subdirectories intentionally use namespace-package
+    # layout (no __init__.py), so find_packages() would still omit them.
+    packages=find_namespace_packages(include=["hierarchos", "hierarchos.*"]),
     ext_modules=[CMakeExtension('hierarchos_matmul', sourcedir='cpp')],
     cmdclass={'build_ext': CMakeBuild},
     zip_safe=False,
-    python_requires=">=3.8",
+    # The active modular runtime uses PEP 604 union annotations (``T | None``),
+    # which are syntax only on Python 3.10+.  Advertising 3.8/3.9 lets an
+    # installation succeed and then fail while importing the model.
+    python_requires=">=3.10",
 )

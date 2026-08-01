@@ -1,8 +1,10 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from hierarchos.training.datasets import _resolve_prefetch_factor
 from hierarchos.training.trainer import estimate_cuda_loss_chunk_rows
+from hierarchos.training.trainer import configure_cuda_training_runtime
 from hierarchos_cli import (
     choose_length_bucket_size_from_lengths,
     estimate_bucket_token_efficiency,
@@ -66,6 +68,30 @@ class BlackwellCudaDefaultTests(unittest.TestCase):
         )
 
         self.assertGreaterEqual(rows, 64 * 255)
+
+    def test_programmatic_cuda_amp_and_compile_opt_outs_are_respected(self):
+        args = SimpleNamespace(
+            amp=False,
+            compile=False,
+            force_compile=False,
+            compile_static_worker_loop=None,
+            _explicit_cli_dests=("amp", "compile"),
+        )
+        config = SimpleNamespace(amp=False, compile=False)
+        properties = SimpleNamespace(total_memory=96 * 1024**3)
+
+        with (
+            mock.patch("torch.cuda.get_device_name", return_value="Test GPU"),
+            mock.patch("torch.cuda.get_device_properties", return_value=properties),
+            mock.patch("torch.cuda.get_device_capability", return_value=(9, 0)),
+            mock.patch("torch.cuda.is_bf16_supported", return_value=True),
+        ):
+            configure_cuda_training_runtime(args, config, _Device())
+
+        self.assertFalse(args.amp)
+        self.assertFalse(config.amp)
+        self.assertFalse(args.compile)
+        self.assertFalse(config.compile)
 
 
 if __name__ == "__main__":

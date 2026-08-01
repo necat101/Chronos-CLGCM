@@ -8,6 +8,7 @@ import torch
 
 import hierarchos_cli
 from hierarchos.training.datasets import TokenizedBinaryDataset
+from hierarchos.utils.rosa import precompute_rosa_ids_for_chunks
 
 
 class _GPT2SizedTokenizer:
@@ -44,6 +45,7 @@ def _cache_args(source_path, cache_root):
         use_rosa=True,
         training_chunk_size=4,
         rosa_max_context=8,
+        enforce_rosa_max_context=False,
         token_cache_build_batch_size=2,
         token_cache_write_buffer_mb=1,
         batch_size=2,
@@ -79,6 +81,83 @@ def _dummy_weighted_batch():
     }
 
 
+def test_cache_directory_publish_retries_transient_windows_permission_error(monkeypatch):
+    calls = []
+    sleeps = []
+
+    def _flaky_replace(source, destination):
+        calls.append((source, destination))
+        if len(calls) < 3:
+            raise PermissionError("simulated transient directory handle")
+
+    monkeypatch.setattr(
+        hierarchos_cli,
+        "_RETRY_CACHE_DIRECTORY_PERMISSION_ERRORS",
+        True,
+    )
+    monkeypatch.setattr(hierarchos_cli.os, "replace", _flaky_replace)
+    monkeypatch.setattr(hierarchos_cli.time, "sleep", sleeps.append)
+
+    hierarchos_cli._replace_cache_directory_atomically(
+        "cache.tmp",
+        "cache",
+        attempts=5,
+    )
+
+    assert calls == [("cache.tmp", "cache")] * 3
+    assert sleeps == [0.05, 0.10]
+
+
+def test_cache_directory_publish_fails_closed_after_retry_budget(monkeypatch):
+    calls = []
+
+    def _blocked_replace(source, destination):
+        calls.append((source, destination))
+        raise PermissionError("simulated persistent directory handle")
+
+    monkeypatch.setattr(
+        hierarchos_cli,
+        "_RETRY_CACHE_DIRECTORY_PERMISSION_ERRORS",
+        True,
+    )
+    monkeypatch.setattr(hierarchos_cli.os, "replace", _blocked_replace)
+    monkeypatch.setattr(hierarchos_cli.time, "sleep", lambda _delay: None)
+
+    with pytest.raises(PermissionError, match="persistent directory handle"):
+        hierarchos_cli._replace_cache_directory_atomically(
+            "cache.tmp",
+            "cache",
+            attempts=3,
+        )
+
+    assert calls == [("cache.tmp", "cache")] * 3
+
+
+def test_cached_item_uses_versioned_bounded_rosa_precompute(tmp_path):
+    args = _cache_args(tmp_path / "source.jsonl", tmp_path / "cache")
+    args.enforce_rosa_max_context = True
+    tokens = [1, 2, 1, 2, 3, 1, 2, 4, 1, 2]
+    processed = {
+        "input_ids": torch.tensor(tokens, dtype=torch.long),
+        "labels": torch.tensor(tokens, dtype=torch.long),
+        "_length": len(tokens),
+    }
+    item = hierarchos_cli._processed_sample_to_cached_item(
+        processed,
+        args=args,
+        tokenizer=_GPT2SizedTokenizer(),
+    )
+    expected = precompute_rosa_ids_for_chunks(
+        tokens,
+        vocab_size=50257,
+        chunk_size=args.training_chunk_size,
+        rosa_max_ctx=args.rosa_max_context,
+        enforce_max_context=True,
+    )
+    assert item["_rosa_context_mode"] == "bounded-segment-v1"
+    assert item["rosa_ids"].tolist() == expected
+
+
 def test_local_compact_cache_is_lossless_small_and_backward_ready(tmp_path, monkeypatch):
     source_path = tmp_path / "source.jsonl"
     source_path.write_text('{"instruction":"a","output":"b"}\n', encoding="utf-8")
@@ -104,7 +183,12 @@ def test_local_compact_cache_is_lossless_small_and_backward_ready(tmp_path, monk
     assert index["rosa_dtype"] == "uint16"
     assert index["label_ignore_sentinel"] is None
     assert index["loss_weight_encoding"] == "float32_palette_rle"
-    assert builder_kwargs["in_order"] is False
+    assert index["rosa_ids_context_mode"] == "legacy-unbounded-v1"
+    assert index["enforce_rosa_max_context"] is False
+    assert builder_kwargs["in_order"] is True
+    assert builder_kwargs["enforce_rosa_max_context"] is False
+    assert len(index["ordered_record_sha256"]) == 64
+    assert len(index["tokens_sha256"]) == 64
 
     # Eight real tokens at four bytes/token: uint16 input plus ROSA. Labels are
     # reconstructed exactly from input ids after the writer verifies equality.
@@ -113,6 +197,14 @@ def test_local_compact_cache_is_lossless_small_and_backward_ready(tmp_path, monk
     with open(os.path.join(cache_dir, "_SUCCESS"), "r", encoding="utf-8") as success_file:
         success = json.load(success_file)
     assert success["bytes"] == 8 * 4
+    assert success["ordered_record_sha256"] == index["ordered_record_sha256"]
+    assert success["tokens_sha256"] == index["tokens_sha256"]
+    assert args._token_cache_identity["tokens_sha256"] == index["tokens_sha256"]
+    assert success["rosa_ids_context_mode"] == "legacy-unbounded-v1"
+    with open(os.path.join(cache_dir, "cache_audit.json"), "r", encoding="utf-8") as audit_file:
+        audit = json.load(audit_file)
+    assert audit["accepted"] == 2
+    assert audit["retained_tokens"] == 8
 
     dataset = TokenizedBinaryDataset(cache_dir, max_length=4, pad_token_id=99)
     first = dataset[0]
@@ -127,6 +219,7 @@ def test_local_compact_cache_is_lossless_small_and_backward_ready(tmp_path, monk
     assert fused["labels"].dtype == torch.int32
     assert fused["attention_mask"].dtype == torch.bool
     assert fused["rosa_ids"].dtype == torch.int32
+    assert fused["rosa_ids_context_mode"] == "legacy-unbounded-v1"
     assert torch.equal(
         fused["labels"],
         torch.tensor([[10, 11, 12, 13], [20, 21, 22, -100]], dtype=torch.int32),
@@ -144,6 +237,134 @@ def test_local_compact_cache_is_lossless_small_and_backward_ready(tmp_path, monk
     # A completed immutable-key cache is reused rather than rebuilt.
     assert hierarchos_cli.materialize_local_token_cache(args, _GPT2SizedTokenizer()) == cache_dir
     assert len(build_calls) == 1
+
+
+def test_completed_cache_rejects_same_size_binary_corruption(tmp_path, monkeypatch):
+    source_path = tmp_path / "source.jsonl"
+    source_path.write_text('{"instruction":"a","output":"b"}\n', encoding="utf-8")
+    args = _cache_args(source_path, tmp_path / "cache")
+    monkeypatch.setattr(
+        hierarchos_cli,
+        "create_dataloader_for_jsonl",
+        lambda *_args, **_kwargs: [_dummy_weighted_batch()],
+    )
+    cache_dir = hierarchos_cli.materialize_local_token_cache(
+        args,
+        _GPT2SizedTokenizer(),
+    )
+    data_path = os.path.join(cache_dir, "tokens.bin")
+    original_size = os.path.getsize(data_path)
+    with open(data_path, "r+b") as data_file:
+        first = data_file.read(1)
+        data_file.seek(0)
+        data_file.write(bytes([first[0] ^ 0x01]))
+    assert os.path.getsize(data_path) == original_size
+
+    with pytest.raises(RuntimeError, match="binary checksum failed"):
+        hierarchos_cli.materialize_local_token_cache(
+            args,
+            _GPT2SizedTokenizer(),
+        )
+
+
+@pytest.mark.parametrize(
+    "field,mutate,match",
+    [
+        (
+            "cache_payload",
+            lambda success: {**success["cache_payload"], "max_length": 999},
+            "cache_payload metadata disagrees",
+        ),
+        ("samples", lambda success: int(success["samples"]) + 1, "sample count mismatch"),
+        ("bytes", lambda success: int(success["bytes"]) + 1, "byte count mismatch"),
+    ],
+)
+def test_completed_cache_rejects_success_index_metadata_drift(
+    tmp_path,
+    monkeypatch,
+    field,
+    mutate,
+    match,
+):
+    source_path = tmp_path / "source.jsonl"
+    source_path.write_text('{"instruction":"a","output":"b"}\n', encoding="utf-8")
+    args = _cache_args(source_path, tmp_path / "cache")
+    monkeypatch.setattr(
+        hierarchos_cli,
+        "create_dataloader_for_jsonl",
+        lambda *_args, **_kwargs: [_dummy_weighted_batch()],
+    )
+    cache_dir = hierarchos_cli.materialize_local_token_cache(
+        args,
+        _GPT2SizedTokenizer(),
+    )
+    success_path = os.path.join(cache_dir, "_SUCCESS")
+    with open(success_path, "r", encoding="utf-8") as success_file:
+        success = json.load(success_file)
+    success[field] = mutate(success)
+    with open(success_path, "w", encoding="utf-8") as success_file:
+        json.dump(success, success_file)
+
+    with pytest.raises(RuntimeError, match=match):
+        hierarchos_cli.materialize_local_token_cache(
+            args,
+            _GPT2SizedTokenizer(),
+        )
+
+
+def test_ordered_cache_identity_is_reproducible_across_fresh_roots(tmp_path, monkeypatch):
+    source_path = tmp_path / "source.jsonl"
+    source_path.write_text('{"instruction":"a","output":"b"}\n', encoding="utf-8")
+    batch = _dummy_weighted_batch()
+    monkeypatch.setattr(
+        hierarchos_cli,
+        "create_dataloader_for_jsonl",
+        lambda *_args, **_kwargs: [batch],
+    )
+    identities = []
+    for name in ("cache-a", "cache-b"):
+        args = _cache_args(source_path, tmp_path / name)
+        cache_dir = hierarchos_cli.materialize_local_token_cache(
+            args,
+            _GPT2SizedTokenizer(),
+        )
+        identities.append(args._token_cache_identity["ordered_record_sha256"])
+        assert os.path.exists(os.path.join(cache_dir, "cache_audit.json"))
+    assert identities[0] == identities[1]
+
+
+def test_cache_build_fails_when_rejection_budget_is_exceeded(tmp_path, monkeypatch):
+    source_path = tmp_path / "source.jsonl"
+    source_path.write_text('{"instruction":"a","output":"b"}\n', encoding="utf-8")
+    args = _cache_args(source_path, tmp_path / "cache")
+    batch = dict(_dummy_weighted_batch())
+    batch["_audit_records"] = [
+        {
+            "accepted": True,
+            "schema": "alpaca:instruction-output",
+            "source": "fixture",
+            "retained_tokens": 5,
+            "supervised_tokens": 4,
+            "weighted_tokens": 4.0,
+            "retained_response_tokens": 2,
+        },
+        {
+            "accepted": False,
+            "schema": "alpaca:instruction-output",
+            "source": "fixture",
+            "rejection_reason": "response_below_minimum",
+        },
+    ]
+    monkeypatch.setattr(
+        hierarchos_cli,
+        "create_dataloader_for_jsonl",
+        lambda *_args, **_kwargs: [batch],
+    )
+    with pytest.raises(RuntimeError, match="data quality budget exceeded"):
+        hierarchos_cli.materialize_local_token_cache(
+            args,
+            _GPT2SizedTokenizer(),
+        )
 
 
 def test_hf_schema_v6_cache_can_move_roots_without_retokenizing(tmp_path, monkeypatch, capsys):
@@ -238,6 +459,11 @@ def test_compact_cache_rejects_corrupt_loss_run_metadata(tmp_path, monkeypatch):
     torch.save(index, index_path)
 
     with pytest.raises(ValueError, match="final loss run"):
+        TokenizedBinaryDataset(cache_dir)
+
+    index["loss_run_ends"] = index["loss_run_ends"].to(dtype=torch.float32)
+    torch.save(index, index_path)
+    with pytest.raises(ValueError, match="loss-run ends must use an integer dtype"):
         TokenizedBinaryDataset(cache_dir)
 
 
