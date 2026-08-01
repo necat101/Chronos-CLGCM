@@ -440,6 +440,40 @@ def _enforce_cache_audit_budgets(args, audit):
         )
 
 
+def _persist_and_enforce_cache_audit(args, audit, *, tmp_dir, cache_dir):
+    """Persist audit evidence before enforcing budgets and clean failed builds."""
+
+    audit_path = os.path.join(tmp_dir, "cache_audit.json")
+    with open(audit_path, "w", encoding="utf-8") as audit_file:
+        json.dump(audit, audit_file, indent=2, sort_keys=True)
+
+    failed_audit_path = cache_dir + ".failed-cache-audit.json"
+    try:
+        _enforce_cache_audit_budgets(args, audit)
+    except Exception as exc:
+        preserved_path = None
+        try:
+            shutil.copy2(audit_path, failed_audit_path)
+            preserved_path = failed_audit_path
+        except OSError:
+            pass
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        suffix = (
+            f" Full audit saved to {preserved_path}."
+            if preserved_path is not None
+            else " The temporary cache was removed; the audit could not be preserved."
+        )
+        raise RuntimeError(f"{exc}{suffix}") from exc
+
+    try:
+        if os.path.exists(failed_audit_path):
+            os.remove(failed_audit_path)
+    except OSError:
+        pass
+    return audit_path
+
+
 def _jsonl_source_files(path):
     if _is_jsonl_path(path):
         return [path]
@@ -1855,10 +1889,12 @@ def materialize_hf_token_cache(args, tokenizer):
 
     ordered_record_sha256 = ordered_record_hasher.hexdigest()
     tokens_sha256 = tokens_hasher.hexdigest()
-    _enforce_cache_audit_budgets(args, cache_audit)
-    audit_path = os.path.join(tmp_dir, "cache_audit.json")
-    with open(audit_path, "w", encoding="utf-8") as audit_file:
-        json.dump(cache_audit, audit_file, indent=2, sort_keys=True)
+    audit_path = _persist_and_enforce_cache_audit(
+        args,
+        cache_audit,
+        tmp_dir=tmp_dir,
+        cache_dir=cache_dir,
+    )
     audit_sha256 = _file_sha256(audit_path)
 
     index = {
@@ -2161,10 +2197,12 @@ def materialize_local_token_cache(args, tokenizer):
 
     ordered_record_sha256 = ordered_record_hasher.hexdigest()
     tokens_sha256 = tokens_hasher.hexdigest()
-    _enforce_cache_audit_budgets(args, cache_audit)
-    audit_path = os.path.join(tmp_dir, "cache_audit.json")
-    with open(audit_path, "w", encoding="utf-8") as audit_file:
-        json.dump(cache_audit, audit_file, indent=2, sort_keys=True)
+    audit_path = _persist_and_enforce_cache_audit(
+        args,
+        cache_audit,
+        tmp_dir=tmp_dir,
+        cache_dir=cache_dir,
+    )
     audit_sha256 = _file_sha256(audit_path)
 
     index = {

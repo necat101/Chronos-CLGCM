@@ -360,11 +360,20 @@ def test_cache_build_fails_when_rejection_budget_is_exceeded(tmp_path, monkeypat
         "create_dataloader_for_jsonl",
         lambda *_args, **_kwargs: [batch],
     )
-    with pytest.raises(RuntimeError, match="data quality budget exceeded"):
+    with pytest.raises(RuntimeError, match="data quality budget exceeded") as exc_info:
         hierarchos_cli.materialize_local_token_cache(
             args,
             _GPT2SizedTokenizer(),
         )
+    assert "Full audit saved to" in str(exc_info.value)
+    failure_audits = list((tmp_path / "cache").glob("*.failed-cache-audit.json"))
+    assert len(failure_audits) == 1
+    with open(failure_audits[0], "r", encoding="utf-8") as audit_file:
+        failure_audit = json.load(audit_file)
+    assert failure_audit["records"] == 2
+    assert failure_audit["rejected"] == 1
+    assert failure_audit["rejection_reasons"] == {"response_below_minimum": 1}
+    assert not list((tmp_path / "cache").glob("*.tmp"))
 
 
 def test_hf_schema_v6_cache_can_move_roots_without_retokenizing(tmp_path, monkeypatch, capsys):
