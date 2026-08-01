@@ -22,6 +22,9 @@ from ..utils.rosa import ROSAState
 CHAT_STATE_KIND = "hierarchos_chat_runtime_state"
 CHAT_STATE_VERSION = 4
 LEGACY_CHAT_STATE_VERSIONS = frozenset({1, 2, 3})
+CHAT_CONTINUITY_METADATA_VERSION = 1
+MAX_CHAT_HISTORY_TURNS = 256
+MAX_CHAT_HISTORY_CHARS = 1_000_000
 RWKV_V8_LAYOUT = "rwkv_v8_matrix_packed"
 LEGACY_SCALAR_LAYOUT = "legacy_scalar_wkv"
 
@@ -313,6 +316,129 @@ def _validated_total_tokens(payload: Dict[str, Any]) -> int:
             "Chat state total_tokens_generated must be a nonnegative integer."
         )
     return value
+
+
+def _validated_bounded_int(
+    value: Any,
+    *,
+    name: str,
+    maximum: Optional[int] = None,
+) -> int:
+    if isinstance(value, bool):
+        raise RuntimeError(f"Chat state {name} cannot be boolean.")
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            f"Chat state {name} must be a nonnegative integer."
+        ) from exc
+    if value < 0:
+        raise RuntimeError(f"Chat state {name} must be a nonnegative integer.")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(
+            f"Chat state {name} exceeds the supported maximum of {maximum}."
+        )
+    return value
+
+
+def validate_chat_continuity_metadata(
+    payload: Dict[str, Any],
+    *,
+    expected_prefill_chunk_size: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Validate the optional CLI chat-continuity envelope.
+
+    Version-4 state files created before this envelope remain loadable. New CLI
+    state files include it so the absolute TBPTT phase and the bounded textual
+    turn history cannot silently change across a resumed session.
+    """
+    metadata = payload.get("chat_continuity")
+    if metadata is None:
+        return None
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Chat state has malformed chat_continuity metadata.")
+
+    version = _validated_bounded_int(
+        metadata.get("version"),
+        name="chat_continuity version",
+    )
+    if version != CHAT_CONTINUITY_METADATA_VERSION:
+        raise RuntimeError(
+            "Unsupported chat continuity metadata version: "
+            f"{version}."
+        )
+
+    prefill_chunk_size = _validated_bounded_int(
+        metadata.get("prefill_chunk_size"),
+        name="prefill_chunk_size",
+    )
+    history_max_turns = _validated_bounded_int(
+        metadata.get("history_max_turns"),
+        name="history_max_turns",
+        maximum=MAX_CHAT_HISTORY_TURNS,
+    )
+    history_max_chars = _validated_bounded_int(
+        metadata.get("history_max_chars"),
+        name="history_max_chars",
+        maximum=MAX_CHAT_HISTORY_CHARS,
+    )
+    carry_chat_state = metadata.get("carry_chat_state")
+    if not isinstance(carry_chat_state, bool):
+        raise RuntimeError("Chat state carry_chat_state must be boolean.")
+
+    turn_history = metadata.get("turn_history")
+    if not isinstance(turn_history, list):
+        raise RuntimeError("Chat state turn_history must be a list of strings.")
+    if len(turn_history) > history_max_turns:
+        raise RuntimeError(
+            "Chat state turn_history exceeds its persisted turn bound."
+        )
+    if any(not isinstance(turn, str) or not turn.strip() for turn in turn_history):
+        raise RuntimeError(
+            "Chat state turn_history must contain only nonempty strings."
+        )
+    history_text = "\n\n".join(turn_history)
+    if len(history_text) > history_max_chars:
+        raise RuntimeError(
+            "Chat state turn_history exceeds its persisted character bound."
+        )
+    if (history_max_turns == 0 or history_max_chars == 0) and turn_history:
+        raise RuntimeError(
+            "Chat state turn_history must be empty when a history bound is zero."
+        )
+
+    total_tokens = _validated_total_tokens(payload)
+    expected_phase = total_tokens % prefill_chunk_size if prefill_chunk_size > 0 else 0
+    saved_phase = _validated_bounded_int(
+        metadata.get("absolute_chunk_phase"),
+        name="absolute_chunk_phase",
+    )
+    if saved_phase != expected_phase:
+        raise RuntimeError(
+            "Chat state prefill chunk phase is inconsistent with its token offset: "
+            f"saved={saved_phase}, expected={expected_phase}."
+        )
+
+    if expected_prefill_chunk_size is not None:
+        requested = _validated_bounded_int(
+            expected_prefill_chunk_size,
+            name="requested prefill_chunk_size",
+        )
+        if requested != prefill_chunk_size:
+            raise RuntimeError(
+                "Chat state prefill chunk geometry mismatch: "
+                f"saved={prefill_chunk_size}, requested={requested}. "
+                "Resume without an override or use the saved chunk size."
+            )
+
+    return {
+        "prefill_chunk_size": prefill_chunk_size,
+        "absolute_chunk_phase": saved_phase,
+        "history_max_turns": history_max_turns,
+        "history_max_chars": history_max_chars,
+        "carry_chat_state": carry_chat_state,
+        "turn_history": list(turn_history),
+    }
 
 
 def _validate_rosa_state_structure(state: ROSAState, row_tokens: list[int]) -> None:

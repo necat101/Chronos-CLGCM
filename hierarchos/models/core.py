@@ -1889,8 +1889,6 @@ class HierarchosCore(nn.Module):
         ponder_weights = []
         commitment_costs = []
         commitment_weights = []
-        ltm_value_alignment_costs = []
-        ltm_value_alignment_weights = []
         all_topk_vals = []
         all_topk_idx = []
         aux_attention_mask = attention_mask.to(device=device, dtype=torch.float32) if attention_mask is not None else None
@@ -1940,7 +1938,15 @@ class HierarchosCore(nn.Module):
         h_effective_steps = [] if return_step_telemetry else None
         l_effective_steps = [] if return_step_telemetry else None
         persistent_batch = self.persistent.unsqueeze(0).expand(B, -1)
-        time_frequencies = self.time_freqs.view(1, 1, -1)
+        ltm_time_feature_mode = str(
+            getattr(self.config, "ltm_time_feature_mode", "absolute-sinusoidal")
+            or "absolute-sinusoidal"
+        ).strip().lower().replace("_", "-")
+        time_frequencies = (
+            self.time_freqs.view(1, 1, -1)
+            if ltm_time_feature_mode == "absolute-sinusoidal"
+            else None
+        )
 
         # ==================================================================
         # 2. MAIN TIME LOOP
@@ -2022,13 +2028,18 @@ class HierarchosCore(nn.Module):
             if return_topk_indices:
                 all_topk_idx.append(topk_idx)
             
-            # Positional encoding
-            args = topk_ts.unsqueeze(-1) * time_frequencies
-            pe = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-            if self.config.ltm_val_dim % 2 == 1:
-                pe = torch.cat([pe, pe.new_zeros(*pe.shape[:-1], 1)], dim=-1)
             valid_memory = (topk_idx >= 0).unsqueeze(-1)
-            topk_vals = (topk_vals + pe) * valid_memory.to(dtype=topk_vals.dtype)
+            if time_frequencies is not None:
+                # Legacy-v8 learned with this absolute timestamp signal.  It is
+                # deliberately absent from coherent-v9, where timestamps are
+                # metadata only: stamping a slot must not inject an unrelated
+                # O(1) sinusoid into an otherwise tiny online update.
+                time_args = topk_ts.unsqueeze(-1) * time_frequencies
+                pe = torch.cat([torch.sin(time_args), torch.cos(time_args)], dim=-1)
+                if self.config.ltm_val_dim % 2 == 1:
+                    pe = torch.cat([pe, pe.new_zeros(*pe.shape[:-1], 1)], dim=-1)
+                topk_vals = topk_vals + pe
+            topk_vals = topk_vals * valid_memory.to(dtype=topk_vals.dtype)
             
             if self.memory_token_routers and hasattr(self, "ltm_router"):
                 gate_input = self.ltm_gate_logit + self.ltm_router(token_x)
@@ -2287,17 +2298,6 @@ class HierarchosCore(nn.Module):
                     torch.zeros_like(cc),
                 )
 
-            if ltm_value_readout is not None:
-                value_to_store = self.val_proj(enc.detach())
-                memory_readback = F.linear(value_to_store, ltm_value_readout)
-                target_value = enc.detach().float()
-                squared_error = (memory_readback.float() - target_value).square().mean(dim=-1)
-                target_energy = target_value.square().mean(dim=-1).clamp_min(1e-4)
-                alignment_cost = squared_error / target_energy
-                ltm_value_alignment_costs.append(alignment_cost)
-                if aux_attention_mask is not None:
-                    ltm_value_alignment_weights.append(aux_attention_mask[:, t])
-            
             if return_last_logit_only:
                 if has_inactive_rows:
                     if last_final_emb is None:
@@ -2353,14 +2353,16 @@ class HierarchosCore(nn.Module):
         # ==================================================================
         # 5. FINAL OUTPUTS
         # ==================================================================
+        sequence_enc = None
         if return_last_logit_only:
             final = _finite_clamp(
                 self.out_norm(last_final_emb.unsqueeze(1)),
                 activation_clamp,
             )
         else:
+            sequence_enc = torch.stack(final_embs, dim=1)
             final = _finite_clamp(
-                self.out_norm(torch.stack(final_embs, dim=1)),
+                self.out_norm(sequence_enc),
                 activation_clamp,
             )
         logits = None
@@ -2375,6 +2377,54 @@ class HierarchosCore(nn.Module):
             'logit_saturation_threshold',
             30.0,
         )
+
+        if ltm_value_readout is not None:
+            if sequence_enc is None:
+                raise RuntimeError(
+                    "LTM value alignment requires sequence outputs, not last-logit-only mode"
+                )
+            alignment_stride = max(
+                1,
+                int(getattr(self.config, "ltm_value_alignment_stride", 1) or 1),
+            )
+            first_alignment_index = (
+                -int(global_pos_offset)
+            ) % alignment_stride
+            if first_alignment_index >= int(sequence_enc.shape[1]):
+                # A very short non-aligned tail can contain no sampled global
+                # positions. Preserve a finite, val_proj-connected zero so the
+                # trainer's auxiliary contract remains total.
+                ltm_value_alignment_cost_out = self.val_proj.weight.sum() * 0.0
+            else:
+                alignment_targets = sequence_enc[
+                    :, first_alignment_index::alignment_stride
+                ].detach()
+                # One batched projection/readback replaces two small GEMM launches
+                # per token.  Only val_proj receives gradients: both the causal
+                # encoder target and the established LTM readout are detached.
+                value_to_store = self.val_proj(alignment_targets)
+                memory_readback = F.linear(value_to_store, ltm_value_readout)
+                target_value = alignment_targets.float()
+                squared_error = (
+                    memory_readback.float() - target_value
+                ).square().mean(dim=-1)
+                target_energy = target_value.square().mean(dim=-1).clamp_min(1e-4)
+                alignment_cost = squared_error / target_energy
+                if aux_attention_mask is None:
+                    ltm_value_alignment_cost_out = alignment_cost.mean()
+                else:
+                    alignment_weights = aux_attention_mask[
+                        :, first_alignment_index::alignment_stride
+                    ].float()
+                    alignment_denom = alignment_weights.sum()
+                    alignment_mean = (
+                        alignment_cost.float() * alignment_weights
+                    ).sum() / alignment_denom.clamp_min(1.0)
+                    ltm_value_alignment_cost_out = torch.where(
+                        alignment_denom > 0,
+                        alignment_mean,
+                        torch.zeros_like(alignment_mean),
+                    )
 
         if labels is not None and not return_logits:
             chunked_loss_result = self._compute_cuda_chunked_lm_loss(
@@ -2517,10 +2567,6 @@ class HierarchosCore(nn.Module):
 
             ponder_cost_out = _weighted_aux_mean(ponder_costs, ponder_weights)
             commitment_cost_out = _weighted_aux_mean(commitment_costs, commitment_weights)
-            ltm_value_alignment_cost_out = _weighted_aux_mean(
-                ltm_value_alignment_costs,
-                ltm_value_alignment_weights,
-            )
 
         h_state = _finite_clamp(h_state, recurrent_state_clamp)
         l_state = _finite_clamp(l_state, recurrent_state_clamp)

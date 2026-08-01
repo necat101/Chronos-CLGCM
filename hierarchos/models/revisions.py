@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 LEGACY_REVISION = "legacy-v8"
 COHERENT_REVISION = "coherent-v9"
-ARCHITECTURE_CONTRACT_SCHEMA_VERSION = 2
+ARCHITECTURE_CONTRACT_SCHEMA_VERSION = 3
 LEGACY_TRAINING_CHUNK_SIZE = 128
 COHERENT_TRAINING_CHUNK_SIZE = 256
 
@@ -83,6 +83,7 @@ ARCHITECTURE_CONTRACT_FIELDS = (
     "ltm_weight_decay",
     "ltm_forget_rate",
     "ltm_score_grad_scale",
+    "ltm_time_feature_mode",
     "reference_chunk_len",
     "training_chunk_size",
     "allow_untrained_hebbian_writer",
@@ -99,6 +100,12 @@ ARCHITECTURE_CONTRACT_FIELDS = (
     "max_commitment_cost_for_backward",
     "max_ponder_cost_for_backward",
     "z_loss_weight",
+    "ltm_value_alignment_weight",
+    "ltm_value_alignment_stride",
+    "ltm_value_alignment_min_updates",
+    "ltm_value_alignment_ready_threshold",
+    "ltm_value_alignment_ema_decay",
+    "ltm_value_writer_max_norm",
 )
 
 
@@ -236,6 +243,8 @@ def validate_architecture_numeric_contract(config) -> None:
         "min_h_steps",
         "training_chunk_size",
         "reference_chunk_len",
+        "ltm_value_alignment_stride",
+        "ltm_value_alignment_min_updates",
     )
     for name in positive_int_fields:
         _canonical_contract_int(config, name, minimum=1)
@@ -315,6 +324,8 @@ def validate_architecture_numeric_contract(config) -> None:
         "max_commitment_cost_for_backward",
         "max_ponder_cost_for_backward",
         "z_loss_weight",
+        "ltm_value_alignment_weight",
+        "ltm_value_writer_max_norm",
     )
     for name in nonnegative_float_fields:
         _canonical_contract_float(config, name, minimum=0.0)
@@ -343,6 +354,47 @@ def validate_architecture_numeric_contract(config) -> None:
         minimum=0.0,
         maximum=0.95,
     )
+    _canonical_contract_float(
+        config,
+        "ltm_value_alignment_ready_threshold",
+        minimum=0.0,
+    )
+    _canonical_contract_float(
+        config,
+        "ltm_value_alignment_ema_decay",
+        minimum=0.0,
+        maximum=1.0,
+        maximum_inclusive=False,
+    )
+
+    raw_time_feature_mode = str(
+        _get(config, "ltm_time_feature_mode", "absolute-sinusoidal")
+        or "absolute-sinusoidal"
+    ).strip().lower().replace("_", "-")
+    time_feature_aliases = {
+        "sinusoidal": "absolute-sinusoidal",
+        "absolute": "absolute-sinusoidal",
+        "none": "metadata-only",
+        "off": "metadata-only",
+        "metadata": "metadata-only",
+    }
+    time_feature_mode = time_feature_aliases.get(
+        raw_time_feature_mode,
+        raw_time_feature_mode,
+    )
+    if time_feature_mode not in {"absolute-sinusoidal", "metadata-only"}:
+        raise ValueError(
+            "ltm_time_feature_mode must be 'absolute-sinusoidal' or "
+            f"'metadata-only', got {raw_time_feature_mode!r}"
+        )
+    _set(config, "ltm_time_feature_mode", time_feature_mode)
+
+    if _contains(config, "ltm_training_mode"):
+        _set(
+            config,
+            "ltm_training_mode",
+            normalize_ltm_training_mode(_get(config, "ltm_training_mode")),
+        )
 
     ltm_slots = _get(config, "ltm_slots", None)
     ltm_topk = _get(config, "ltm_topk", None)
@@ -399,6 +451,40 @@ def normalize_architecture_revision(value) -> str:
     if normalized not in {LEGACY_REVISION, COHERENT_REVISION}:
         raise ValueError(
             "architecture_revision must be 'legacy-v8' or 'coherent-v9', "
+            f"got {value!r}"
+        )
+    return normalized
+
+
+def normalize_ltm_training_mode(value) -> str:
+    """Return the canonical LTM training mode and reject unknown behavior.
+
+    Historically the trainer silently mapped typos to the expensive,
+    label-gradient ``inner-update`` path while the core treated the same typo
+    as read-only.  A learned-function contract must fail closed instead.
+    """
+
+    normalized = str(value or "inner-update").strip().lower().replace("_", "-")
+    aliases = {
+        "inner": "inner-update",
+        "inner-updates": "inner-update",
+        "gradient": "inner-update",
+        "grad": "inner-update",
+        "supervised": "inner-update",
+        "supervised-inner-update": "inner-update",
+        "titans": "inner-update",
+        "titans-inner-update": "inner-update",
+        "readonly": "read-only",
+        "inference": "read-only",
+        "inference-like": "read-only",
+        "inference-like-ltm": "read-only",
+        "off": "read-only",
+        "none": "read-only",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"inner-update", "read-only"}:
+        raise ValueError(
+            "ltm_training_mode must be 'inner-update' or 'read-only', "
             f"got {value!r}"
         )
     return normalized
@@ -470,6 +556,20 @@ def apply_architecture_revision_defaults(config) -> str:
             # Keep new coherent runs train/chat aligned unless the experiment
             # explicitly opts into the legacy Titans inner-update ablation.
             "ltm_training_mode": "read-only",
+            # Token/wall clocks remain available for filtering and provenance.
+            # Adding an untrained, full-amplitude absolute sinusoid after a write
+            # made tiny fast-memory updates produce learning-rate-independent
+            # logit jumps, so coherent-v9 does not expose it to the model.
+            "ltm_time_feature_mode": "metadata-only",
+            # Train the already-present cheap validation writer without changing
+            # model geometry.  A deterministic stride keeps the auxiliary well
+            # below the cost of the recurrent language path.
+            "ltm_value_alignment_weight": 0.01,
+            "ltm_value_alignment_stride": 8,
+            "ltm_value_alignment_min_updates": 100,
+            "ltm_value_alignment_ready_threshold": 0.95,
+            "ltm_value_alignment_ema_decay": 0.95,
+            "ltm_value_writer_max_norm": 64.0,
             "adaptive_ponder": True,
             "ponder_objective": "symmetric-huber",
             "inference_logit_clamp": 0.0,
@@ -489,6 +589,13 @@ def apply_architecture_revision_defaults(config) -> str:
             "enforce_rosa_max_context": False,
             "rosa_zero_no_prediction": False,
             "ltm_training_mode": "inner-update",
+            "ltm_time_feature_mode": "absolute-sinusoidal",
+            "ltm_value_alignment_weight": 0.0,
+            "ltm_value_alignment_stride": 1,
+            "ltm_value_alignment_min_updates": 100,
+            "ltm_value_alignment_ready_threshold": 0.95,
+            "ltm_value_alignment_ema_decay": 0.95,
+            "ltm_value_writer_max_norm": 64.0,
             "adaptive_ponder": False,
             "ponder_objective": "auto",
             "inference_logit_clamp": 30.0,

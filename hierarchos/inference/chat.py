@@ -21,12 +21,8 @@ import time
 import copy
 from datetime import datetime
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp import GradScaler, autocast
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from ..utils.device import is_directml_device
 from ..utils.checkpoint import (
     LTM_PERSISTENT_METADATA_VERSION,
     LTM_WALLCLOCK_SEMANTICS,
@@ -38,16 +34,25 @@ from ..utils.checkpoint import (
 from ..utils.tokenizer import tokenizer_identity, validate_inference_tokenizer_identity
 from ..utils.rosa import ROSAState
 from ..utils.safe_loading import load_tensor_payload_safely
-from ..models.revisions import architecture_contract, architecture_contract_hash
+from ..models.ltm import LTMModule
+from ..models.revisions import (
+    architecture_contract,
+    architecture_contract_hash,
+    normalize_ltm_training_mode,
+)
 from .chat_state import (
+    CHAT_CONTINUITY_METADATA_VERSION,
     CHAT_STATE_KIND,
     CHAT_STATE_VERSION,
+    MAX_CHAT_HISTORY_CHARS,
+    MAX_CHAT_HISTORY_TURNS,
     chat_state_architecture_metadata,
     chat_state_config_signature,
     clear_ltm_working_memory,
     normalize_recurrent_state_for_model,
     recurrent_state_metadata,
     tensor_to_cpu,
+    validate_chat_continuity_metadata,
     validate_chat_state_payload_compatible,
 )
 
@@ -70,30 +75,19 @@ def _handle_interrupt(sig, frame):
 
 # --- Feedback Detection ---
 def is_positive_feedback(text: str) -> bool:
-    """Checks if the user input looks like positive validation."""
-    text = text.lower().strip()
+    """Recognize only an unambiguous, standalone positive utterance.
+
+    Natural-language feedback detection is opt-in at the chat-policy layer.  A
+    strict detector here prevents mixed statements such as ``yes, but wrong``
+    from ever being treated as validation.
+    """
+    text = " ".join(text.lower().strip().split())
+    text = text.strip(".!?,;:")
     positive_triggers = {
         "good", "great", "correct", "yes", "nice", "cool", "perfect",
         "thanks", "thx", "+", "right", "accurate"
     }
-    if text in positive_triggers:
-        return True
-    first_word = text.split(' ')[0] if ' ' in text else text
-    first_word = ''.join(c for c in first_word if c.isalnum())
-    return first_word in positive_triggers or text.startswith("/learn")
-
-
-def is_correction_or_instruction(text: str) -> bool:
-    """Checks if user input looks like a correction or new instruction."""
-    text_lower = text.lower().strip()
-    correction_triggers = ["no", "wrong", "incorrect", "actually", "false", "not true"]
-    for trigger in correction_triggers:
-        if text_lower.startswith(trigger):
-            return len(text.split()) > 3
-    word_count = len(text.split())
-    if word_count > 5 and not is_positive_feedback(text):
-        return True
-    return False
+    return text in positive_triggers
 
 
 def extract_correction_text(text: str):
@@ -145,8 +139,8 @@ def wrap_for_hierarchos(raw_text, system_prompt=None, alpaca_mode=False, input_c
     return f"User: {clean_text}\n\nAssistant: "
 
 
-def build_chat_input_context(turn_history, max_turns=4, max_chars=3000):
-    """Build Alpaca Input text from previous chat turns."""
+def bound_chat_turn_history(turn_history, max_turns=4, max_chars=3000):
+    """Return a canonical, cheap-to-persist suffix of textual chat turns."""
     try:
         max_turns = int(max_turns)
     except (TypeError, ValueError):
@@ -156,12 +150,101 @@ def build_chat_input_context(turn_history, max_turns=4, max_chars=3000):
     except (TypeError, ValueError):
         max_chars = 0
     if max_turns <= 0 or max_chars <= 0:
+        return []
+    if max_turns > MAX_CHAT_HISTORY_TURNS:
+        raise ValueError(
+            f"chat history turn bound cannot exceed {MAX_CHAT_HISTORY_TURNS}"
+        )
+    if max_chars > MAX_CHAT_HISTORY_CHARS:
+        raise ValueError(
+            f"chat history character bound cannot exceed {MAX_CHAT_HISTORY_CHARS}"
+        )
+
+    try:
+        recent_turns = turn_history[-max_turns:]
+    except (TypeError, AttributeError):
+        recent_turns = list(turn_history)[-max_turns:]
+    selected = [
+        str(turn).strip()
+        for turn in recent_turns
+        if str(turn).strip()
+    ]
+    while selected:
+        context_length = sum(len(turn) for turn in selected) + 2 * (len(selected) - 1)
+        excess = context_length - max_chars
+        if excess <= 0:
+            break
+        if len(selected) > 1 and excess >= len(selected[0]) + 2:
+            selected.pop(0)
+            continue
+        selected[0] = selected[0][excess:].lstrip()
+        if not selected[0]:
+            selected.pop(0)
+    return selected
+
+
+def build_chat_input_context(turn_history, max_turns=4, max_chars=3000):
+    """Build bounded Alpaca Previous Context text from prior chat turns."""
+    selected = bound_chat_turn_history(
+        turn_history,
+        max_turns=max_turns,
+        max_chars=max_chars,
+    )
+    return "\n\n".join(selected)
+
+
+def build_effective_chat_input_context(
+    turn_history,
+    *,
+    max_turns=4,
+    max_chars=3000,
+    carry_chat_state=False,
+):
+    """Avoid replaying text already represented by carried recurrent state."""
+    if carry_chat_state:
         return ""
-    selected = list(turn_history[-max_turns:])
-    context = "\n\n".join(t.strip() for t in selected if str(t).strip()).strip()
-    if len(context) > max_chars:
-        context = context[-max_chars:].lstrip()
-    return context
+    return build_chat_input_context(
+        turn_history,
+        max_turns=max_turns,
+        max_chars=max_chars,
+    )
+
+
+def resolve_effective_carry_chat_state(
+    carry_chat_state=False,
+    resume_chat_from_state_file=None,
+):
+    """A requested continuation must retain the restored recurrent carriers."""
+    return bool(carry_chat_state or resume_chat_from_state_file)
+
+
+def _chat_continuity_metadata(
+    *,
+    total_tokens_generated,
+    chat_prefill_chunk_size,
+    chat_input_history_turns,
+    chat_input_history_chars,
+    carry_chat_state,
+    chat_turn_history,
+):
+    chunk_size = max(0, int(chat_prefill_chunk_size or 0))
+    total_tokens = max(0, int(total_tokens_generated or 0))
+    turns = max(0, int(chat_input_history_turns or 0))
+    chars = max(0, int(chat_input_history_chars or 0))
+    bounded_history = bound_chat_turn_history(
+        chat_turn_history,
+        max_turns=turns,
+        max_chars=chars,
+    )
+    return {
+        "version": CHAT_CONTINUITY_METADATA_VERSION,
+        "prefill_chunk_size": chunk_size,
+        "absolute_chunk_phase": total_tokens % chunk_size if chunk_size > 0 else 0,
+        "history_max_turns": turns,
+        "history_max_chars": chars,
+        "carry_chat_state": bool(carry_chat_state),
+        "turn_history": bounded_history,
+    }
 
 
 def clean_hierarchos_output(raw_generation):
@@ -225,6 +308,44 @@ def _normalize_chat_state_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(raw_path.strip().strip('"')))
 
 
+ONLINE_ADAPTATION_POLICIES = ("off", "validated", "prompt", "prompt+response")
+
+
+def resolve_online_adaptation_policy(args):
+    """Resolve the fail-closed runtime write policy and legacy opt-in flags."""
+
+    policy = str(getattr(args, "online_adaptation_policy", "validated") or "validated")
+    policy = policy.strip().lower()
+    if policy not in ONLINE_ADAPTATION_POLICIES:
+        allowed = ", ".join(ONLINE_ADAPTATION_POLICIES)
+        raise ValueError(f"unknown online adaptation policy {policy!r}; expected one of: {allowed}")
+    if policy == "off":
+        return policy, False, False
+
+    # Keep the older explicit flags useful while making passive writes opt-in.
+    passive_prompt = policy in ("prompt", "prompt+response") or bool(
+        getattr(args, "passive_learning", False)
+    )
+    passive_response = policy == "prompt+response" or bool(
+        getattr(args, "passive_response_learning", False)
+    )
+    if passive_response:
+        passive_prompt = True
+    return policy, passive_prompt, passive_response
+
+
+def _default_ltm_delta_overlay_path(model_path: str) -> str:
+    """Return a deterministic model-local path for cumulative online memory."""
+
+    normalized = os.path.abspath(os.path.expanduser(os.fspath(model_path)))
+    if os.path.isdir(normalized):
+        return os.path.join(normalized, "hierarchos_ltm_updates.pt")
+    stem, extension = os.path.splitext(normalized)
+    if extension:
+        return stem + "_ltm_updates.pt"
+    return normalized + "_ltm_updates.pt"
+
+
 def _chat_runtime_identity(config, model=None, tokenizer=None):
     """Bind a continuation state to the function that produced its carriers.
 
@@ -234,7 +355,9 @@ def _chat_runtime_identity(config, model=None, tokenizer=None):
     legacy files fall back to stable file attributes plus retained run metadata.
     """
     identity = {
-        "version": 1,
+        # Version 2 makes the continuity envelope mandatory for new CLI state
+        # files while version-1 identities remain load-compatible below.
+        "version": 2,
         "architecture_contract_sha256": architecture_contract_hash(config),
     }
     metadata = getattr(model, "_hierarchos_checkpoint_metadata", {})
@@ -288,6 +411,11 @@ def _validate_chat_runtime_identity(payload, config, model=None, tokenizer=None)
     if not isinstance(saved, dict):
         raise RuntimeError("Chat state has malformed runtime identity metadata.")
     current = _chat_runtime_identity(config, model=model, tokenizer=tokenizer)
+    saved_version = saved.get("version")
+    if isinstance(saved_version, bool) or saved_version not in (1, 2):
+        raise RuntimeError("Chat state has an unsupported runtime identity version.")
+    if saved_version == 1:
+        current["version"] = 1
     if saved != current:
         raise RuntimeError(
             "Chat state belongs to different model weights or tokenizer behavior. "
@@ -310,6 +438,11 @@ def save_hierarchical_chat_state(
     ltm_state=None,
     total_tokens_generated,
     tokenizer=None,
+    chat_prefill_chunk_size=None,
+    chat_input_history_turns=0,
+    chat_input_history_chars=3000,
+    carry_chat_state=False,
+    chat_turn_history=None,
 ):
     """Save only tiny chat continuation tensors; never LTM/model weights."""
     path = _normalize_chat_state_path(path)
@@ -318,6 +451,8 @@ def save_hierarchical_chat_state(
     os.makedirs(os.path.dirname(path), exist_ok=True)
     rosa_past_tokens = _rosa_past_tokens_from_ltm_state(ltm_state)
     rosa_states = _rosa_states_from_ltm_state(ltm_state)
+    if chat_prefill_chunk_size is None:
+        chat_prefill_chunk_size = resolve_inference_prefill_chunk_size(config)
     payload = {
         "version": CHAT_STATE_VERSION,
         "kind": CHAT_STATE_KIND,
@@ -337,6 +472,14 @@ def save_hierarchical_chat_state(
             model=model,
             tokenizer=tokenizer,
         ),
+        "chat_continuity": _chat_continuity_metadata(
+            total_tokens_generated=total_tokens_generated,
+            chat_prefill_chunk_size=chat_prefill_chunk_size,
+            chat_input_history_turns=chat_input_history_turns,
+            chat_input_history_chars=chat_input_history_chars,
+            carry_chat_state=carry_chat_state,
+            chat_turn_history=chat_turn_history or [],
+        ),
     }
     payload.update(chat_state_architecture_metadata(config))
     payload.update(
@@ -354,6 +497,10 @@ def save_hierarchical_chat_state(
         payload,
         config,
         model=model,
+    )
+    validate_chat_continuity_metadata(
+        payload,
+        expected_prefill_chunk_size=chat_prefill_chunk_size,
     )
     _validate_chat_runtime_identity(
         payload,
@@ -374,6 +521,7 @@ def load_hierarchical_chat_state(
     device,
     model=None,
     tokenizer=None,
+    expected_chat_prefill_chunk_size=None,
 ):
     """Load a tiny chat state file without restoring LTM working memory."""
     path = _normalize_chat_state_path(path)
@@ -394,6 +542,25 @@ def load_hierarchical_chat_state(
         model=model,
         tokenizer=tokenizer,
     )
+    continuity = validate_chat_continuity_metadata(
+        payload,
+        expected_prefill_chunk_size=expected_chat_prefill_chunk_size,
+    )
+    runtime_identity = payload.get("runtime_identity")
+    if (
+        isinstance(runtime_identity, dict)
+        and runtime_identity.get("version") == 2
+        and continuity is None
+    ):
+        raise RuntimeError(
+            "Current CLI chat state is missing required chat_continuity metadata."
+        )
+    if continuity is None and expected_chat_prefill_chunk_size is not None:
+        raise RuntimeError(
+            "Legacy chat state does not record prefill chunk geometry, so an "
+            "explicit resume-time chunk override cannot be validated. Resume "
+            "without the override to use the checkpoint's training geometry."
+        )
 
     def tensor(name):
         value = payload.get(name)
@@ -434,6 +601,22 @@ def load_hierarchical_chat_state(
         if payload.get("rosa_states") is not None
         else None,
         "total_tokens_generated": int(payload.get("total_tokens_generated") or 0),
+        "chat_continuity": continuity,
+        "chat_prefill_chunk_size": continuity.get("prefill_chunk_size")
+        if continuity is not None
+        else None,
+        "chat_input_history_turns": continuity.get("history_max_turns")
+        if continuity is not None
+        else None,
+        "chat_input_history_chars": continuity.get("history_max_chars")
+        if continuity is not None
+        else None,
+        "carry_chat_state": continuity.get("carry_chat_state")
+        if continuity is not None
+        else None,
+        "chat_turn_history": list(continuity.get("turn_history", []))
+        if continuity is not None
+        else [],
     }
 
 
@@ -517,25 +700,13 @@ def _setting_value(settings, name, default):
 
 
 def _normalize_ltm_training_mode(value) -> str:
-    mode = str(value or "inner-update").strip().lower().replace("_", "-")
-    aliases = {
-        "inner": "inner-update",
-        "inner-update": "inner-update",
-        "inner-updates": "inner-update",
-        "supervised": "inner-update",
-        "supervised-inner-update": "inner-update",
-        "readonly": "read-only",
-        "read-only": "read-only",
-        "read_only": "read-only",
-        "inference": "read-only",
-        "inference-like": "read-only",
-        "inference-like-ltm": "read-only",
-    }
-    return aliases.get(mode, "inner-update")
+    return normalize_ltm_training_mode(value)
 
 
 def _checkpoint_ltm_training_mode(config) -> str:
-    return _normalize_ltm_training_mode(getattr(config, "ltm_training_mode", "inner-update"))
+    return _normalize_ltm_training_mode(
+        _setting_value(config, "ltm_training_mode", "inner-update")
+    )
 
 
 def _checkpoint_has_trained_hebbian_writer(config) -> bool:
@@ -985,18 +1156,6 @@ def ltm_replay_seed_state(ltm_state):
     return tuple(state)
 
 
-def _materialize_ltm_state_for_update(ltm_state):
-    """Convert inference tensors before an in-place online-memory update."""
-    if not isinstance(ltm_state, (tuple, list)):
-        return ltm_state
-    return tuple(
-        value.detach().clone()
-        if torch.is_tensor(value) and torch.is_inference(value)
-        else value
-        for value in ltm_state
-    )
-
-
 def _detach_ltm_replay_state(ltm_state):
     """Detach tensor carriers at a TBPTT boundary without discarding ROSA state."""
     if not isinstance(ltm_state, (tuple, list)):
@@ -1016,6 +1175,7 @@ def replay_online_feedback_with_training_recurrence(
     min_timestamp=0.0,
     min_wallclock_timestamp=0.0,
     source_filter=None,
+    return_memory_trace=True,
 ):
     """Replay feedback with the checkpoint's full-sample/TBPTT state geometry.
 
@@ -1070,8 +1230,8 @@ def replay_online_feedback_with_training_recurrence(
             source_filter=source_filter,
             suppress_hebbian=True,
             return_topk_values=False,
-            return_raw_topk_values=True,
-            return_topk_indices=True,
+            return_raw_topk_values=bool(return_memory_trace),
+            return_topk_indices=bool(return_memory_trace),
             return_step_telemetry=False,
             return_numerics=False,
             return_last_logit_only=False,
@@ -1080,9 +1240,9 @@ def replay_online_feedback_with_training_recurrence(
             raise RuntimeError("Online feedback replay requires model logits")
 
         logits_parts.append(outputs["logits"])
-        if outputs.get("topk_idx") is not None:
+        if return_memory_trace and outputs.get("topk_idx") is not None:
             topk_parts.append(outputs["topk_idx"])
-        if outputs.get("raw_topk_vals") is not None:
+        if return_memory_trace and outputs.get("raw_topk_vals") is not None:
             raw_topk_vals.extend(outputs["raw_topk_vals"])
         final_outputs = outputs
 
@@ -1119,7 +1279,396 @@ def replay_online_feedback_with_training_recurrence(
     return combined
 
 
-LTM_DELTA_OVERLAY_VERSION = 2
+def _online_feedback_objective(logits, labels, vocab_size, *, penalty=False):
+    """Return the supervised scalar used to accept or reject a memory write."""
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    flat_logits = shift_logits.view(-1, int(vocab_size)).float()
+    flat_labels = shift_labels.reshape(-1)
+    valid = flat_labels != -100
+    active_logits = flat_logits[valid]
+    active_labels = flat_labels[valid]
+    if active_labels.numel() == 0:
+        return None
+    if penalty:
+        probs = F.softmax(active_logits, dim=-1)
+        target_probs = torch.gather(
+            probs,
+            1,
+            active_labels.unsqueeze(1),
+        ).squeeze(1)
+        target_probs = target_probs.clamp(min=1e-7, max=1.0 - 1e-7)
+        return -torch.log1p(-target_probs).mean()
+    return F.cross_entropy(active_logits, active_labels)
+
+
+def _online_feedback_tensors(
+    input_ids,
+    label_ids,
+    *,
+    max_length,
+    learn_input_tokens=False,
+):
+    if input_ids.ndim != 1:
+        raise ValueError("Online feedback prompt IDs must be one-dimensional")
+    if label_ids is None:
+        full_sequence = input_ids.unsqueeze(0)
+        labels = (
+            full_sequence.clone()
+            if learn_input_tokens
+            else torch.full_like(full_sequence, -100)
+        )
+    else:
+        if label_ids.ndim != 1:
+            raise ValueError("Online feedback target IDs must be one-dimensional")
+        full_sequence = torch.cat([input_ids, label_ids], dim=0).unsqueeze(0)
+        labels = (
+            full_sequence.clone()
+            if learn_input_tokens
+            else torch.cat(
+                [torch.full_like(input_ids, -100), label_ids],
+                dim=0,
+            ).unsqueeze(0)
+        )
+    max_length = max(2, int(max_length or full_sequence.shape[1]))
+    if full_sequence.shape[1] > max_length:
+        full_sequence = full_sequence[:, -max_length:]
+        labels = labels[:, -max_length:]
+    return full_sequence, labels
+
+
+def _copy_online_state_to_module(model, state):
+    """Commit an accepted one-row runtime state to the module buffers."""
+
+    ltm = getattr(model, "ltm", None)
+    if ltm is None or not isinstance(state, (tuple, list)):
+        return
+    for index, attr in (
+        (0, "fast_vals"),
+        (1, "_mom_vals"),
+        (4, "timestamps"),
+        (5, "sources"),
+        (6, "wallclock_timestamps"),
+    ):
+        if len(state) <= index:
+            continue
+        source = state[index]
+        target = getattr(ltm, attr, None)
+        if not torch.is_tensor(source) or not torch.is_tensor(target):
+            continue
+        source = source.detach()
+        if source.dim() == target.dim() + 1 and source.shape[0] == 1:
+            source = source.squeeze(0)
+        if tuple(source.shape) != tuple(target.shape):
+            raise ValueError(
+                f"Accepted online LTM {attr} shape {tuple(source.shape)} does not "
+                f"match module shape {tuple(target.shape)}"
+            )
+        if source.is_floating_point() and not bool(torch.isfinite(source).all().item()):
+            raise ValueError(f"Accepted online LTM {attr} is non-finite")
+        with torch.no_grad():
+            target.copy_(source.to(device=target.device, dtype=target.dtype))
+
+
+def apply_online_feedback_transaction(
+    model,
+    input_ids,
+    label_ids,
+    *,
+    config,
+    ltm_state=None,
+    source_id=LTMModule.SRC_USER_INTERACTION,
+    penalty=False,
+    learning_rate=1e-3,
+    grad_clip=0.75,
+    max_delta_norm=1.0,
+    max_fast_norm=64.0,
+    max_slot_norm=4.0,
+    token_clock=0,
+    min_timestamp=0.0,
+    min_wallclock_timestamp=0.0,
+    source_filter=None,
+    learn_input_tokens=False,
+    compute_only=False,
+    max_backoff_steps=4,
+):
+    """Apply one bounded, objective-checked fast-memory transaction.
+
+    Gradients are requested only for the retrieved LTM values, so explicit
+    feedback does not allocate or accumulate gradients for the full model.
+    Candidate state and metadata remain cloned until a replay confirms that the
+    requested positive/negative objective did not worsen.  Rejected candidates
+    leave both the runtime carrier and module buffers untouched.
+    """
+
+    try:
+        learning_rate = float(learning_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("online LTM learning rate must be numeric") from exc
+    if not math.isfinite(learning_rate) or learning_rate <= 0.0:
+        raise ValueError("online LTM learning rate must be finite and positive")
+
+    model_device = next(model.parameters()).device
+    full_sequence, labels = _online_feedback_tensors(
+        input_ids.to(device=model_device, dtype=torch.long),
+        label_ids.to(device=model_device, dtype=torch.long)
+        if label_ids is not None
+        else None,
+        max_length=getattr(config, "max_length", 1024),
+        learn_input_tokens=learn_input_tokens,
+    )
+    prior_training = bool(model.training)
+    prior_suppress = getattr(model, "suppress_hebbian", True)
+    model.eval()
+    model.suppress_hebbian = True
+    model.zero_grad(set_to_none=True)
+
+    try:
+        with (torch.no_grad() if compute_only else torch.enable_grad()):
+            outputs = replay_online_feedback_with_training_recurrence(
+                model,
+                full_sequence,
+                config=config,
+                ltm_state=ltm_state,
+                min_timestamp=min_timestamp,
+                min_wallclock_timestamp=min_wallclock_timestamp,
+                source_filter=source_filter,
+                return_memory_trace=not compute_only,
+            )
+            loss = _online_feedback_objective(
+                outputs["logits"],
+                labels,
+                getattr(config, "vocab_size"),
+                penalty=penalty,
+            )
+            if loss is None:
+                return {
+                    "committed": False,
+                    "reason": "no-supervised-tokens",
+                    "ltm_state": ltm_state,
+                    "token_clock": int(token_clock),
+                }
+            if not bool(torch.isfinite(loss.detach()).all().item()):
+                return {
+                    "committed": False,
+                    "reason": "non-finite-loss",
+                    "ltm_state": ltm_state,
+                    "token_clock": int(token_clock),
+                }
+            loss_before = float(loss.detach().item())
+            if compute_only:
+                return {
+                    "committed": False,
+                    "reason": "compute-only",
+                    "loss_before": loss_before,
+                    "ltm_state": ltm_state,
+                    "token_clock": int(token_clock),
+                }
+
+            raw_values = list(outputs.get("raw_topk_vals") or [])
+            grad_targets = [value for value in raw_values if value.requires_grad]
+            if not grad_targets:
+                return {
+                    "committed": False,
+                    "reason": "no-ltm-gradient-path",
+                    "loss_before": loss_before,
+                    "ltm_state": ltm_state,
+                    "token_clock": int(token_clock),
+                }
+            target_grads = torch.autograd.grad(
+                loss,
+                grad_targets,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            grad_iter = iter(target_grads)
+            grads = []
+            for value in raw_values:
+                if value.requires_grad:
+                    grad = next(grad_iter)
+                    grads.append(torch.zeros_like(value) if grad is None else grad)
+                else:
+                    grads.append(torch.zeros_like(value))
+            prepared_grads = prepare_online_ltm_gradients(
+                torch.stack(grads, dim=1),
+                grad_clip,
+            )
+
+        if prepared_grads is None:
+            return {
+                "committed": False,
+                "reason": "invalid-ltm-gradients",
+                "loss_before": loss_before,
+                "ltm_state": ltm_state,
+                "token_clock": int(token_clock),
+            }
+        topk_idx = outputs.get("topk_idx")
+        current_state = outputs.get("ltm_memory_state")
+        if topk_idx is None or not isinstance(current_state, (tuple, list)):
+            return {
+                "committed": False,
+                "reason": "missing-ltm-state",
+                "loss_before": loss_before,
+                "ltm_state": ltm_state,
+                "token_clock": int(token_clock),
+            }
+
+        base_fast = current_state[0].detach().float().clone()
+        base_momentum = torch.zeros_like(current_state[1], dtype=torch.float32)
+        base_timestamps = current_state[4].detach().clone()
+        base_sources = current_state[5].detach().clone()
+        base_wallclock = current_state[6].detach().clone()
+        old_past_tokens = (
+            ltm_state[2]
+            if isinstance(ltm_state, (tuple, list)) and len(ltm_state) >= 3
+            else None
+        )
+        old_rosa_states = (
+            ltm_state[3]
+            if isinstance(ltm_state, (tuple, list)) and len(ltm_state) >= 4
+            else None
+        )
+        write_timestamp = float(int(token_clock) + int(full_sequence.shape[1]))
+        write_wallclock = time.time()
+        ltm = model.ltm
+        accumulated_before = bool(getattr(ltm, "accumulate_deltas", False))
+        accepted = None
+        accepted_delta = None
+        accepted_lr = None
+        loss_after = None
+        try:
+            # Candidate attempts must not leak into the durable delta accumulator.
+            ltm.accumulate_deltas = False
+            attempts = max(1, int(max_backoff_steps or 1))
+            for attempt in range(attempts):
+                candidate_lr = learning_rate * (0.5 ** attempt)
+                candidate_timestamps = base_timestamps.clone()
+                candidate_sources = base_sources.clone()
+                candidate_wallclock = base_wallclock.clone()
+                candidate_fast, _candidate_momentum = ltm.inner_update(
+                    topk_idx,
+                    prepared_grads,
+                    current_lr=candidate_lr,
+                    timestamp=write_timestamp,
+                    source=int(source_id),
+                    tokens_covered=int(full_sequence.shape[1]),
+                    fast_vals=base_fast,
+                    mom_vals=base_momentum,
+                    timestamps=candidate_timestamps,
+                    sources=candidate_sources,
+                    wallclock_timestamp=write_wallclock,
+                    wallclock_timestamps=candidate_wallclock,
+                    inplace=False,
+                )
+                candidate_fast = candidate_fast.detach().float()
+                delta = candidate_fast - base_fast
+                delta_norm = float(delta.norm().item())
+                fast_norm = float(candidate_fast.norm().item())
+                slot_norm = float(candidate_fast.norm(dim=-1).max().item())
+                finite_candidate = bool(torch.isfinite(candidate_fast).all().item())
+                within_budget = (
+                    finite_candidate
+                    and delta_norm > 0.0
+                    and (float(max_delta_norm or 0.0) <= 0.0 or delta_norm <= float(max_delta_norm))
+                    and (float(max_fast_norm or 0.0) <= 0.0 or fast_norm <= float(max_fast_norm))
+                    and (float(max_slot_norm or 0.0) <= 0.0 or slot_norm <= float(max_slot_norm))
+                )
+                if not within_budget:
+                    continue
+
+                candidate_state_for_replay = (
+                    candidate_fast,
+                    torch.zeros_like(candidate_fast),
+                    None,
+                    None,
+                    candidate_timestamps,
+                    candidate_sources,
+                    candidate_wallclock,
+                )
+                with torch.no_grad():
+                    verification = replay_online_feedback_with_training_recurrence(
+                        model,
+                        full_sequence,
+                        config=config,
+                        ltm_state=candidate_state_for_replay,
+                        min_timestamp=min_timestamp,
+                        min_wallclock_timestamp=min_wallclock_timestamp,
+                        source_filter=source_filter,
+                        return_memory_trace=False,
+                    )
+                    verification_loss = _online_feedback_objective(
+                        verification["logits"],
+                        labels,
+                        getattr(config, "vocab_size"),
+                        penalty=penalty,
+                    )
+                if verification_loss is None or not bool(
+                    torch.isfinite(verification_loss).all().item()
+                ):
+                    continue
+                candidate_loss = float(verification_loss.item())
+                tolerance = max(1e-7, abs(loss_before) * 1e-6)
+                if candidate_loss <= loss_before + tolerance:
+                    accepted = (
+                        candidate_fast,
+                        torch.zeros_like(candidate_fast),
+                        old_past_tokens,
+                        old_rosa_states,
+                        candidate_timestamps,
+                        candidate_sources,
+                        candidate_wallclock,
+                    )
+                    accepted_delta = delta.detach()
+                    accepted_lr = candidate_lr
+                    loss_after = candidate_loss
+                    break
+        finally:
+            ltm.accumulate_deltas = accumulated_before
+
+        if accepted is None:
+            return {
+                "committed": False,
+                "reason": "objective-or-budget-rejected",
+                "loss_before": loss_before,
+                "ltm_state": ltm_state,
+                "token_clock": int(token_clock),
+            }
+
+        _copy_online_state_to_module(model, accepted)
+        if accumulated_before and torch.is_tensor(getattr(ltm, "ltm_deltas", None)):
+            durable_delta = accepted_delta
+            if durable_delta.dim() == 3:
+                durable_delta = durable_delta.sum(dim=0)
+            with torch.no_grad():
+                ltm.ltm_deltas.add_(
+                    durable_delta.to(
+                        device=ltm.ltm_deltas.device,
+                        dtype=ltm.ltm_deltas.dtype,
+                    )
+                )
+        return {
+            "committed": True,
+            "reason": "accepted",
+            "loss_before": loss_before,
+            "loss_after": loss_after,
+            "learning_rate": float(accepted_lr),
+            "delta_norm": float(accepted_delta.norm().item()),
+            "fast_norm": float(accepted[0].float().norm().item()),
+            "ltm_state": tuple(
+                value.detach() if torch.is_tensor(value) else value
+                for value in accepted
+            ),
+            "token_clock": int(write_timestamp),
+        }
+    finally:
+        model.zero_grad(set_to_none=True)
+        model.suppress_hebbian = prior_suppress
+        model.train(prior_training)
+
+
+LTM_DELTA_OVERLAY_VERSION = 3
 
 
 def _validated_overlay_tensor(value, reference, name):
@@ -1159,7 +1708,7 @@ def _validate_overlay_metadata_tensor(ltm, value, reference, name):
     return value
 
 
-def load_ltm_delta_overlay(model, path):
+def load_ltm_delta_overlay(model, path, tokenizer=None):
     """Apply a legacy tensor or versioned cumulative LTM overlay.
 
     Loading seeds ``ltm_deltas`` with the previously saved cumulative delta so
@@ -1184,10 +1733,21 @@ def load_ltm_delta_overlay(model, path):
             raise ValueError("LTM overlay has an invalid version") from exc
         delta = payload.get("delta")
         metadata = payload
-        if version != LTM_DELTA_OVERLAY_VERSION:
+        if version not in (2, LTM_DELTA_OVERLAY_VERSION):
             raise ValueError(f"Unsupported LTM overlay version {version}")
     else:
         raise ValueError("LTM overlay must be a tensor or versioned dictionary")
+
+    if version >= 3:
+        runtime_identity = metadata.get("runtime_identity")
+        if not isinstance(runtime_identity, dict):
+            raise ValueError("LTM overlay is missing its model/tokenizer runtime identity")
+        _validate_chat_runtime_identity(
+            {"runtime_identity": runtime_identity},
+            getattr(model, "config", {}),
+            model=model,
+            tokenizer=tokenizer,
+        )
 
     delta = _validated_overlay_tensor(delta, ltm.vals, "delta")
     if not delta.is_floating_point():
@@ -1236,7 +1796,7 @@ def load_ltm_delta_overlay(model, path):
     return version
 
 
-def build_ltm_delta_overlay(model, ltm_state=None):
+def build_ltm_delta_overlay(model, ltm_state=None, tokenizer=None):
     """Build a cumulative, metadata-bearing overlay payload for safe saving."""
     ltm = getattr(model, "ltm", None)
     delta = getattr(ltm, "ltm_deltas", None)
@@ -1258,6 +1818,11 @@ def build_ltm_delta_overlay(model, ltm_state=None):
     payload = {
         "version": LTM_DELTA_OVERLAY_VERSION,
         "delta": delta.cpu().clone(),
+        "runtime_identity": _chat_runtime_identity(
+            getattr(model, "config", {}),
+            model=model,
+            tokenizer=tokenizer,
+        ),
     }
     for key, index in (
         ("timestamps", 4),
@@ -1268,6 +1833,49 @@ def build_ltm_delta_overlay(model, ltm_state=None):
         if torch.is_tensor(value):
             payload[key] = value.detach().cpu().clone()
     return payload
+
+
+def save_ltm_delta_overlay_atomic(
+    model,
+    path,
+    ltm_state=None,
+    *,
+    tokenizer=None,
+    extra_metadata=None,
+):
+    """Atomically persist an identity-bound cumulative online-memory overlay."""
+
+    path = os.path.abspath(os.path.expanduser(os.fspath(path)))
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    payload = build_ltm_delta_overlay(
+        model,
+        ltm_state,
+        tokenizer=tokenizer,
+    )
+    if isinstance(extra_metadata, dict):
+        reserved = set(payload) | {"saved_at"}
+        overlap = reserved.intersection(extra_metadata)
+        if overlap:
+            names = ", ".join(sorted(overlap))
+            raise ValueError(f"extra overlay metadata cannot replace protected fields: {names}")
+        payload.update(copy.deepcopy(extra_metadata))
+    payload["saved_at"] = time.time()
+    temporary = path + ".tmp"
+    try:
+        torch.save(payload, temporary)
+        with open(temporary, "r+b") as overlay_file:
+            os.fsync(overlay_file.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def resolve_wallclock_filter(value, *, now=None):
@@ -1688,42 +2296,72 @@ def chat(args, device, tokenizer):
     # =================================================================
     # 3. LTM & OPTIMIZER SETUP
     # =================================================================
-    ltm_lora_path = getattr(args, 'ltm_lora_path', None)
-    learning_enabled = not is_quantized or enable_quantized_learning
-    
-    if ltm_lora_path and learning_enabled:
-        print(f"LTM online learning is ACTIVE. Updates will be stored at: {ltm_lora_path}")
-        updatable_model = shadow_model if is_quantized else model
-        if updatable_model and hasattr(updatable_model.ltm, 'accumulate_deltas'):
+    try:
+        online_adaptation_policy, passive_learning, passive_response_learning = (
+            resolve_online_adaptation_policy(args)
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(2)
+
+    updatable_model = shadow_model if is_quantized else model
+    learning_enabled = (
+        online_adaptation_policy != "off"
+        and (not is_quantized or enable_quantized_learning)
+        and updatable_model is not None
+    )
+    requested_overlay_path = getattr(args, "ltm_lora_path", None)
+    ltm_lora_path = (
+        os.path.abspath(os.path.expanduser(os.fspath(requested_overlay_path)))
+        if requested_overlay_path
+        else _default_ltm_delta_overlay_path(args.model_path)
+        if learning_enabled
+        else None
+    )
+
+    if learning_enabled:
+        print(
+            f"LTM online adaptation is ACTIVE (policy={online_adaptation_policy}). "
+            f"Cumulative updates: {ltm_lora_path}"
+        )
+        print(
+            "Passive prompt/response writes: "
+            f"{'ON' if passive_learning else 'OFF'}/"
+            f"{'ON' if passive_response_learning else 'OFF'}"
+        )
+        if hasattr(updatable_model.ltm, "accumulate_deltas"):
             updatable_model.ltm.accumulate_deltas = True
-            if os.path.exists(ltm_lora_path):
-                print("Loading existing LTM deltas...")
-                try:
-                    overlay_version = load_ltm_delta_overlay(
-                        updatable_model,
-                        ltm_lora_path,
+        if ltm_lora_path and os.path.exists(ltm_lora_path):
+            print("Loading existing LTM deltas...")
+            try:
+                overlay_version = load_ltm_delta_overlay(
+                    updatable_model,
+                    ltm_lora_path,
+                    tokenizer=tokenizer,
+                )
+                if is_quantized and model is not None and shadow_model is not None:
+                    model.ltm.load_state_dict(
+                        shadow_model.ltm.state_dict(),
+                        strict=False,
                     )
-                    if is_quantized and model is not None and shadow_model is not None:
-                        model.ltm.load_state_dict(
-                            shadow_model.ltm.state_dict(),
-                            strict=False,
-                        )
-                        if (
-                            hasattr(model.ltm, "wallclock_timestamps")
-                            and hasattr(shadow_model.ltm, "wallclock_timestamps")
-                        ):
-                            model.ltm.wallclock_timestamps.copy_(
-                                shadow_model.ltm.wallclock_timestamps.to(
-                                    device=model.ltm.wallclock_timestamps.device,
-                                    dtype=model.ltm.wallclock_timestamps.dtype,
-                                )
-                            )
-                    print(f"Loaded cumulative LTM overlay v{overlay_version}.")
-                except Exception as e:
-                    print(f"Warning: Failed to load LTM deltas: {e}")
-    elif learning_enabled:
-        print("LTM online learning is ACTIVE for passive prompt memory and explicit feedback/validation.")
-        print("Passive response learning is OFF by default; use --passive-response-learning to opt in.")
+                print(f"Loaded cumulative LTM overlay v{overlay_version}.")
+            except Exception as exc:
+                # Never overwrite an incompatible/corrupt durable overlay with a
+                # fresh accumulator. Inference remains safe and read-only.
+                print(f"Error: could not safely load the online-memory overlay: {exc}")
+                print("Online adaptation has been disabled for this session; inference remains available.")
+                learning_enabled = False
+                passive_learning = False
+                passive_response_learning = False
+                if hasattr(updatable_model.ltm, "accumulate_deltas"):
+                    updatable_model.ltm.accumulate_deltas = False
+    else:
+        reason = (
+            "policy=off"
+            if online_adaptation_policy == "off"
+            else "no updatable full-precision model"
+        )
+        print(f"LTM online adaptation is OFF ({reason}).")
     trained_ltm_mode = _print_ltm_chat_alignment(config, learning_enabled)
     clock_model = shadow_model if is_quantized and shadow_model is not None else model
     clock_timestamps = getattr(getattr(clock_model, "ltm", None), "timestamps", None)
@@ -1740,29 +2378,14 @@ def chat(args, device, tokenizer):
     if shadow_model is not None:
         shadow_model.suppress_hebbian = True
 
-    # LTM Scheduler setup
-    ltm_scheduler = None
+    # Preserve dynamic LR with scalar math only: no dummy optimizer or scaler.
     static_ltm_lr = getattr(args, 'static_ltm_lr', True)
-    ltm_lr = getattr(args, 'ltm_lr', 0.001)
-    
+    ltm_schedule_steps = max(1, int(getattr(args, 'ltm_schedule_steps', 100) or 100))
+    ltm_schedule_min_lr = max(0.0, float(getattr(args, 'ltm_schedule_min_lr', 1e-5)))
+    online_update_count = 0
     if not static_ltm_lr and learning_enabled:
-        print("INFO: Using Cosine Annealing schedule for LTM updates.")
-        ltm_schedule_steps = getattr(args, 'ltm_schedule_steps', 100)
-        ltm_schedule_min_lr = getattr(args, 'ltm_schedule_min_lr', 1e-5)
-        dummy_param = nn.Parameter(torch.tensor(0.0))
-        ltm_optimizer = torch.optim.SGD([dummy_param], lr=ltm_lr)
-        ltm_scheduler = CosineAnnealingLR(ltm_optimizer, T_max=ltm_schedule_steps, eta_min=ltm_schedule_min_lr)
+        print("INFO: Using a lightweight cosine schedule for accepted online-memory updates.")
 
-    # AMP Setup
-    use_amp = getattr(args, 'amp', False) and learning_enabled and device.type == 'cuda'
-    # BFloat16 does NOT use GradScaler — only float16 needs it (same as trainer.py)
-    amp_dtype_str = getattr(args, 'amp_dtype', None) or getattr(config, 'amp_dtype', 'float16')
-    scaler = GradScaler() if (use_amp and amp_dtype_str == 'float16') else None
-    dummy_optimizer = None
-    if use_amp:
-        dummy_param_amp = nn.Parameter(torch.tensor(0.0)).to(device)
-        dummy_optimizer = torch.optim.SGD([dummy_param_amp], lr=1.0)
-        print("INFO: AMP ENABLED for online learning.")
 
     def _merge_ltm_state_into_model_state(update_model, state) -> bool:
         """Copy active chat fast-memory state into model.ltm before saving weights."""
@@ -1803,325 +2426,97 @@ def chat(args, device, tokenizer):
     # 4. LOCAL HELPER FOR LTM UPDATE
     # =================================================================
     def perform_ltm_update(input_ids_tensor, label_ids_tensor, source_id, penalty=False, lr_override=None, silent=False, compute_only=False, learn_input_tokens=False):
-        """Performs LTM update. Returns loss value if successful, else None.
-        If compute_only=True, only computes loss without updating LTM."""
-        nonlocal ltm_has_been_updated, ltm_state, ltm_token_clock
-        
+        """Run one bounded transaction; return its pre-update objective."""
+        nonlocal ltm_has_been_updated, ltm_state, ltm_token_clock, online_update_count
+
         update_model = shadow_model if is_quantized else model
-        if update_model is None:
+        if not learning_enabled or update_model is None:
             if not silent:
-                print(" (No updatable model available)")
+                print(" (Online adaptation is disabled)")
             return None
-            
-        target_device = device
-
-        # Online feedback should observe the same adaptive inference path used
-        # to produce the answer. eval() still permits gradients.
-        update_model.eval()
-        with torch.enable_grad():
-            if label_ids_tensor is None:
-                full_sequence = input_ids_tensor.unsqueeze(0)
-                labels = full_sequence.clone() if learn_input_tokens else torch.full_like(full_sequence, -100)
-            else:
-                full_sequence = torch.cat([input_ids_tensor, label_ids_tensor], dim=0).unsqueeze(0)
-                if learn_input_tokens:
-                    labels = full_sequence.clone()
-                else:
-                    labels = torch.cat([torch.full_like(input_ids_tensor, -100), label_ids_tensor], dim=0).unsqueeze(0)
-            
-            max_length = getattr(config, 'max_length', 1024)
-            if full_sequence.shape[1] > max_length:
-                full_sequence = full_sequence[:, -max_length:]
-                labels = labels[:, -max_length:]
-
-            if use_amp and dummy_optimizer:
-                dummy_optimizer.zero_grad(set_to_none=True)
-            update_model.zero_grad(set_to_none=True)
-
-            autocast_device = 'cpu' if is_directml_device(target_device) else target_device.type
-            with autocast(device_type=autocast_device, enabled=use_amp):
-                outputs = replay_online_feedback_with_training_recurrence(
-                    update_model,
-                    full_sequence,
-                    config=config,
-                    ltm_state=ltm_state,
-                    min_timestamp=min_ts_filter,
-                    min_wallclock_timestamp=min_wallclock_ts_filter,
-                    source_filter=source_id_filter,
-                )
-                logits = outputs["logits"]
-                
-                # LTM feedback learning must retain gradients on the exact
-                # retrieval tensors consumed by the forward graph. retrieve_topk
-                # already runs in float32, matching trainer.py.
-                if outputs.get("raw_topk_vals") is not None:
-                    for t in outputs["raw_topk_vals"]:
-                        if t.requires_grad:
-                            t.retain_grad()
-
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                flat_logits = shift_logits.view(-1, config.vocab_size)
-                flat_labels = shift_labels.view(-1)
-                valid_mask = flat_labels != -100
-                active_logits = flat_logits[valid_mask]
-                active_labels = flat_labels[valid_mask]
-
-                if active_labels.numel() == 0:
-                    update_model.zero_grad(set_to_none=True)
-                    update_model.eval()
-                    if not silent:
-                        print(" (No supervised tokens for LTM update)")
-                    return None
-
-                if penalty:
-                    probs = F.softmax(active_logits, dim=-1)
-                    target_probs = torch.gather(probs, 1, active_labels.unsqueeze(1)).squeeze(1)
-                    target_probs = torch.clamp(target_probs, min=1e-7, max=1.0 - 1e-7)
-                    loss = -torch.log(1.0 - target_probs).mean()
-                else:
-                    loss = F.cross_entropy(active_logits, active_labels)
-
-            if not bool(torch.isfinite(loss.detach()).all().item()):
-                update_model.zero_grad(set_to_none=True)
-                if not silent:
-                    print(" (Rejected non-finite online-learning loss)")
-                return None
-
-            # Surprise/quality probes need only the scalar loss. Avoid a full
-            # backward pass when no memory write was requested.
-            if compute_only:
-                loss_value = float(loss.detach().item())
-                update_model.zero_grad(set_to_none=True)
-                return loss_value
-
-            if use_amp and scaler:
-                scaler.scale(loss + dummy_param_amp * 0.0).backward()
-            else:
-                loss.backward()
-
-            # Extract and apply LTM gradients
-            ltm_grads = None
-            if outputs.get("raw_topk_vals") is not None:
-                grads_list = [t.grad for t in outputs["raw_topk_vals"]]
-                if any(g is not None for g in grads_list):
-                    cleaned_grads = []
-                    for i, g in enumerate(grads_list):
-                        if g is None:
-                            cleaned_grads.append(torch.zeros_like(outputs["raw_topk_vals"][i]))
-                        else:
-                            cleaned_grads.append(g)
-                    ltm_grads = torch.stack(cleaned_grads, dim=1)
-
-            if ltm_grads is not None:
-                ltm_grads_copy = ltm_grads.detach().clone()
-                
-                current_ltm_lr = lr_override if lr_override is not None else ltm_lr
-                if ltm_scheduler and lr_override is None:
-                    current_ltm_lr = ltm_scheduler.get_last_lr()[0]
-                    ltm_scheduler.step()
-
-                if use_amp and scaler:
-                    current_scale = scaler.get_scale()
-                    if current_scale != 1.0:
-                        ltm_grads_copy = ltm_grads_copy / current_scale
-
-                ltm_grads_copy = prepare_online_ltm_gradients(
-                    ltm_grads_copy,
-                    getattr(args, "online_ltm_grad_clip", 0.75),
-                )
-                if ltm_grads_copy is None:
-                    update_model.zero_grad(set_to_none=True)
-                    if not silent:
-                        print(" (Rejected non-finite online LTM gradient; memory unchanged)")
-                    return None
-
-                curr_ltm = outputs.get("ltm_memory_state")
-                curr_fast = curr_ltm[0] if curr_ltm is not None else None
-                curr_mom = curr_ltm[1] if curr_ltm is not None else None
-                old_past_tokens = ltm_state[2] if ltm_state is not None and len(ltm_state) >= 3 else None
-                old_rosa_states = ltm_state[3] if ltm_state is not None and len(ltm_state) >= 4 else None
-                curr_timestamps = curr_ltm[4] if curr_ltm is not None and len(curr_ltm) >= 5 else None
-                curr_sources = curr_ltm[5] if curr_ltm is not None and len(curr_ltm) >= 6 else None
-                curr_wallclock_timestamps = curr_ltm[6] if curr_ltm is not None and len(curr_ltm) >= 7 else None
-                write_timestamp = float(
-                    ltm_token_clock + int(full_sequence.shape[1])
-                )
-                write_wallclock_timestamp = time.time()
-
-                new_fast, new_mom = update_model.ltm.inner_update(
-                    outputs["topk_idx"],
-                    ltm_grads_copy,
-                    current_lr=current_ltm_lr,
-                    timestamp=write_timestamp,
-                    source=source_id,
-                    tokens_covered=full_sequence.shape[1],
-                    fast_vals=curr_fast,
-                    mom_vals=curr_mom,
-                    timestamps=curr_timestamps,
-                    sources=curr_sources,
-                    wallclock_timestamp=write_wallclock_timestamp,
-                    wallclock_timestamps=curr_wallclock_timestamps,
-                    inplace=True
-                )
-                if curr_ltm is not None:
-                    if is_quantized:
-                        new_fast = new_fast.detach().cpu()
-                        new_mom = new_mom.detach().cpu()
-                        if isinstance(curr_timestamps, torch.Tensor):
-                            curr_timestamps = curr_timestamps.detach().cpu()
-                        if isinstance(curr_sources, torch.Tensor):
-                            curr_sources = curr_sources.detach().cpu()
-                        if isinstance(curr_wallclock_timestamps, torch.Tensor):
-                            curr_wallclock_timestamps = (
-                                curr_wallclock_timestamps.detach().cpu()
-                            )
-                    ltm_state = (
-                        new_fast.detach(),
-                        new_mom.detach(),
-                        old_past_tokens.detach() if isinstance(old_past_tokens, torch.Tensor) else old_past_tokens,
-                        old_rosa_states,
-                        curr_timestamps.detach() if isinstance(curr_timestamps, torch.Tensor) else curr_timestamps,
-                        curr_sources.detach() if isinstance(curr_sources, torch.Tensor) else curr_sources,
-                        curr_wallclock_timestamps.detach() if isinstance(curr_wallclock_timestamps, torch.Tensor) else curr_wallclock_timestamps,
-                    )
-                ltm_token_clock = int(write_timestamp)
-                ltm_has_been_updated = True
-
-                if use_amp and scaler and dummy_optimizer:
-                    scaler.unscale_(dummy_optimizer)
-                    scaler.step(dummy_optimizer)
-                    scaler.update()
-
-                update_model.zero_grad(set_to_none=True)
-
-                if is_quantized and shadow_model:
-                    model.ltm.load_state_dict(update_model.ltm.state_dict(), strict=False)
-                    if (
-                        hasattr(model.ltm, "wallclock_timestamps")
-                        and hasattr(update_model.ltm, "wallclock_timestamps")
-                    ):
-                        model.ltm.wallclock_timestamps.copy_(
-                            update_model.ltm.wallclock_timestamps.to(
-                                device=model.ltm.wallclock_timestamps.device,
-                                dtype=model.ltm.wallclock_timestamps.dtype,
-                            )
-                        )
-
-                update_model.eval()
-                if penalty:
-                    if not silent:
-                        print(f" Done. (Unlikelihood | Loss: {loss.item():.3f})")
-                else:
-                    if not silent:
-                        print(f" Done. (Reinforced | Loss: {loss.item():.3f})")
-                return loss.item()
-            else:
-                update_model.eval()
-                if not silent:
-                    print(" (No LTM gradients generated)")
-                return None
-
-        update_model.eval()
-        return None
-
-    def perform_validation_hebbian_update(input_ids_tensor, label_ids_tensor, source_id, lr_override=None, silent=False):
-        """Stores a validated exchange in fast LTM using Hebbian writes only after praise/validation."""
-        nonlocal ltm_has_been_updated, ltm_state, ltm_token_clock
-
-        if not _checkpoint_has_trained_hebbian_writer(config):
-            if not silent:
-                print(" (Hebbian validation skipped: checkpoint value writer is untrained)", end="", flush=True)
-            return None
-
-        update_model = model
-        if update_model is None:
-            if not silent:
-                print(" (No model available for validation memory)")
-            return None
-
-        full_sequence = torch.cat([input_ids_tensor, label_ids_tensor], dim=0).unsqueeze(0)
-        max_length = getattr(config, 'max_length', 1024)
-        if full_sequence.shape[1] > max_length:
-            full_sequence = full_sequence[:, -max_length:]
-
-        model_input = full_sequence.cpu() if is_quantized else full_sequence.to(device)
-        rnn_device_local = "cpu" if is_quantized else device
-        if is_quantized or not hasattr(model, "h_rnn"):
-            local_h = torch.zeros(1, getattr(config, 'h_hidden', config.context_dim), 5, device=rnn_device_local)
-            local_l = torch.zeros(1, getattr(config, 'l_hidden', config.context_dim), 5, device=rnn_device_local)
-            local_h[:, :, 3] = -1e30
-            local_l[:, :, 3] = -1e30
-        else:
-            local_h = model.h_rnn.initial_state(1, device=rnn_device_local)
-            local_l = model.l_rnn.initial_state(1, device=rnn_device_local)
-        local_prev = torch.zeros(1, config.context_dim, device=rnn_device_local)
-        local_target = torch.zeros(1, config.context_dim, device=rnn_device_local)
-
-        previous_suppress = getattr(update_model, "suppress_hebbian", True)
-        previous_lr = getattr(update_model.config, "ltm_lr", None)
-        current_ltm_lr = lr_override if lr_override is not None else ltm_lr
-        update_model.suppress_hebbian = False
-        update_model.config.ltm_lr = current_ltm_lr
-        write_timestamp = float(
-            ltm_token_clock + int(full_sequence.shape[1])
+        current_ltm_lr = lr_override
+        if current_ltm_lr is None:
+            current_ltm_lr = float(getattr(args, "online_ltm_lr", 1e-3))
+            if not static_ltm_lr:
+                phase = min(online_update_count, ltm_schedule_steps) / ltm_schedule_steps
+                cosine = 0.5 * (1.0 + math.cos(math.pi * phase))
+                current_ltm_lr = ltm_schedule_min_lr + (
+                    max(current_ltm_lr, ltm_schedule_min_lr) - ltm_schedule_min_lr
+                ) * cosine
+        mutable_ltm_snapshot = {}
+        if not compute_only:
+            for attr_name in (
+                "fast_vals",
+                "_mom_vals",
+                "timestamps",
+                "sources",
+                "wallclock_timestamps",
+                "ltm_deltas",
+            ):
+                value = getattr(update_model.ltm, attr_name, None)
+                if torch.is_tensor(value):
+                    mutable_ltm_snapshot[attr_name] = value.detach().clone()
+        previous_ltm_state = ltm_state
+        previous_token_clock = ltm_token_clock
+        previous_updated = ltm_has_been_updated
+        result = apply_online_feedback_transaction(
+            update_model,
+            input_ids_tensor,
+            label_ids_tensor,
+            config=config,
+            ltm_state=ltm_state,
+            source_id=source_id,
+            penalty=penalty,
+            learning_rate=current_ltm_lr,
+            grad_clip=getattr(args, "online_ltm_grad_clip", 0.75),
+            max_delta_norm=getattr(args, "online_ltm_max_delta_norm", 1.0),
+            max_fast_norm=getattr(args, "online_ltm_max_fast_norm", 64.0),
+            max_slot_norm=getattr(args, "online_ltm_max_slot_norm", 4.0),
+            token_clock=ltm_token_clock,
+            min_timestamp=min_ts_filter,
+            min_wallclock_timestamp=min_wallclock_ts_filter,
+            source_filter=source_id_filter,
+            learn_input_tokens=learn_input_tokens,
+            compute_only=compute_only,
         )
-        write_wallclock_timestamp = time.time()
-
-        try:
-            if hasattr(update_model, "eval"):
-                update_model.eval()
-            with torch.no_grad():
-                outputs = update_model(
-                    input_ids=model_input,
-                    h_state=local_h if is_quantized else None,
-                    l_state=local_l if is_quantized else None,
-                    prev_context=local_prev if is_quantized else None,
-                    target_context=local_target if is_quantized else None,
-                    global_pos_offset=0,
-                    min_timestamp=min_ts_filter,
-                    min_wallclock_timestamp=min_wallclock_ts_filter,
-                    source_filter=source_id_filter,
-                    allow_hebbian_update=True,
-                    ltm_memory_state=_materialize_ltm_state_for_update(ltm_state),
-                    memory_write_source=source_id,
-                    memory_write_timestamp=write_timestamp,
-                    memory_write_wallclock_timestamp=write_wallclock_timestamp,
-                    return_topk_values=False,
-                    return_raw_topk_values=False,
-                    return_topk_indices=False,
-                    return_step_telemetry=False,
-                    return_numerics=False,
-                    return_last_logit_only=True,
-                )
-
-            updated_ltm = outputs.get("ltm_memory_state")
-            if updated_ltm is not None:
-                old_past_tokens = ltm_state[2] if ltm_state is not None and len(ltm_state) >= 3 else None
-                old_rosa_states = ltm_state[3] if ltm_state is not None and len(ltm_state) >= 4 else None
-                updated_mom = torch.zeros_like(updated_ltm[1]) if isinstance(updated_ltm[1], torch.Tensor) else updated_ltm[1]
-                ltm_state = (
-                    updated_ltm[0],
-                    updated_mom,
-                    old_past_tokens,
-                    old_rosa_states,
-                    updated_ltm[4] if len(updated_ltm) >= 5 else None,
-                    updated_ltm[5] if len(updated_ltm) >= 6 else None,
-                    updated_ltm[6] if len(updated_ltm) >= 7 else None,
-                )
-                ltm_token_clock = int(write_timestamp)
-                ltm_has_been_updated = True
+        loss_value = result.get("loss_before")
+        if compute_only:
+            return loss_value
+        if result.get("committed"):
+            ltm_state = result["ltm_state"]
+            ltm_token_clock = int(result["token_clock"])
+            ltm_has_been_updated = True
+            if not persist_online_memory(silent=True):
+                with torch.no_grad():
+                    for attr_name, previous_value in mutable_ltm_snapshot.items():
+                        target = getattr(update_model.ltm, attr_name, None)
+                        if torch.is_tensor(target):
+                            target.copy_(previous_value.to(
+                                device=target.device,
+                                dtype=target.dtype,
+                            ))
+                ltm_state = previous_ltm_state
+                ltm_token_clock = previous_token_clock
+                ltm_has_been_updated = previous_updated
                 if not silent:
-                    fv_norm = ltm_state[0].float().norm().item()
-                    print(f" [Hebbian validation memory | fast_vals norm: {fv_norm:.6e}]", end="", flush=True)
-                return ltm_state[0].float().norm().item() if updated_ltm[0] is not None else 0.0
+                    print(" (Online LTM update rolled back: persistence failed)")
+                return None
+            if lr_override is None:
+                online_update_count += 1
+            if is_quantized and model is not None and shadow_model is not None:
+                _copy_online_state_to_module(model, ltm_state)
+            autosave_chat_state(silent=True)
             if not silent:
-                print(" (No LTM state returned for validation memory)", end="", flush=True)
-            return None
-        finally:
-            update_model.suppress_hebbian = previous_suppress
-            if previous_lr is not None:
-                update_model.config.ltm_lr = previous_lr
+                action = "Unlikelihood" if penalty else "Reinforced"
+                print(
+                    f" Done. ({action} | Loss: {loss_value:.3f} -> "
+                    f"{result['loss_after']:.3f} | Δnorm: "
+                    f"{result['delta_norm']:.3e})"
+                )
+            return loss_value
+        if not silent:
+            print(f" (Online LTM update rejected: {result.get('reason', 'unknown')})")
+        return None
 
     # =================================================================
     # 5. PRINT WELCOME MESSAGE
@@ -2134,6 +2529,8 @@ def chat(args, device, tokenizer):
     print("  /system <prompt> | /system clear               : Set/clear system prompt")
     print("  /reset                                         : Clear RNN & Hierarchical states")
     print("  /reset_ltm                                     : Clear LTM memory (fast_vals)")
+    print("  /learn | /reject                               : Validate/reject the last answer")
+    print("  /correct <replacement answer>                  : Reject then replace the last answer")
     print("  /status                                        : Show model state info")
     print("Press Ctrl+C to stop generation at any time.")
     print("=" * 50)
@@ -2178,6 +2575,11 @@ def chat(args, device, tokenizer):
                 ltm_state=ltm_state,
                 total_tokens_generated=total_tokens_generated,
                 tokenizer=tokenizer,
+                chat_prefill_chunk_size=chat_prefill_chunk_size,
+                chat_input_history_turns=chat_input_history_turns,
+                chat_input_history_chars=chat_input_history_chars,
+                carry_chat_state=carry_chat_state,
+                chat_turn_history=chat_turn_history,
             )
             if not silent:
                 print(f"Saved hierarchical chat state to {path}")
@@ -2186,6 +2588,30 @@ def chat(args, device, tokenizer):
 
     def autosave_chat_state(silent=True):
         save_chat_state_to(chat_state_path, silent=silent)
+
+    def persist_online_memory(silent=True):
+        """Atomically save cumulative accepted deltas after every transaction."""
+
+        if not learning_enabled or not ltm_lora_path or updatable_model is None:
+            return False
+        ltm = getattr(updatable_model, "ltm", None)
+        if not bool(getattr(ltm, "accumulate_deltas", False)):
+            return False
+        try:
+            save_ltm_delta_overlay_atomic(
+                updatable_model,
+                ltm_lora_path,
+                ltm_state,
+                tokenizer=tokenizer,
+            )
+            if not silent:
+                print(f"Saved cumulative online memory to {ltm_lora_path}")
+            return True
+        except Exception as exc:
+            # Keep the in-memory transaction, but make persistence failure loud;
+            # the exit path will retry the same cumulative accumulator.
+            print(f"WARNING: Could not persist online memory atomically: {exc}")
+            return False
 
     def prompt_save_chat_state_on_exit():
         if h_state is None or l_state is None:
@@ -2224,7 +2650,10 @@ def chat(args, device, tokenizer):
         alpaca_chat_format = bool(getattr(args, "alpaca", False) or getattr(config, "alpaca", False))
         chat_input_history_turns = int(getattr(args, "chat_input_history_turns", 4) or 0)
         chat_input_history_chars = int(getattr(args, "chat_input_history_chars", 3000) or 0)
-        carry_chat_state = bool(getattr(args, "carry_chat_state", False))
+        carry_chat_state = resolve_effective_carry_chat_state(
+            getattr(args, "carry_chat_state", False),
+            resume_chat_state_path,
+        )
         requested_prefill_chunk = getattr(args, "chat_prefill_chunk_size", None)
         chat_prefill_chunk_size = resolve_inference_prefill_chunk_size(
             config,
@@ -2242,7 +2671,11 @@ def chat(args, device, tokenizer):
                 print("Chat prompt format: Alpaca ### Instruction/Response")
         else:
             print("Chat prompt format: User/Assistant")
-        if carry_chat_state:
+        if resume_chat_state_path:
+            print(
+                "Chat state carry: ON (required for the requested resumed continuation)."
+            )
+        elif carry_chat_state:
             print("Chat state carry: ON (experimental; recurrent state persists across user turns).")
         else:
             print("Chat state carry: OFF (train-parity mode; use Previous Context text for turn history).")
@@ -2313,6 +2746,11 @@ def chat(args, device, tokenizer):
                     device=rnn_device,
                     model=model,
                     tokenizer=tokenizer,
+                    expected_chat_prefill_chunk_size=(
+                        chat_prefill_chunk_size
+                        if requested_prefill_chunk is not None
+                        else None
+                    ),
                 )
                 if restored["h_state"] is not None:
                     h_state = restored["h_state"]
@@ -2330,6 +2768,27 @@ def chat(args, device, tokenizer):
                     restored.get("rosa_past_tokens"),
                     restored.get("rosa_states"),
                 )
+                continuity = restored.get("chat_continuity")
+                if continuity is not None:
+                    # With no explicit override, the saved effective chunk size
+                    # is authoritative. This preserves the absolute TBPTT phase.
+                    if requested_prefill_chunk is None:
+                        chat_prefill_chunk_size = int(
+                            continuity["prefill_chunk_size"]
+                        )
+                    chat_input_history_turns = int(
+                        continuity["history_max_turns"]
+                    )
+                    chat_input_history_chars = int(
+                        continuity["history_max_chars"]
+                    )
+                    chat_turn_history[:] = continuity["turn_history"]
+                    print(
+                        "Restored chat continuity geometry: "
+                        f"prefill={chat_prefill_chunk_size or 'off'}, "
+                        f"phase={continuity['absolute_chunk_phase']}, "
+                        f"history_turns={len(chat_turn_history)}."
+                    )
                 print(f"Resumed hierarchical chat state from {chat_state_path}")
             except FileNotFoundError as exc:
                 chat_state_resume_valid = False
@@ -2534,11 +2993,38 @@ def chat(args, device, tokenizer):
                 continue
 
             if prompt.startswith('/status'):
+                def _status_config(name, default=None):
+                    if isinstance(config, dict):
+                        return config.get(name, default)
+                    return getattr(config, name, default)
+
+                active_fast = (
+                    ltm_state[0]
+                    if isinstance(ltm_state, (tuple, list))
+                    and ltm_state
+                    and torch.is_tensor(ltm_state[0])
+                    else getattr(getattr(updatable_model, "ltm", None), "fast_vals", None)
+                )
+                fast_norm = (
+                    float(active_fast.detach().float().norm().item())
+                    if torch.is_tensor(active_fast)
+                    else 0.0
+                )
                 print(f"Model Status:")
                 print(f"  Total Tokens Generated: {total_tokens_generated}")
                 print(f"  Device: {device}")
                 print(f"  Quantized: {is_quantized}")
-                print(f"  LTM Learning: {'ACTIVE' if learning_enabled else 'OFF'}")
+                print(f"  Online Adaptation: {'ACTIVE' if learning_enabled else 'OFF'}")
+                print(f"  Online Policy: {online_adaptation_policy}")
+                print(f"  Passive Prompt/Response: {passive_learning}/{passive_response_learning}")
+                print(f"  Online Overlay: {ltm_lora_path or '(disabled)'}")
+                print(f"  Fast Memory Norm: {fast_norm:.6e}")
+                print(
+                    "  Value Writer Ready/Updates/EMA: "
+                    f"{bool(_status_config('val_proj_trained', False))}/"
+                    f"{int(_status_config('val_proj_alignment_updates', 0) or 0)}/"
+                    f"{_status_config('val_proj_alignment_ema', 'n/a')}"
+                )
                 print(f"  Checkpoint LTM Training Mode: {trained_ltm_mode}")
                 print(f"  Chat LTM Runtime: read-only during normal prefill/generation")
                 print(f"  Chat Prefill Chunk Size: {chat_prefill_chunk_size or 'off'}")
@@ -2548,75 +3034,118 @@ def chat(args, device, tokenizer):
             # =================================================================
             # A. CHECK FOR FEEDBACK & PERFORM UPDATES
             # =================================================================
-            if learning_enabled:
-                correction_text = extract_correction_text(prompt) if pending_training_data is not None else None
-                if correction_text:
-                    print("[Correction received. Updating previous answer memory...]", end="", flush=True)
+            feedback_text = prompt.strip()
+            feedback_lower = feedback_text.lower()
+            explicit_feedback = (
+                feedback_lower in ("/learn", "/reject", "/correct")
+                or feedback_lower.startswith("/correct ")
+            )
+            if explicit_feedback:
+                if not learning_enabled:
+                    print("[Online adaptation is disabled by policy or runtime]")
+                    continue
+                if pending_training_data is None:
+                    print("[Nothing pending to adapt]")
+                    continue
+
+                exchange = pending_training_data
+                pending_training_data = None  # Every explicit action is single-use.
+                if feedback_lower == "/learn":
+                    print("[Validating the previous answer...]", end="", flush=True)
                     perform_ltm_update(
-                        pending_training_data['prompt_ids'][0],
-                        pending_training_data['response_ids'],
-                        LTMModule.SRC_CORRECTION,
-                        penalty=True
+                        exchange['prompt_ids'][0],
+                        exchange['response_ids'],
+                        LTMModule.SRC_USER_INTERACTION,
+                        penalty=False,
                     )
-                    correction_ids = tokenizer.encode(correction_text, add_special_tokens=False)
-                    if tokenizer.eos_token_id is not None:
-                        correction_ids = correction_ids + [tokenizer.eos_token_id]
-                    correction_tensor = torch.tensor(correction_ids, device=device)
+                    print("")
+                    continue
+                if feedback_lower == "/reject":
+                    print("[Rejecting the previous answer...]", end="", flush=True)
                     perform_ltm_update(
-                        pending_training_data['prompt_ids'][0],
-                        correction_tensor,
-                        LTMModule.SRC_CORRECTION,
-                        penalty=False
+                        exchange['prompt_ids'][0],
+                        exchange['response_ids'],
+                        LTMModule.SRC_USER_INTERACTION,
+                        penalty=True,
                     )
-                    pending_training_data = None
                     print("")
                     continue
 
-                if is_positive_feedback(prompt) and pending_training_data is not None:
-                    print("[Positive feedback. Reinforcing previous memory...]", end="", flush=True)
-                    perform_ltm_update(
-                        pending_training_data['prompt_ids'][0],
-                        pending_training_data['response_ids'],
-                        LTMModule.SRC_USER_INTERACTION,
-                        penalty=False
-                    )
-                    perform_validation_hebbian_update(
-                        pending_training_data['prompt_ids'][0],
-                        pending_training_data['response_ids'],
-                        LTMModule.SRC_USER_INTERACTION,
-                    )
-                    pending_training_data = None
-                    print("")
+                correction_text = feedback_text[len("/correct"):].strip()
+                if not correction_text:
+                    pending_training_data = exchange
+                    print("Usage: /correct <replacement answer>")
                     continue
-
-                elif prompt.strip().lower() in ["no", "n", "bad", "wrong", "bad bot"]:
-                    if pending_training_data is not None:
-                        print("[Negative feedback. Minimizing probability of previous output...]", end="", flush=True)
-                        perform_ltm_update(
-                            pending_training_data['prompt_ids'][0],
-                            pending_training_data['response_ids'],
-                            LTMModule.SRC_USER_INTERACTION,
-                            penalty=True
-                        )
-
-            if prompt.strip() == "/learn" and pending_training_data:
-                print("[Manual learn command. Reinforcing previous...]", end="", flush=True)
-                perform_ltm_update(
-                    pending_training_data['prompt_ids'][0],
-                    pending_training_data['response_ids'],
-                    LTMModule.SRC_USER_INTERACTION,
-                    penalty=False
+                correction_ids = tokenizer.encode(
+                    correction_text,
+                    add_special_tokens=False,
                 )
-                perform_validation_hebbian_update(
-                    pending_training_data['prompt_ids'][0],
-                    pending_training_data['response_ids'],
-                    LTMModule.SRC_USER_INTERACTION,
+                if tokenizer.eos_token_id is not None:
+                    correction_ids = correction_ids + [tokenizer.eos_token_id]
+                if not correction_ids:
+                    pending_training_data = exchange
+                    print("[Correction produced no target tokens]")
+                    continue
+                print("[Replacing the previous answer in online memory...]", end="", flush=True)
+                perform_ltm_update(
+                    exchange['prompt_ids'][0],
+                    exchange['response_ids'],
+                    LTMModule.SRC_CORRECTION,
+                    penalty=True,
+                )
+                perform_ltm_update(
+                    exchange['prompt_ids'][0],
+                    torch.tensor(correction_ids, device=device),
+                    LTMModule.SRC_CORRECTION,
+                    penalty=False,
                 )
                 print("")
                 continue
-            elif prompt.strip() == "/learn":
-                print("[Nothing pending to learn]")
-                continue
+
+            # Heuristic natural-language feedback is deliberately opt-in. It is
+            # never combined with the Hebbian writer, avoiding double writes.
+            if (
+                learning_enabled
+                and bool(getattr(args, "natural_feedback_detection", False))
+                and pending_training_data is not None
+            ):
+                natural_correction = extract_correction_text(feedback_text)
+                natural_positive = is_positive_feedback(feedback_text)
+                natural_negative = feedback_lower in {
+                    "no", "n", "bad", "wrong", "bad bot", "incorrect"
+                }
+                if natural_correction:
+                    exchange = pending_training_data
+                    pending_training_data = None
+                    correction_ids = tokenizer.encode(natural_correction, add_special_tokens=False)
+                    if tokenizer.eos_token_id is not None:
+                        correction_ids = correction_ids + [tokenizer.eos_token_id]
+                    if correction_ids:
+                        print("[Natural correction detected...]", end="", flush=True)
+                        perform_ltm_update(
+                            exchange['prompt_ids'][0], exchange['response_ids'],
+                            LTMModule.SRC_CORRECTION, penalty=True,
+                        )
+                        perform_ltm_update(
+                            exchange['prompt_ids'][0],
+                            torch.tensor(correction_ids, device=device),
+                            LTMModule.SRC_CORRECTION,
+                            penalty=False,
+                        )
+                        print("")
+                        continue
+                elif natural_positive or natural_negative:
+                    exchange = pending_training_data
+                    pending_training_data = None
+                    print("[Natural feedback detected...]", end="", flush=True)
+                    perform_ltm_update(
+                        exchange['prompt_ids'][0],
+                        exchange['response_ids'],
+                        LTMModule.SRC_USER_INTERACTION,
+                        penalty=natural_negative,
+                    )
+                    print("")
+                    continue
 
             # =================================================================
             # B. GENERATION LOGIC
@@ -2638,15 +3167,14 @@ def chat(args, device, tokenizer):
                 prompt,
                 system_prompt=system_prompt,
                 alpaca_mode=alpaca_chat_format,
-                input_context=build_chat_input_context(
+                input_context=build_effective_chat_input_context(
                     chat_turn_history,
                     max_turns=chat_input_history_turns,
                     max_chars=chat_input_history_chars,
+                    carry_chat_state=carry_chat_state,
                 ) if alpaca_chat_format else None,
             )
             prompt_ids = tokenizer.encode(prompt_format, return_tensors="pt").to(device)
-            passive_learning = getattr(args, 'passive_learning', False)
-            passive_response_learning = getattr(args, 'passive_response_learning', False)
             passive_lr = getattr(args, 'passive_lr', 1e-5)
             surprise_threshold = getattr(args, 'surprise_threshold', 0.5)
 
@@ -2916,9 +3444,11 @@ def chat(args, device, tokenizer):
                 )
                 if response_text:
                     chat_turn_history.append(f"User: {prompt.strip()}\nAssistant: {response_text}")
-                    max_keep_turns = max(chat_input_history_turns, 1)
-                    if len(chat_turn_history) > max_keep_turns:
-                        del chat_turn_history[:-max_keep_turns]
+                    chat_turn_history[:] = bound_chat_turn_history(
+                        chat_turn_history,
+                        max_turns=chat_input_history_turns,
+                        max_chars=chat_input_history_chars,
+                    )
                 pending_training_data = {
                     'prompt_ids': prompt_ids,
                     'response_ids': torch.tensor(response_ids, device=device)
@@ -2990,9 +3520,11 @@ def chat(args, device, tokenizer):
             if hasattr(updatable_model.ltm, 'ltm_deltas') and torch.any(updatable_model.ltm.ltm_deltas != 0):
                 print(f"\nSaving LTM memory deltas to {ltm_lora_path}...")
                 try:
-                    torch.save(
-                        build_ltm_delta_overlay(updatable_model, ltm_state),
+                    save_ltm_delta_overlay_atomic(
+                        updatable_model,
                         ltm_lora_path,
+                        ltm_state,
+                        tokenizer=tokenizer,
                     )
                     print("Deltas saved.")
                 except Exception as e:

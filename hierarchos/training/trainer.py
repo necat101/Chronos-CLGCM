@@ -36,6 +36,7 @@ from ..models.revisions import (
     architecture_contract,
     architecture_contract_hash,
     architecture_default_training_chunk_size,
+    normalize_ltm_training_mode as _normalize_ltm_training_mode_contract,
 )
 from ..evaluation.selection import BestMetric, extract_selection_metric
 from ..utils.rosa import rosa_batch_parallel, rosa_context_mode
@@ -1082,8 +1083,13 @@ def resolve_training_step_offset(model, next_local_step: int) -> int:
     return int(saved_step) + 1 - max(0, int(next_local_step or 0))
 
 
-def mark_val_proj_trained(model):
-    """Record a successful writer update through compiled and PEFT wrappers."""
+def mark_val_proj_trained(model, alignment_cost=None):
+    """Record one successful writer update and quality-gate its capability.
+
+    Update count alone cannot prove that a writer maps values into the learned
+    LTM read channel.  Readiness therefore requires a finite alignment EMA below
+    the checkpointed threshold and a finite, bounded writer norm.
+    """
     candidates = [model, getattr(model, "_orig_mod", None)]
     base_model = getattr(model, "base_model", None)
     candidates.extend(
@@ -1111,19 +1117,75 @@ def mark_val_proj_trained(model):
                 else getattr(config, "ltm_value_alignment_min_updates", 100)
             ),
         )
-        if isinstance(config, dict):
-            updates = int(config.get("val_proj_alignment_updates", 0) or 0) + 1
-            config["val_proj_alignment_updates"] = updates
-            if updates >= minimum_updates:
-                config["val_proj_trained"] = True
-        else:
+        def read(name, default=None):
+            return (
+                config.get(name, default)
+                if isinstance(config, dict)
+                else getattr(config, name, default)
+            )
+
+        def write(name, value):
+            if isinstance(config, dict):
+                config[name] = value
+            else:
+                setattr(config, name, value)
+
+        updates = int(read("val_proj_alignment_updates", 0) or 0) + 1
+        write("val_proj_alignment_updates", updates)
+
+        score = None
+        if torch.is_tensor(alignment_cost):
+            if alignment_cost.numel() == 1:
+                score = float(alignment_cost.detach().float().item())
+        elif alignment_cost is not None:
             try:
-                updates = int(getattr(config, "val_proj_alignment_updates", 0) or 0) + 1
-                setattr(config, "val_proj_alignment_updates", updates)
-                if updates >= minimum_updates:
-                    setattr(config, "val_proj_trained", True)
-            except Exception:
-                pass
+                score = float(alignment_cost)
+            except (TypeError, ValueError):
+                score = None
+
+        score_is_finite = score is not None and math.isfinite(score) and score >= 0.0
+        if score_is_finite:
+            decay = float(read("ltm_value_alignment_ema_decay", 0.95) or 0.0)
+            decay = min(max(decay, 0.0), 0.999999)
+            previous_ema = read("val_proj_alignment_ema", None)
+            if previous_ema is None or not math.isfinite(float(previous_ema)):
+                ema = score
+            else:
+                ema = decay * float(previous_ema) + (1.0 - decay) * score
+            previous_best = read("val_proj_alignment_best", None)
+            best = (
+                score
+                if previous_best is None or not math.isfinite(float(previous_best))
+                else min(float(previous_best), score)
+            )
+            write("val_proj_alignment_last", score)
+            write("val_proj_alignment_ema", ema)
+            write("val_proj_alignment_best", best)
+        else:
+            ema = float("inf")
+
+        writer = getattr(candidate, "val_proj", None)
+        writer_weight = getattr(writer, "weight", None)
+        if torch.is_tensor(writer_weight):
+            writer_norm = float(writer_weight.detach().float().norm().item())
+            writer_norm_is_finite = math.isfinite(writer_norm)
+            write("val_proj_writer_norm", writer_norm)
+        else:
+            writer_norm = 0.0
+            writer_norm_is_finite = True
+
+        ready_threshold = float(
+            read("ltm_value_alignment_ready_threshold", 0.95) or 0.0
+        )
+        writer_max_norm = float(read("ltm_value_writer_max_norm", 64.0) or 0.0)
+        quality_ready = score_is_finite and ema <= ready_threshold
+        norm_ready = writer_norm_is_finite and (
+            writer_max_norm <= 0.0 or writer_norm <= writer_max_norm
+        )
+        write(
+            "val_proj_trained",
+            bool(updates >= minimum_updates and quality_ready and norm_ready),
+        )
 
 
 def compute_chunk_training_weights(labels: torch.Tensor, attention_mask: torch.Tensor = None,
@@ -1945,21 +2007,7 @@ def _state_to_device(value, device):
     return value
 
 def normalize_ltm_training_mode(value) -> str:
-    mode = str(value or "inner-update").strip().lower().replace("_", "-")
-    aliases = {
-        "inner": "inner-update",
-        "gradient": "inner-update",
-        "grad": "inner-update",
-        "titans": "inner-update",
-        "titans-inner-update": "inner-update",
-        "read-only": "read-only",
-        "readonly": "read-only",
-        "inference": "read-only",
-        "inference-like": "read-only",
-        "off": "read-only",
-        "none": "read-only",
-    }
-    return aliases.get(mode, "inner-update")
+    return _normalize_ltm_training_mode_contract(value)
 
 def ltm_inner_updates_enabled(args) -> bool:
     return normalize_ltm_training_mode(getattr(args, "ltm_training_mode", "inner-update")) == "inner-update"
@@ -2435,7 +2483,11 @@ _EXACT_RESUME_ARG_KEYS = (
     "commitment_loss_weight",
     "commitment_threshold",
     "ltm_value_alignment_weight",
+    "ltm_value_alignment_stride",
     "ltm_value_alignment_min_updates",
+    "ltm_value_alignment_ready_threshold",
+    "ltm_value_alignment_ema_decay",
+    "ltm_value_writer_max_norm",
     # PEFT geometry/scaling must remain fixed for a true fine-tune resume.
     "lora_r",
     "lora_alpha",
@@ -3436,6 +3488,7 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
     full_commitment_terms = []
     full_ltm_alignment_terms = []
     full_recurrent_carrier_checks = []
+    writer_alignment_score = None
     fast_lm_loss = (
         (device.type == 'cuda' and getattr(args, 'cuda_chunked_lm_loss', True))
         or (device.type == 'cpu' and getattr(args, 'cpu_chunked_lm_loss', True))
@@ -3533,6 +3586,15 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                 ponder_cost = outputs.get('ponder_cost')
                 commitment_cost = outputs.get('commitment_cost')
                 ltm_value_alignment_cost = outputs.get('ltm_value_alignment_cost')
+                if ltm_value_alignment_cost is not None:
+                    weighted_writer_score = (
+                        ltm_value_alignment_cost.detach().float() * token_ratio
+                    )
+                    writer_alignment_score = (
+                        weighted_writer_score
+                        if writer_alignment_score is None
+                        else writer_alignment_score + weighted_writer_score
+                    )
                 recurrent_carrier_checks = _recurrent_carrier_finite_checks(outputs)
 
                 if full_sample_bptt:
@@ -4051,7 +4113,10 @@ def train_step(model, batch, optimizer, scaler, accumulation_steps, step, args, 
                     )
                 optimizer.step()
             if ltm_value_alignment_weight > 0.0:
-                mark_val_proj_trained(model)
+                mark_val_proj_trained(
+                    model,
+                    alignment_cost=writer_alignment_score,
+                )
             optimizer.zero_grad(set_to_none=True)
             args._accumulation_weighted_token_mass = 0.0
             args._optimizer_step_was_taken = True
