@@ -13,6 +13,14 @@ parser.add_argument("--dataset", type=str, required=True,
                     help="Path to the input JSONL dataset file (e.g., train.jsonl).")
 parser.add_argument("--tokenizer-path", type=str, default="openai-community/gpt2", # Changed default
                     help="Path or Hugging Face name of the tokenizer to use.")
+parser.add_argument(
+    "--trust-remote-code",
+    action="store_true",
+    help=(
+        "Explicitly allow the tokenizer repository to execute custom Python "
+        "code. Disabled by default; use only for a repository you trust."
+    ),
+)
 parser.add_argument("--overlap", type=int, default=1024,
                     help="Number of tokens to overlap between consecutive chunks.")
 parser.add_argument("--output-dir", type=str, default="train_Hierarchos_chunked_tensors",
@@ -47,7 +55,11 @@ if WRITE_JSONL:
 # --- 2. Load Tokenizer ---
 print(f"Loading tokenizer '{TOKENIZER_PATH}'...")
 try:
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, model_max_length=999999, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        TOKENIZER_PATH,
+        model_max_length=999999,
+        trust_remote_code=bool(args.trust_remote_code),
+    )
 except Exception as e:
     print(f"ERROR: Failed to load tokenizer '{TOKENIZER_PATH}'. {e}")
     sys.exit(1)

@@ -715,10 +715,11 @@ def test_cli_builds_and_uses_hf_token_cache():
                 batch_size=4,
                 num_workers=0,
                 length_bucket_size=len(rows),
-                hf_token_cache=True,
-                streaming_datasets=True,
-                prefetch_factor=None,
-            )
+                    hf_token_cache=True,
+                    streaming_datasets=True,
+                    prefetch_factor=None,
+                    max_cache_truncated_fraction=1.0,
+                )
             dataloader = hierarchos_cli.create_hf_training_dataloader(
                 args,
                 TinyTokenizer(),

@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import re
 import subprocess
 import sys
@@ -78,10 +79,12 @@ def test_core_package_import_does_not_load_optional_benchmark_stack():
                 "import sys; import hierarchos; "
                 "assert 'lm_eval' not in sys.modules; "
                 "assert 'soundfile' not in sys.modules; "
-                "assert 'transformers.pipelines' not in sys.modules"
+                "assert 'transformers.pipelines' not in sys.modules; "
+                "assert 'numba' not in sys.modules"
             ),
         ],
         cwd=ROOT,
+        env={**os.environ, "ROSA_USE_NUMBA": "0"},
         capture_output=True,
         text=True,
         timeout=60,

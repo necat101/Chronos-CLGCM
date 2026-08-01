@@ -19,6 +19,7 @@ Self-contained — creates models in-memory, no checkpoint needed.
 """
 import sys
 sys.path.insert(0, '.')
+import pytest
 import torch
 from torch.amp import autocast
 from hierarchos import HierarchosCore, AttrDict
@@ -306,9 +307,9 @@ def test_optimizer_step_sanity():
     print("[PASS] Full training step sanity check passed")
 
 
-def test_act_and_recurrent_forward_clamps():
-    """Poisoned incoming states and ACT halt logits must be repaired in forward."""
-    print("\n=== Test 8: ACT/Recurrent Forward Clamps ===")
+def test_act_and_recurrent_forward_rejects_nonfinite_state():
+    """Non-finite recurrent inputs must never be rewritten into a valid path."""
+    print("\n=== Test 8: ACT/Recurrent Non-Finite Rejection ===")
     cfg = make_config()
     cfg.recurrent_state_clamp = 1.5
     cfg.context_state_clamp = 1.25
@@ -340,30 +341,18 @@ def test_act_and_recurrent_forward_clamps():
         model.h_halt_proj.weight.fill_(float("inf"))
         model.h_halt_proj.bias.fill_(float("nan"))
 
-    with autocast(device_type=device_type, dtype=amp_dtype, enabled=True):
-        out = model(
-            x,
-            labels=labels,
-            h_state=h_state,
-            l_state=l_state,
-            prev_context=prev_context,
-            target_context=target_context,
-            drift_state=drift_state,
-        )
-
-    assert torch.isfinite(out["loss"]), "FAIL: loss is non-finite after forward clamps"
-    assert torch.isfinite(out["ponder_cost"]), "FAIL: ponder_cost is non-finite after halt-logit clamp"
-    assert torch.isfinite(out["h_state"]).all(), "FAIL: h_state still has NaN/Inf"
-    assert torch.isfinite(out["l_state"]).all(), "FAIL: l_state still has NaN/Inf"
-    assert torch.isfinite(out["prev_context"]).all(), "FAIL: prev_context still has NaN/Inf"
-    assert torch.isfinite(out["target_context"]).all(), "FAIL: target_context still has NaN/Inf"
-    assert torch.isfinite(out["drift_state"]).all(), "FAIL: drift_state still has NaN/Inf"
-    assert out["h_state"].abs().max().item() <= cfg.recurrent_state_clamp
-    assert out["l_state"].abs().max().item() <= cfg.recurrent_state_clamp
-    assert out["prev_context"].abs().max().item() <= cfg.context_state_clamp
-    assert out["target_context"].abs().max().item() <= cfg.context_state_clamp
-    assert out["drift_state"].abs().max().item() <= cfg.drift_state_clamp
-    print("[PASS] ACT halt logits and recurrent states are repaired and bounded")
+    with pytest.raises(FloatingPointError, match="Non-finite raw language-model logits"):
+        with autocast(device_type=device_type, dtype=amp_dtype, enabled=True):
+            model(
+                x,
+                labels=labels,
+                h_state=h_state,
+                l_state=l_state,
+                prev_context=prev_context,
+                target_context=target_context,
+                drift_state=drift_state,
+            )
+    print("[PASS] Non-finite ACT/recurrent trajectory was rejected")
 
 
 if __name__ == "__main__":
@@ -379,7 +368,10 @@ if __name__ == "__main__":
         ("Multi-Chunk TBPTT Backward", test_multichunk_backward),
         ("LERP Dtype Safety", test_lerp_dtype_safety),
         ("Full Training Step Sanity", test_optimizer_step_sanity),
-        ("ACT/Recurrent Forward Clamps", test_act_and_recurrent_forward_clamps),
+        (
+            "ACT/Recurrent Non-Finite Rejection",
+            test_act_and_recurrent_forward_rejects_nonfinite_state,
+        ),
     ]
 
     results = []

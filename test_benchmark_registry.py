@@ -3,8 +3,10 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 from hierarchos.evaluation import post_training
+from hierarchos.evaluation import arc_agi
 from hierarchos.evaluation.arc_agi import extract_json_grid, load_arc_agi_tasks
 from hierarchos.evaluation.benchmarks import get_benchmark, resolve_task_names
 
@@ -100,6 +102,39 @@ class BenchmarkRegistryTests(unittest.TestCase):
         self.assertEqual(tasks[0].task_id, "sample")
         self.assertEqual(tasks[0].train[0].input, [[0]])
         self.assertEqual(tasks[0].test[0].output, [[3]])
+
+    def test_arc_agi_uses_checkpoint_training_prompt_format(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            task_path = Path(tmp_dir) / "sample.json"
+            task_path.write_text(
+                json.dumps(
+                    {
+                        "train": [{"input": [[0]], "output": [[1]]}],
+                        "test": [{"input": [[2]], "output": [[3]]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            model = SimpleNamespace(config=SimpleNamespace(alpaca=True))
+            with mock.patch.object(
+                arc_agi,
+                "generate_text",
+                return_value="[[3]]",
+            ) as generate:
+                result = arc_agi.run_arc_agi_eval(
+                    model=model,
+                    tokenizer=object(),
+                    device=None,
+                    dataset_path=str(task_path),
+                )
+
+        prompt = generate.call_args.kwargs["prompt"]
+        self.assertTrue(prompt.startswith("### Instruction:\n"))
+        self.assertTrue(prompt.endswith("\n\n### Response:\n"))
+        self.assertEqual(
+            result["config"]["prompt_format"],
+            "alpaca-instruction-response",
+        )
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 import random
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -171,7 +172,12 @@ class ROSACorrectnessTests(unittest.TestCase):
             device=device,
             rosa_max_ctx=64,
         )
-        _, saved_past, _states = finalize()
+        _, saved_past, first_states = finalize()
+        self.assertIsNone(saved_past)
+        saved_past = torch.tensor(
+            [first_states[0].tokens],
+            dtype=torch.long,
+        )
 
         # Chat persistence stores the capped token window, not the Python
         # automaton object. Rebuilding from saved tokens must preserve ROSA.
@@ -188,7 +194,7 @@ class ROSACorrectnessTests(unittest.TestCase):
 
         expected = ROSA(seq)[7:]
         self.assertEqual(_decode_sentinel(out[0].tolist(), sentinel), expected)
-        self.assertEqual(past.tolist(), [seq])
+        self.assertIsNone(past)
         self.assertEqual(states[0].tokens, seq)
 
     def test_async_full_history_alignment_across_chunks(self):
@@ -219,7 +225,7 @@ class ROSACorrectnessTests(unittest.TestCase):
 
             self.assertEqual(len(actual), len(cur))
             self.assertEqual(actual, expected)
-            self.assertEqual(past.tolist(), [seq[:end]])
+            self.assertIsNone(past)
             self.assertEqual(states[0].tokens, seq[:end])
             pos = end
 
@@ -237,8 +243,75 @@ class ROSACorrectnessTests(unittest.TestCase):
 
         self.assertEqual(out.shape, (1, 2))
         self.assertEqual(_decode_sentinel(out[0].tolist(), sentinel), [-1, -1])
-        self.assertEqual(past.tolist(), [[6, 3]])
+        self.assertIsNone(past)
         self.assertEqual(states[0].tokens, [6, 3])
+
+    def test_versioned_bounded_mode_is_chunk_invariant_and_strictly_bounded(self):
+        seq = [1, 2, 1, 2, 3, 1, 2, 4, 1, 2, 3, 5, 1]
+        sentinel = 99
+        cap = 4
+        expected = precompute_rosa_ids_for_chunks(
+            seq,
+            vocab_size=sentinel,
+            chunk_size=5,
+            rosa_max_ctx=cap,
+            enforce_max_context=True,
+        )
+
+        for chunks in ([1] * len(seq), [3, 2, 5, 3], [7, 6]):
+            past = None
+            states = None
+            actual = []
+            pos = 0
+            for width in chunks:
+                cur = seq[pos:pos + width]
+                finalize = rosa_async_pipeline(
+                    torch.tensor([cur], dtype=torch.long),
+                    past_tokens=past,
+                    rosa_states=states,
+                    vocab_size=sentinel,
+                    device=torch.device("cpu"),
+                    rosa_max_ctx=cap,
+                    enforce_max_context=True,
+                )
+                out, past, states = finalize()
+                actual.extend(out[0].tolist())
+                self.assertIsNone(past)
+                self.assertLessEqual(len(states[0].tokens), cap)
+                pos += width
+            self.assertEqual(actual, expected)
+
+    def test_concurrent_async_batches_have_independent_result_storage(self):
+        batches = [
+            [[1, 2, 1, 3], [4, 4, 5, 4]],
+            [[7, 8, 7, 9], [2, 3, 2, 4]],
+            [[5, 6, 5, 7], [8, 8, 9, 8]],
+            [[9, 1, 9, 2], [3, 4, 3, 5]],
+        ]
+        sentinel = 99
+
+        def run(batch):
+            finalize = rosa_async_pipeline(
+                torch.tensor(batch, dtype=torch.long),
+                past_tokens=None,
+                rosa_states=None,
+                vocab_size=sentinel,
+                device=torch.device("cpu"),
+            )
+            out, _past, _states = finalize()
+            return out.tolist()
+
+        with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+            actual = list(pool.map(run, batches))
+
+        expected = [
+            [
+                [sentinel if pred == -1 else pred for pred in ROSA(row)]
+                for row in batch
+            ]
+            for batch in batches
+        ]
+        self.assertEqual(actual, expected)
 
     def test_precomputed_chunk_ids_match_async_pipeline(self):
         seq = [1, 2, 1, 2, 3, 1, 2, 4, 1, 2, 3, 5, 1]

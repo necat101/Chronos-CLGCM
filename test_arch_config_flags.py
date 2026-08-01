@@ -6,6 +6,7 @@ import torch
 
 from hierarchos.models.quantized import (
     detect_quantized_rwkv_format,
+    load_quantized,
     validate_quantized_rwkv_format,
 )
 from hierarchos.utils.checkpoint import (
@@ -44,6 +45,24 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
         self.assertFalse(config["use_deepembed"])
         self.assertFalse(config["use_rosa"])
         self.assertNotIn("rosa_max_context", config)
+
+    def test_infers_coherent_shared_adapters_from_state_dict(self):
+        config = {}
+        state = {
+            "h_deepembed_adapter.down.weight": torch.empty(2, 4),
+            "l_deepembed_adapter.down.weight": torch.empty(2, 4),
+            "rosa_adapter.down.weight": torch.empty(2, 4),
+            "rosa_gate_logit": torch.empty(()),
+            "h_rnn.r_k": torch.empty(7, 4),
+        }
+
+        _infer_arch_flags_from_state_dict(config, state)
+
+        self.assertEqual(config["architecture_revision"], "coherent-v9")
+        self.assertEqual(config["deepembed_mode"], "shared-factorized")
+        self.assertEqual(config["rosa_embedding_mode"], "shared-factorized")
+        self.assertTrue(config["use_deepembed"])
+        self.assertTrue(config["use_rosa"])
 
     def test_rejects_legacy_scalar_rwkv_checkpoint(self):
         state = {
@@ -91,7 +110,7 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
         self.assertEqual(os.path.normcase(resolved), os.path.normcase(new_path))
         self.assertEqual(os.path.normcase(model_dir), os.path.normcase(tmp))
 
-    def test_quantized_loader_rejects_v8_matrix_state_archive(self):
+    def test_quantized_loader_rejects_every_legacy_npz_architecture(self):
         legacy_q = {"h_rnn.time_decay": object(), "h_rnn.time_mix_k": object()}
         v8_q = {"h_rnn.x_r": object(), "h_rnn.r_k": object()}
         mixed_q = {"h_rnn.time_decay": object(), "h_rnn.x_r": object()}
@@ -99,10 +118,27 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
         self.assertEqual(detect_quantized_rwkv_format(legacy_q), "legacy-scalar")
         self.assertEqual(detect_quantized_rwkv_format(v8_q), "v8-matrix")
         self.assertEqual(detect_quantized_rwkv_format(mixed_q), "mixed")
-        with self.assertRaisesRegex(ValueError, "Unsupported v8 matrix-state quantized model"):
-            validate_quantized_rwkv_format(v8_q, "v8.npz")
-        with self.assertRaisesRegex(ValueError, "Mixed legacy/v8"):
-            validate_quantized_rwkv_format(mixed_q, "mixed.npz")
+        for archive, source in (
+            (legacy_q, "legacy.npz"),
+            (v8_q, "v8.npz"),
+            (mixed_q, "mixed.npz"),
+            ({}, "unknown.npz"),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"Quantized \.npz inference is intentionally unsupported",
+                ):
+                    validate_quantized_rwkv_format(archive, source)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "legacy.npz"), "wb"):
+                pass
+            with self.assertRaisesRegex(
+                ValueError,
+                r"Quantized \.npz inference is intentionally unsupported",
+            ):
+                load_quantized(tmp, device="cpu")
 
 
 if __name__ == "__main__":

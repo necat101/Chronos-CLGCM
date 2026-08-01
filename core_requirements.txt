@@ -1,6 +1,7 @@
-# Core dependencies for running and training
-torch
-transformers
+# Core dependencies for running and training. PyTorch 2.4+ supplies the
+# fail-closed safe_globals checkpoint-loading boundary used by the active CLI.
+torch>=2.4
+transformers>=4.30.0
 datasets
 numpy
 tqdm

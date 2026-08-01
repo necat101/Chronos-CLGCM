@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 import pytest
 import torch
 
@@ -102,6 +105,47 @@ def test_factorization_removes_vocabulary_scaled_auxiliary_parameters():
     assert legacy_count - coherent_count > 50_000
 
 
+def test_reference_v9_parameter_budget_stays_below_31_million():
+    reference = dict(
+        vocab_size=50_257,
+        context_dim=448,
+        h_hidden=448,
+        l_hidden=448,
+        persistent_dim=128,
+        ltm_slots=1_024,
+        ltm_key_dim=128,
+        ltm_val_dim=128,
+        ltm_topk=4,
+        max_h_steps=5,
+        max_l_steps=5,
+        h_stride=4,
+        l_conv_atol=1e-4,
+        commitment_threshold=0.05,
+        use_deepembed=True,
+        use_rosa=True,
+        memory_token_routers=True,
+        compile=False,
+        gradient_checkpointing=False,
+        rwkv_head_size=64,
+    )
+
+    with torch.device("meta"):
+        legacy = HierarchosCore(
+            AttrDict(reference, architecture_revision="legacy-v8")
+        )
+        coherent = HierarchosCore(
+            AttrDict(reference, architecture_revision="coherent-v9")
+        )
+
+    legacy_count = sum(parameter.numel() for parameter in legacy.parameters())
+    coherent_count = sum(
+        parameter.numel() for parameter in coherent.parameters()
+    )
+    assert legacy_count == 232_516_229
+    assert coherent_count == 30_227_653
+    assert coherent_count / legacy_count < 0.131
+
+
 def test_hard_manager_semantics_match_between_train_and_eager_inference():
     torch.manual_seed(22)
     model = HierarchosCore(
@@ -161,6 +205,55 @@ def test_memory_gate_schedule_has_train_eval_logit_parity(training_step):
 
     assert model.memory_gate_warmup_step.item() == training_step
     torch.testing.assert_close(train_logits, eval_logits, rtol=1e-5, atol=2e-6)
+
+
+def test_cached_rosa_training_can_skip_duplicate_history_without_changing_model_state():
+    torch.manual_seed(222)
+    model = HierarchosCore(_config(revision="coherent-v9")).eval()
+    with torch.no_grad():
+        model.rosa_adapter.up.weight.normal_(mean=0.0, std=0.05)
+    ids = torch.tensor([[1, 2, 3, 4]])
+    rosa_ids = torch.tensor([[model.config.vocab_size, 1, 1, 2]])
+    common = dict(
+        attention_mask=torch.ones_like(ids),
+        rosa_ids=rosa_ids,
+        rosa_ids_context_mode="bounded-segment-v1",
+        suppress_hebbian=True,
+        return_topk_values=False,
+        return_raw_topk_values=False,
+        return_topk_indices=False,
+        return_step_telemetry=False,
+        return_numerics=False,
+    )
+
+    with torch.no_grad():
+        compatibility = model(
+            ids,
+            advance_cached_rosa_history=True,
+            **common,
+        )
+        optimized = model(
+            ids,
+            advance_cached_rosa_history=False,
+            **common,
+        )
+
+    for name in (
+        "logits",
+        "h_state",
+        "l_state",
+        "prev_context",
+        "target_context",
+        "drift_state",
+    ):
+        torch.testing.assert_close(
+            optimized[name],
+            compatibility[name],
+            rtol=1e-5,
+            atol=2e-6,
+        )
+    assert torch.equal(compatibility["ltm_memory_state"][2], ids.cpu())
+    assert optimized["ltm_memory_state"][2] is None
 
 
 def test_coherent_checkpoint_roundtrip_preserves_raw_logits(tmp_path):
@@ -249,8 +342,15 @@ def test_chat_ltm_reexport_preserves_coherent_checkpoint_identity(tmp_path):
         "version": 1,
         "architecture_contract": contract,
         "architecture_contract_sha256": contract_hash,
-        "sha256": "identity-fixture",
     }
+    run_identity["sha256"] = hashlib.sha256(
+        json.dumps(
+            run_identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
     original_path = tmp_path / "original.pt"
     torch.save(
         {
@@ -270,6 +370,9 @@ def test_chat_ltm_reexport_preserves_coherent_checkpoint_identity(tmp_path):
     )
 
     loaded, _ = load_full_model_with_config(original_path, torch.device("cpu"))
+    loaded.ltm.timestamps.fill_(37.0)
+    loaded.ltm.sources.fill_(loaded.ltm.SRC_CORRECTION)
+    loaded.ltm.wallclock_timestamps.fill_(1_700_000_000.0)
     reexport = build_chat_ltm_checkpoint_payload(loaded)
     assert reexport["checkpoint_version"] == 4
     assert reexport["checkpoint_kind"] == "inference-ltm-consolidated"
@@ -281,6 +384,9 @@ def test_chat_ltm_reexport_preserves_coherent_checkpoint_identity(tmp_path):
         "training_chunk_size": 256
     }
     assert reexport["completed_epoch"] == 15
+    assert reexport["ltm_persistent_metadata"]["wallclock_semantics"] == (
+        "unix-seconds-utc-user-memory-write-v1"
+    )
 
     reexport_path = tmp_path / "reexport.pt"
     torch.save(reexport, reexport_path)
@@ -290,6 +396,44 @@ def test_chat_ltm_reexport_preserves_coherent_checkpoint_identity(tmp_path):
     )
     assert restored_config.architecture_revision == "coherent-v9"
     assert restored.config.manager_compute_mode == "hard-masked"
+    assert torch.equal(
+        restored.ltm.timestamps,
+        torch.full_like(restored.ltm.timestamps, 37.0),
+    )
+    assert torch.equal(
+        restored.ltm.sources,
+        torch.full_like(restored.ltm.sources, restored.ltm.SRC_CORRECTION),
+    )
+    assert torch.equal(
+        restored.ltm.wallclock_timestamps,
+        torch.full_like(restored.ltm.wallclock_timestamps, 1_700_000_000.0),
+    )
+    _, matching_idx, _ = restored.ltm.retrieve_topk(
+        torch.zeros(1, restored.config.ltm_key_dim),
+        topk=1,
+        source_filter=restored.ltm.SRC_CORRECTION,
+        min_wallclock_timestamp=1_699_999_999.0,
+    )
+    _, rejected_idx, _ = restored.ltm.retrieve_topk(
+        torch.zeros(1, restored.config.ltm_key_dim),
+        topk=1,
+        source_filter=restored.ltm.SRC_TRAINING_DATA,
+        min_wallclock_timestamp=1_699_999_999.0,
+    )
+    assert matching_idx.item() >= 0
+    assert rejected_idx.item() == -1
+
+    invalid = dict(reexport)
+    invalid_metadata = dict(reexport["ltm_persistent_metadata"])
+    invalid_metadata["sources"] = torch.full_like(
+        invalid_metadata["sources"],
+        99,
+    )
+    invalid["ltm_persistent_metadata"] = invalid_metadata
+    invalid_path = tmp_path / "invalid-ltm-metadata.pt"
+    torch.save(invalid, invalid_path)
+    with pytest.raises(ValueError, match="unknown source identifier"):
+        load_full_model_with_config(invalid_path, torch.device("cpu"))
 
 
 def test_coherent_checkpoint_rejects_architecture_config_tampering(tmp_path):

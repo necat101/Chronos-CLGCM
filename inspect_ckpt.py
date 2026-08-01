@@ -1,9 +1,9 @@
-import torch
 import sys
+from hierarchos.utils.checkpoint import load_checkpoint_payload_compatible
 
 ckpt_path = r"C:\Users\User\Downloads\Hierarchos-main\Hierarchos-main\rog_ally_model\hierarchos_epoch_31.pt"
 try:
-    checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    checkpoint = load_checkpoint_payload_compatible(ckpt_path, map_location="cpu")
     state_dict = checkpoint['model_state_dict']
     print(f"Keys: {list(state_dict.keys())[:20]}...")
     if 'persistent' in state_dict:

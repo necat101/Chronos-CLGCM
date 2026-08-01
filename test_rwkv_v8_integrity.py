@@ -1,10 +1,12 @@
 import unittest
 import os
 import tempfile
+import copy
 
 import torch
 
 import hierarchos
+import hierarchos.models.rwkv_cell as rwkv_cell_module
 from hierarchos import AttrDict, HierarchosCore
 from hierarchos.inference.chat import load_hierarchical_chat_state, save_hierarchical_chat_state
 from hierarchos.inference.chat_state import CHAT_STATE_VERSION
@@ -40,6 +42,71 @@ def _tiny_config():
 
 
 class RWKVV8IntegrityTests(unittest.TestCase):
+    def test_autocast_cached_low_rank_weights_preserve_forward_and_gradients(self):
+        torch.manual_seed(123)
+        optimized = RWKVCell(
+            32,
+            head_size=16,
+            state_readout_mode="explicit-output",
+        ).train()
+        reference = copy.deepcopy(optimized)
+        optimized_input = torch.randn(
+            3,
+            32,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        reference_input = optimized_input.detach().clone().requires_grad_(True)
+
+        with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+            optimized_out, optimized_state = optimized(optimized_input, None)
+            optimized_loss = (
+                optimized_out.float().square().mean()
+                + optimized_state.float().square().mean()
+            )
+        optimized_loss.backward()
+
+        cached_helper = rwkv_cell_module._parameter_matmul
+        try:
+            rwkv_cell_module._parameter_matmul = (
+                lambda left, parameter: left
+                @ parameter.to(dtype=left.dtype, device=left.device)
+            )
+            with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+                reference_out, reference_state = reference(reference_input, None)
+                reference_loss = (
+                    reference_out.float().square().mean()
+                    + reference_state.float().square().mean()
+                )
+            reference_loss.backward()
+        finally:
+            rwkv_cell_module._parameter_matmul = cached_helper
+
+        torch.testing.assert_close(optimized_out, reference_out, rtol=0, atol=0)
+        torch.testing.assert_close(
+            optimized_state,
+            reference_state,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            optimized_input.grad,
+            reference_input.grad,
+            rtol=0,
+            atol=0,
+        )
+        for (name, parameter), (reference_name, reference_parameter) in zip(
+            optimized.named_parameters(),
+            reference.named_parameters(),
+        ):
+            self.assertEqual(name, reference_name)
+            torch.testing.assert_close(
+                parameter.grad,
+                reference_parameter.grad,
+                rtol=0,
+                atol=0,
+            )
+
     def test_import_uses_modular_package_not_legacy_monolith(self):
         loaded = os.path.normcase(os.path.abspath(hierarchos.__file__))
         self.assertTrue(loaded.endswith(os.path.normcase(os.path.join("hierarchos", "__init__.py"))), loaded)
@@ -122,6 +189,37 @@ class RWKVV8IntegrityTests(unittest.TestCase):
         self.assertEqual(cell.head_size, 75)
         self.assertEqual(cell.n_head, 6)
         self.assertGreaterEqual(cell.state_size, 3 + 64)
+
+    def test_explicit_output_cell_rejects_wrong_runtime_state_layout(self):
+        cell = RWKVCell(
+            4,
+            head_size=2,
+            state_readout_mode="explicit-output",
+        )
+        self.assertFalse(cell.allow_legacy_state_migration)
+
+        x = torch.randn(1, 4)
+        wrong_state = torch.zeros(1, 4, cell.state_size - 1)
+        with self.assertRaisesRegex(ValueError, "strict 'explicit-output' contract"):
+            cell(x, wrong_state)
+
+    def test_legacy_input_cache_cell_still_migrates_old_runtime_state(self):
+        cell = RWKVCell(
+            4,
+            head_size=2,
+            state_readout_mode="legacy-input-cache",
+        )
+        self.assertTrue(cell.allow_legacy_state_migration)
+
+        x = torch.randn(1, 4)
+        old_state = torch.zeros(1, 4, cell.state_size - 1)
+        output, migrated_state = cell(x, old_state)
+
+        self.assertEqual(tuple(output.shape), (1, 4))
+        self.assertEqual(
+            tuple(migrated_state.shape),
+            (1, 4, cell.state_size),
+        )
 
     def test_rwkv_cell_is_torch_compile_graph_capture_compatible(self):
         if not hasattr(torch, "compile"):
@@ -572,10 +670,90 @@ class RWKVV8IntegrityTests(unittest.TestCase):
             self.assertEqual(payload["recurrent_state_layout"]["h"]["head_size"], model.h_rnn.head_size)
             self.assertEqual(payload["recurrent_state_layout"]["h"]["state_size"], model.h_rnn.state_size)
             self.assertEqual(payload["recurrent_state_shapes"]["h_state"], list(out["h_state"].shape))
+            self.assertEqual(len(payload["architecture_contract_sha256"]), 64)
+            self.assertIn("manager_compute_mode", payload["architecture_contract"])
+            self.assertIn("manager_state_commit_mode", payload["architecture_contract"])
 
             restored = load_hierarchical_chat_state(path, config=cfg, device="cpu", model=model)
             self.assertEqual(tuple(restored["h_state"].shape), tuple(out["h_state"].shape))
             self.assertEqual(tuple(restored["l_state"].shape), tuple(out["l_state"].shape))
+
+    def test_current_chat_state_rejects_manager_contract_drift(self):
+        torch.manual_seed(42)
+        cfg = _tiny_config()
+        cfg.architecture_revision = "coherent-v9"
+        model = HierarchosCore(cfg)
+        model.eval()
+        with torch.no_grad():
+            out = model(torch.tensor([[1, 2]], dtype=torch.long), return_topk_values=False)
+
+        other_cfg = _tiny_config()
+        other_cfg.architecture_revision = "coherent-v9"
+        other_cfg.manager_compute_mode = "soft-act"
+        other_cfg.manager_state_commit_mode = "last-shadow"
+        other_model = HierarchosCore(other_cfg)
+        other_model.eval()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-state.pt")
+            save_hierarchical_chat_state(
+                path,
+                config=cfg,
+                model=model,
+                model_path=tmpdir,
+                h_state=out["h_state"],
+                l_state=out["l_state"],
+                prev_context=out["prev_context"],
+                target_context=out["target_context"],
+                drift_state=out["drift_state"],
+                ltm_state=out["ltm_memory_state"],
+                total_tokens_generated=2,
+            )
+            with self.assertRaisesRegex(RuntimeError, "Architecture contract mismatch"):
+                load_hierarchical_chat_state(
+                    path,
+                    config=other_cfg,
+                    device="cpu",
+                    model=other_model,
+                )
+
+    def test_current_chat_state_rejects_shape_tampering_without_migration(self):
+        torch.manual_seed(44)
+        cfg = _tiny_config()
+        model = HierarchosCore(cfg)
+        model.eval()
+        with torch.no_grad():
+            out = model(torch.tensor([[1, 2]], dtype=torch.long), return_topk_values=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "chat-state.pt")
+            save_hierarchical_chat_state(
+                path,
+                config=cfg,
+                model=model,
+                model_path=tmpdir,
+                h_state=out["h_state"],
+                l_state=out["l_state"],
+                prev_context=out["prev_context"],
+                target_context=out["target_context"],
+                drift_state=out["drift_state"],
+                ltm_state=out["ltm_memory_state"],
+                total_tokens_generated=2,
+            )
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            payload["h_state"] = payload["h_state"][:, :-1, :]
+            payload["recurrent_state_shapes"]["h_state"] = list(
+                payload["h_state"].shape
+            )
+            torch.save(payload, path)
+
+            with self.assertRaisesRegex(RuntimeError, "tensor shape mismatch"):
+                load_hierarchical_chat_state(
+                    path,
+                    config=cfg,
+                    device="cpu",
+                    model=model,
+                )
 
     def test_chat_state_loader_migrates_legacy_five_slot_state_to_v8(self):
         torch.manual_seed(43)

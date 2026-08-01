@@ -76,6 +76,153 @@ def test_full_sample_checkpoint_defaults_to_one_chat_prefill_graph():
     assert boundary_drift_seed(drift, 128, 128) is drift
 
 
+def test_corrected_rosa_sentinel_is_zero_masked_before_memory_routing():
+    torch.manual_seed(15)
+    config = _tiny_config()
+    config.use_deepembed = False
+    config.memory_token_routers = False
+    config.rosa_zero_no_prediction = False
+    model = HierarchosCore(config).eval()
+    with torch.no_grad():
+        model.rosa_emb.weight[config.vocab_size].fill_(3.0)
+        model.rosa_gate_logit.fill_(20.0)
+
+    captured = []
+
+    def capture_query_input(_module, inputs):
+        captured.append(inputs[0].detach().clone())
+
+    handle = model.qproj.register_forward_pre_hook(capture_query_input)
+    try:
+        with torch.no_grad():
+            model(torch.tensor([[11]], dtype=torch.long), suppress_hebbian=True)
+        legacy_token_input = captured[-1][..., :config.context_dim]
+        captured.clear()
+
+        config.rosa_zero_no_prediction = True
+        with torch.no_grad():
+            model(torch.tensor([[11]], dtype=torch.long), suppress_hebbian=True)
+        corrected_token_input = captured[-1][..., :config.context_dim]
+    finally:
+        handle.remove()
+
+    expected_token_input = model.tok_emb(torch.tensor([11]))
+    assert not torch.allclose(legacy_token_input, expected_token_input)
+    torch.testing.assert_close(corrected_token_input, expected_token_input)
+
+
+def test_bounded_cached_and_live_rosa_keep_logits_and_continuation_state_aligned():
+    torch.manual_seed(16)
+    config = _tiny_config()
+    config.use_deepembed = False
+    config.memory_gate_warmup_steps = 0
+    config.enforce_rosa_max_context = True
+    config.rosa_max_context = 4
+    model = HierarchosCore(config).eval()
+    input_ids = torch.tensor([[1, 2, 1, 2, 3, 1, 2, 4, 1, 2]], dtype=torch.long)
+    cached_ids = torch.tensor(
+        [
+            precompute_rosa_ids_for_chunks(
+                input_ids[0].tolist(),
+                vocab_size=config.vocab_size,
+                chunk_size=3,
+                rosa_max_ctx=config.rosa_max_context,
+                enforce_max_context=True,
+            )
+        ],
+        dtype=torch.long,
+    )
+
+    def run(use_cache):
+        state = None
+        logits = []
+        for start in range(0, input_ids.shape[1], 3):
+            end = min(start + 3, input_ids.shape[1])
+            kwargs = {}
+            if use_cache:
+                kwargs["rosa_ids"] = cached_ids[:, start:end]
+                kwargs["rosa_ids_context_mode"] = "bounded-segment-v1"
+            outputs = model(
+                input_ids[:, start:end],
+                ltm_memory_state=state,
+                global_pos_offset=start,
+                suppress_hebbian=True,
+                **kwargs,
+            )
+            state = outputs["ltm_memory_state"]
+            logits.append(outputs["logits"])
+            if use_cache:
+                assert state[2].shape[1] <= config.rosa_max_context
+                assert state[3] is None
+            else:
+                assert state[2] is None
+                assert len(state[3][0].tokens) <= config.rosa_max_context
+        return torch.cat(logits, dim=1), state
+
+    with torch.no_grad():
+        live_logits, live_state = run(False)
+        cached_logits, cached_state = run(True)
+
+    torch.testing.assert_close(cached_logits, live_logits, rtol=1e-6, atol=5e-7)
+    assert cached_state[2][0].tolist() == live_state[3][0].tokens
+
+
+def test_rosa_live_cached_live_transition_preserves_complete_history():
+    torch.manual_seed(160)
+    config = _tiny_config()
+    config.use_deepembed = False
+    config.memory_gate_warmup_steps = 0
+    config.enforce_rosa_max_context = True
+    config.rosa_max_context = 5
+    model = HierarchosCore(config).eval()
+    input_ids = torch.tensor(
+        [[1, 2, 1, 2, 3, 1, 2, 4, 1]],
+        dtype=torch.long,
+    )
+    cached_ids = torch.tensor(
+        [
+            precompute_rosa_ids_for_chunks(
+                input_ids[0].tolist(),
+                vocab_size=config.vocab_size,
+                chunk_size=3,
+                rosa_max_ctx=config.rosa_max_context,
+                enforce_max_context=True,
+            )
+        ],
+        dtype=torch.long,
+    )
+
+    def run(use_middle_cache):
+        state = None
+        logits = []
+        for chunk_index, start in enumerate(range(0, input_ids.shape[1], 3)):
+            end = min(start + 3, input_ids.shape[1])
+            kwargs = {}
+            if use_middle_cache and chunk_index == 1:
+                kwargs = {
+                    "rosa_ids": cached_ids[:, start:end],
+                    "rosa_ids_context_mode": "bounded-segment-v1",
+                }
+            outputs = model(
+                input_ids[:, start:end],
+                ltm_memory_state=state,
+                global_pos_offset=start,
+                suppress_hebbian=True,
+                **kwargs,
+            )
+            state = outputs["ltm_memory_state"]
+            logits.append(outputs["logits"])
+        return torch.cat(logits, dim=1), state
+
+    with torch.no_grad():
+        live_logits, live_state = run(False)
+        mixed_logits, mixed_state = run(True)
+
+    torch.testing.assert_close(mixed_logits, live_logits, rtol=1e-6, atol=5e-7)
+    assert mixed_state[2] is None
+    assert mixed_state[3][0].tokens == live_state[3][0].tokens
+
+
 def test_explicit_chat_prefill_segments_preserve_full_sample_drift_recurrence():
     torch.manual_seed(17)
     config = _full_sample_config()
@@ -624,6 +771,35 @@ def test_inference_export_resets_transient_ltm_without_logit_drift(tmp_path):
     with torch.no_grad():
         actual_logits = loaded(input_ids, suppress_hebbian=True)["logits"]
     torch.testing.assert_close(actual_logits, expected_logits, rtol=0, atol=0)
+
+
+def test_legacy_export_without_gate_step_loads_warmup_complete(tmp_path):
+    torch.manual_seed(91)
+    config = _tiny_config()
+    config.memory_gate_warmup_steps = 100
+    config.memory_gate_warmup_floor = 0.5
+    model = HierarchosCore(config).eval()
+    model.set_training_step(100)
+    ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    with torch.no_grad():
+        expected = model(ids, suppress_hebbian=True)["logits"]
+
+    legacy_state = dict(model.state_dict())
+    legacy_state.pop("memory_gate_warmup_step")
+    torch.save(
+        {
+            "model_state_dict": legacy_state,
+            "config": dict(config),
+            "training_complete": True,
+        },
+        tmp_path / "hierarchos.pt",
+    )
+
+    loaded, _ = load_full_model_with_config(str(tmp_path), "cpu")
+    assert loaded.memory_gate_warmup_step.item() == 100
+    with torch.no_grad():
+        actual = loaded(ids, suppress_hebbian=True)["logits"]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_checkpoint_loader_backfills_explicit_tbptt_recurrence(tmp_path):

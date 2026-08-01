@@ -1,7 +1,10 @@
 """Analyze training config from checkpoint."""
-import torch
+from hierarchos.utils.checkpoint import load_checkpoint_payload_compatible
 
-ckpt = torch.load('./rog_ally_model/hierarchos_epoch_60.pt', map_location='cpu', weights_only=False)
+ckpt = load_checkpoint_payload_compatible(
+    "./rog_ally_model/hierarchos_epoch_60.pt",
+    map_location="cpu",
+)
 c = ckpt.get('config', {})
 
 print('=== TRAINING CONFIG ===')

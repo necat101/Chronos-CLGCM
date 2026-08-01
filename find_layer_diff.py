@@ -1,12 +1,14 @@
-import torch
 import sys
 sys.path.insert(0, r'C:\Users\User\Downloads\Hierarchos-main\Hierarchos-main')
 
 from hierarchos import HierarchosCore, AttrDict
+from hierarchos.utils.checkpoint import load_checkpoint_payload_compatible
 
 # Load checkpoint
-ckpt = torch.load(r'C:\Users\User\Downloads\Hierarchos-main\Hierarchos-main\rog_ally_model\hierarchos_epoch_1.pt', 
-                  map_location='cpu', weights_only=False)
+ckpt = load_checkpoint_payload_compatible(
+    r'C:\Users\User\Downloads\Hierarchos-main\Hierarchos-main\rog_ally_model\hierarchos_epoch_1.pt',
+    map_location='cpu',
+)
 checkpoint_state = ckpt['model_state_dict']
 config = ckpt['config']
 

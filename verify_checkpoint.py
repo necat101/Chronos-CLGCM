@@ -5,6 +5,7 @@ from hierarchos.utils.checkpoint import (
     TRANSIENT_LTM_STATE_KEYS,
     _has_v8_rwkv_state_dict,
     _reject_unsupported_rwkv_state_dict,
+    load_checkpoint_payload_compatible,
     sanitize_model_state_dict,
 )
 
@@ -27,7 +28,7 @@ ckpt_path = os.path.abspath(os.path.expanduser(args.checkpoint))
 if not os.path.exists(ckpt_path):
     raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+ckpt = load_checkpoint_payload_compatible(ckpt_path, map_location="cpu")
 
 state_dict = sanitize_model_state_dict(ckpt['model_state_dict'], reset_transient_ltm=False)
 config = ckpt['config']

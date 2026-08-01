@@ -154,6 +154,50 @@ def test_fast_batch_tokenization_matches_scalar_weighted_alpaca_semantics():
     assert "reply final answer" in false_special_texts
 
 
+def test_min_response_tokens_filters_short_rows_and_audits_truncation():
+    tokenizer = _make_fast_tokenizer()
+    short = {"instruction": "question", "output": "reply"}
+    assert process_text_sample(
+        tokenizer,
+        short,
+        32,
+        alpaca_mode=True,
+        min_response_tokens=2,
+    ) is None
+    rejected = process_text_sample(
+        tokenizer,
+        short,
+        32,
+        alpaca_mode=True,
+        min_response_tokens=2,
+        include_audit=True,
+        audit_source_default="fixture",
+    )
+    assert rejected["_audit_only"] is True
+    assert rejected["_audit"]["rejection_reason"] == "response_below_minimum"
+    assert rejected["_audit"]["source"] == "fixture"
+
+    accepted = process_text_sample(
+        tokenizer,
+        {
+            "instruction": "explain hierarchy prior context",
+            "input": "prior context prior context",
+            "output": "final answer reply",
+        },
+        8,
+        alpaca_mode=True,
+        min_response_tokens=2,
+        include_audit=True,
+        audit_source_default="fixture",
+    )
+    audit = accepted["_audit"]
+    assert audit["accepted"] is True
+    assert audit["truncated"] is True
+    assert audit["original_response_tokens"] >= audit["retained_response_tokens"] >= 2
+    assert audit["retained_tokens"] == len(accepted["input_ids"])
+    assert audit["weighted_tokens"] > 0
+
+
 def test_fast_batch_tokenization_matches_scalar_for_text_generic_and_kayla_rows():
     tokenizer = _make_fast_tokenizer()
 
@@ -321,4 +365,7 @@ def test_hf_map_dataset_dataloader_uses_batched_arrow_fetch_and_tokenization():
     assert len(tokenizer.batch_calls) == 2
     assert actual_batch.keys() == expected_batch.keys()
     for key in expected_batch:
-        assert torch.equal(actual_batch[key], expected_batch[key]), key
+        if torch.is_tensor(expected_batch[key]):
+            assert torch.equal(actual_batch[key], expected_batch[key]), key
+        else:
+            assert actual_batch[key] == expected_batch[key], key
