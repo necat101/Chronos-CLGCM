@@ -14,6 +14,7 @@ from ..inference.chat import (
     resolve_inference_prefill_chunk_size,
     uses_full_sample_inference_recurrence,
 )
+from ..utils.tokenizer import validate_inference_tokenizer_identity
 
 try:
     from lm_eval.api.model import LM
@@ -27,6 +28,53 @@ except ImportError:
         pass
     class Instance:
         pass
+
+
+def _score_target_logits(
+    chunk_logits: torch.Tensor,
+    chunk_targets: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Score all supervised rows without per-row kernels or device syncs."""
+    if chunk_logits.shape[:-1] != chunk_targets.shape:
+        raise ValueError(
+            "chunk_targets must match the batch/time dimensions of chunk_logits, got "
+            f"{tuple(chunk_targets.shape)} vs {tuple(chunk_logits.shape[:-1])}"
+        )
+
+    active = chunk_targets != -100
+    flat_active = active.reshape(-1)
+    flat_targets = chunk_targets.reshape(-1)
+    active_logits = chunk_logits.reshape(-1, chunk_logits.shape[-1])[flat_active].float()
+    active_targets = flat_targets[flat_active]
+
+    # Only the requested target probability is needed.  Subtracting the
+    # vocabulary log-normalizer avoids materializing another
+    # [active_tokens, vocab] log-softmax tensor on top of the model logits.
+    target_logits = active_logits.gather(
+        dim=-1,
+        index=active_targets.unsqueeze(-1),
+    ).squeeze(-1)
+    target_log_probs = target_logits - torch.logsumexp(active_logits, dim=-1)
+    token_scores = torch.zeros(
+        flat_targets.shape,
+        dtype=torch.float32,
+        device=chunk_logits.device,
+    )
+    token_scores.masked_scatter_(flat_active, target_log_probs)
+
+    active_is_greedy = active_logits.argmax(dim=-1) == active_targets
+    token_is_greedy = torch.ones(
+        flat_targets.shape,
+        dtype=torch.bool,
+        device=chunk_logits.device,
+    )
+    token_is_greedy.masked_scatter_(flat_active, active_is_greedy)
+
+    batch_size = int(chunk_targets.shape[0])
+    return (
+        token_scores.reshape(batch_size, -1).sum(dim=-1),
+        token_is_greedy.reshape(batch_size, -1).all(dim=-1),
+    )
 
 
 class HierarchosLM(LM):
@@ -77,6 +125,10 @@ class HierarchosLM(LM):
         self._max_length = max_length or getattr(model.config, 'max_length', 1024)
         self._prefill_chunk_size = resolve_inference_prefill_chunk_size(
             getattr(model, "config", None)
+        )
+        self._tokenizer_identity_verified = validate_inference_tokenizer_identity(
+            tokenizer,
+            getattr(model, "_hierarchos_checkpoint_metadata", {}),
         )
         
         # Cache the eot token id
@@ -143,24 +195,49 @@ class HierarchosLM(LM):
         # A causal input needs context + continuation[:-1], so a one-token
         # context can score max_length continuation tokens.
         max_targets = max(0, self.max_length)
-        continuation_enc = continuation_enc[-max_targets:] if max_targets else []
+        if max_targets and len(continuation_enc) > max_targets:
+            # The predecessor of the first retained target is the final token
+            # of the discarded continuation prefix, not the old context tail.
+            # Keeping the wrong predecessor silently changes long-continuation
+            # benchmark likelihoods.
+            context_enc = continuation_enc[-max_targets - 1:-max_targets]
+            continuation_enc = continuation_enc[-max_targets:]
+        else:
+            continuation_enc = continuation_enc[-max_targets:] if max_targets else []
         context_budget = max(1, self.max_length - len(continuation_enc) + 1)
         context_enc = context_enc[-context_budget:] or [self.eot_token_id]
         return context_enc, continuation_enc
     
-    def _model_call(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def _model_call(
+        self,
+        input_ids: torch.Tensor,
+        score_targets: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[List[float], List[bool]]]:
         """
-        Run the model and return logits.
+        Run the model and return logits, or stream target scores by chunk.
         
         Args:
             input_ids: Input token ids [batch, seq_len]
             
         Returns:
-            logits: Output logits [batch, seq_len, vocab_size]
+            logits: Output logits [batch, seq_len, vocab_size]. When
+                ``score_targets`` is provided, returns per-row
+                ``(log_probability, is_greedy)`` lists without retaining
+                full-sequence vocabulary logits.
         """
         self.model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             input_ids = input_ids.to(self.device)
+            if score_targets is not None:
+                if score_targets.shape != input_ids.shape:
+                    raise ValueError(
+                        "score_targets must match input_ids shape, got "
+                        f"{tuple(score_targets.shape)} vs {tuple(input_ids.shape)}"
+                    )
+                score_targets = score_targets.to(
+                    device=self.device,
+                    dtype=torch.long,
+                )
             chunk_size = self._prefill_chunk_size if self._prefill_chunk_size > 0 else input_ids.shape[1]
             chunk_size = max(1, int(chunk_size))
             h_state = None
@@ -170,6 +247,16 @@ class HierarchosLM(LM):
             drift_state = None
             ltm_state = None
             logits_parts = []
+            score_sums = torch.zeros(
+                input_ids.shape[0],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            score_is_greedy = torch.ones(
+                input_ids.shape[0],
+                dtype=torch.bool,
+                device=self.device,
+            )
             model_config = getattr(self.model, "config", None)
             exact_full_sample = uses_full_sample_inference_recurrence(model_config)
 
@@ -189,8 +276,24 @@ class HierarchosLM(LM):
                     ltm_memory_state=ltm_state,
                     suppress_hebbian=True,
                     global_pos_offset=start,
+                    return_topk_values=False,
+                    return_raw_topk_values=False,
+                    return_topk_indices=False,
+                    return_step_telemetry=False,
+                    return_numerics=False,
+                    return_last_logit_only=False,
                 )
-                logits_parts.append(outputs['logits'])
+                chunk_logits = outputs["logits"]
+                if score_targets is None:
+                    logits_parts.append(chunk_logits)
+                else:
+                    chunk_targets = score_targets[:, start:start + chunk_size]
+                    chunk_scores, chunk_is_greedy = _score_target_logits(
+                        chunk_logits,
+                        chunk_targets,
+                    )
+                    score_sums.add_(chunk_scores)
+                    score_is_greedy.logical_and_(chunk_is_greedy)
                 h_state = outputs.get('h_state')
                 l_state = outputs.get('l_state')
                 prev_context = outputs.get('prev_context')
@@ -198,6 +301,11 @@ class HierarchosLM(LM):
                 drift_state = outputs.get('drift_state')
                 ltm_state = outputs.get('ltm_memory_state')
 
+            if score_targets is not None:
+                return (
+                    [float(value) for value in score_sums.cpu().tolist()],
+                    [bool(value) for value in score_is_greedy.cpu().tolist()],
+                )
             return torch.cat(logits_parts, dim=1)
     
     def loglikelihood(
@@ -247,26 +355,30 @@ class HierarchosLM(LM):
                 dtype=torch.long,
                 device=self.device,
             )
+            score_targets = torch.full_like(input_ids, -100)
             for row, (_, context_enc, continuation_enc) in enumerate(encoded_batch):
                 full_enc = context_enc + continuation_enc[:-1]
                 input_ids[row, :len(full_enc)] = torch.tensor(full_enc, dtype=torch.long, device=self.device)
-
-            logits = self._model_call(input_ids)
-
-            for row, (result_index, context_enc, continuation_enc) in enumerate(encoded_batch):
                 cont_start = len(context_enc) - 1
-                cont_len = len(continuation_enc)
-                cont_logits = logits[row, cont_start:cont_start + cont_len, :]
-                cont_targets = torch.tensor(continuation_enc, dtype=torch.long, device=self.device)
-                log_probs = F.log_softmax(cont_logits.float(), dim=-1)
-                target_log_probs = log_probs.gather(
-                    dim=-1,
-                    index=cont_targets.unsqueeze(-1)
-                ).squeeze(-1)
-                total_log_prob = target_log_probs.sum().item()
-                greedy_tokens = cont_logits.argmax(dim=-1)
-                is_greedy = (greedy_tokens == cont_targets).all().item()
-                results[result_index] = (total_log_prob, is_greedy)
+                score_targets[
+                    row,
+                    cont_start:cont_start + len(continuation_enc),
+                ] = torch.tensor(
+                    continuation_enc,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+
+            score_sums, score_is_greedy = self._model_call(
+                input_ids,
+                score_targets=score_targets,
+            )
+
+            for row, (result_index, _, _) in enumerate(encoded_batch):
+                results[result_index] = (
+                    score_sums[row],
+                    score_is_greedy[row],
+                )
 
         return results
     
@@ -312,13 +424,22 @@ class HierarchosLM(LM):
                     context_enc, continuation_enc = self._truncate_scoring_pair(context_enc, continuation_enc)
                     full_enc = context_enc + continuation_enc[:-1]
                     input_ids = torch.tensor([full_enc], dtype=torch.long, device=self.device)
-                    logits = self._model_call(input_ids)
                     cont_start = len(context_enc) - 1
                     cont_len = len(continuation_enc)
-                    pred_logits = logits[0, cont_start:cont_start + cont_len, :]
-                    targets = torch.tensor(continuation_enc, dtype=torch.long, device=self.device)
-                    log_probs = F.log_softmax(pred_logits.float(), dim=-1)
-                    total_log_prob += log_probs.gather(-1, targets.unsqueeze(-1)).sum().item()
+                    score_targets = torch.full_like(input_ids, -100)
+                    score_targets[
+                        0,
+                        cont_start:cont_start + cont_len,
+                    ] = torch.tensor(
+                        continuation_enc,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    window_scores, _ = self._model_call(
+                        input_ids,
+                        score_targets=score_targets,
+                    )
+                    total_log_prob += window_scores[0]
 
                 results.append(total_log_prob)
         
@@ -378,7 +499,7 @@ class HierarchosLM(LM):
             exact_full_sample = uses_full_sample_inference_recurrence(model_config)
             total_tokens_seen = 0
             
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Prefill with context
                 prefill_step = prefill_chunk_size if prefill_chunk_size > 0 else input_ids.shape[1]
                 prefill_step = max(1, int(prefill_step))
@@ -396,6 +517,12 @@ class HierarchosLM(LM):
                         ltm_memory_state=ltm_state,
                         suppress_hebbian=True,
                         global_pos_offset=start,
+                        return_topk_values=False,
+                        return_raw_topk_values=False,
+                        return_topk_indices=False,
+                        return_step_telemetry=False,
+                        return_numerics=False,
+                        return_last_logit_only=True,
                     )
                     h_state = outputs.get('h_state')
                     l_state = outputs.get('l_state')
@@ -455,7 +582,13 @@ class HierarchosLM(LM):
                         drift_state=generation_drift_state,
                         ltm_memory_state=ltm_state,
                         suppress_hebbian=True,
-                        global_pos_offset=total_tokens_seen
+                        global_pos_offset=total_tokens_seen,
+                        return_topk_values=False,
+                        return_raw_topk_values=False,
+                        return_topk_indices=False,
+                        return_step_telemetry=False,
+                        return_numerics=False,
+                        return_last_logit_only=True,
                     )
                     total_tokens_seen += 1
                     h_state = outputs.get('h_state')

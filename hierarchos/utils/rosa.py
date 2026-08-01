@@ -33,7 +33,11 @@ def rosa_context_mode(enforce_max_context: bool) -> str:
 # ─────────────────────────────────────────────────────────────
 # Numba JIT Detection
 # ─────────────────────────────────────────────────────────────
-_USE_NUMBA = os.environ.get("ROSA_USE_NUMBA", "1").lower() not in ("0", "false")
+# The active persistent/incremental ROSA path does not call the historical
+# stateless Numba kernel. Importing Numba in every trainer/DataLoader process
+# therefore adds startup time and resident memory without accelerating a model
+# forward. Keep the debug kernel available only through an explicit opt-in.
+_USE_NUMBA = os.environ.get("ROSA_USE_NUMBA", "0").lower() not in ("0", "false")
 _NUMBA_OK = False
 
 if _USE_NUMBA:
@@ -636,14 +640,15 @@ def rosa_async_pipeline(
         else 0
     )
 
-    # Legacy checkpoints keep full ROSA history. Versioned bounded mode stores
-    # only the active fixed-size segment so cached/live paths share one contract.
+    # ``ROSAState.tokens`` is the authoritative live history. ``past_tokens`` is
+    # retained only as a compatibility/rebuild carrier for states loaded without
+    # an automaton. Do not clone a valid CPU history on every autoregressive
+    # token; legacy unbounded chat otherwise turns a linear incremental suffix
+    # update into quadratic host-copy traffic.
     if past_tokens is not None:
         past_cpu = past_tokens.detach()
         if past_cpu.device.type != "cpu" or past_cpu.dtype != torch.int64:
             past_cpu = past_cpu.to(device="cpu", dtype=torch.int64)
-        else:
-            past_cpu = past_cpu.clone()
         if past_cpu.dim() == 1:
             past_cpu = past_cpu.unsqueeze(0)
         if past_cpu.shape[0] == 1 and B > 1:
@@ -693,28 +698,46 @@ def rosa_async_pipeline(
         if ev_copy is not None:
             ev_copy.synchronize()
 
-        current_tokens_cpu = host_buf.detach().cpu().clone()
+        current_tokens_cpu = host_buf.detach().cpu()
         current_input_lists = current_tokens_cpu.tolist()
-        if past_cpu is not None:
-            past_input_lists = past_cpu.tolist()
-        else:
-            past_input_lists = [[] for _ in range(B)]
 
         state_inputs = []
         state_seeds = []
         rebuild_flags = []
 
-        for past_row, current_row, state in zip(past_input_lists, current_input_lists, rosa_states):
-            state_tokens = getattr(state, "tokens", None) if state is not None else None
-            if state is not None and state_tokens == past_row:
-                # Incremental ROSA state already represents the complete saved
-                # history; extend it with only the current chunk.
+        for row, (current_row, state) in enumerate(
+            zip(current_input_lists, rosa_states)
+        ):
+            if state is not None:
+                if not isinstance(state, ROSAState):
+                    raise ValueError(
+                        f"ROSA state row {row} has unsupported type "
+                        f"{type(state).__name__}"
+                    )
+                if (
+                    past_cpu is not None
+                    and len(state.tokens) != int(past_cpu.shape[1])
+                ):
+                    raise ValueError(
+                        "ROSA automaton/history length mismatch: "
+                        f"state row {row} has {len(state.tokens)} tokens while "
+                        f"past_tokens has {int(past_cpu.shape[1])}. A validated "
+                        "automaton is authoritative; discard it explicitly to "
+                        "request a history rebuild."
+                    )
+                # Incremental state already represents the complete history.
+                # Avoid converting/comparing that history on every token.
                 state_inputs.append(current_row)
                 state_seeds.append(state)
                 rebuild_flags.append(False)
             else:
                 # Rebuild from the complete history when state is missing,
-                # stale, or loaded from token history without automaton state.
+                # including legacy chat states that saved token history only.
+                past_row = (
+                    past_cpu[row].tolist()
+                    if past_cpu is not None
+                    else []
+                )
                 state_inputs.append(past_row + current_row)
                 state_seeds.append(None)
                 rebuild_flags.append(True)
@@ -739,18 +762,11 @@ def rosa_async_pipeline(
         rosa_np = np.array(rosa_raw, dtype=np.int64)
         rosa_np[rosa_np == -1] = no_prediction  # sentinel for "no prediction"
 
-        if effective_max_context > 0:
-            state_histories = [list(state.tokens) for state in new_states]
-            history_lengths = {len(history) for history in state_histories}
-            if len(history_lengths) != 1:
-                raise RuntimeError(
-                    "Bounded ROSA batch rows produced different active-history lengths"
-                )
-            next_past_tokens = torch.tensor(state_histories, dtype=torch.int64)
-        elif past_cpu is not None:
-            next_past_tokens = torch.cat([past_cpu, current_tokens_cpu], dim=1)
-        else:
-            next_past_tokens = current_tokens_cpu.clone()
+        # The automata already own their token histories. Carry no duplicate
+        # tensor during live execution; chat-state serialization materializes it
+        # once on save, and cached-ID training retains its separate tensor fallback
+        # in core.py.
+        next_past_tokens = None
 
         # Fresh per-call result storage makes parallel forwards race-free.
         result_buf = torch.empty(
@@ -763,7 +779,11 @@ def rosa_async_pipeline(
 
         return result_buf, next_past_tokens, new_states
 
-    if pool is not None and B > 1:
+    # CUDA still benefits from overlap for the overwhelmingly common B=1 chat
+    # path: run the D2H wait and suffix update on the pipeline worker while the
+    # caller performs token embedding. CPU B=1 remains inline to avoid thread
+    # scheduling overhead where there is no device work to overlap.
+    if pool is not None and (B > 1 or is_cuda):
         future = pool.submit(_cpu_work)
     else:
         future = _ImmediateFuture(_cpu_work())

@@ -5,6 +5,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
+
+def _positive_int(name: str, value) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a positive integer, got {value!r}"
+        ) from exc
+    if not math.isfinite(numeric) or not numeric.is_integer() or numeric <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return int(numeric)
+
+
+def _bounded_float(
+    name: str,
+    value,
+    *,
+    minimum: float,
+    maximum: Optional[float] = None,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number, got {value!r}") from exc
+    if not math.isfinite(numeric) or numeric < minimum:
+        raise ValueError(f"{name} must be finite and >= {minimum}, got {value!r}")
+    if maximum is not None and numeric > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {value!r}")
+    return numeric
+
+
 class LTMModule(nn.Module):
     """
     Titans-style Neural Memory Module with Dual-Store Architecture.
@@ -21,6 +56,33 @@ class LTMModule(nn.Module):
 
     def __init__(self, n_slots=1024, key_dim=64, val_dim=64, lr=1e-3, momentum=0.9, wd=1e-4, forget_rate=0.01, reference_chunk_len=128, score_grad_scale=1.0, cpu_gather_retrieval=True, cpu_sparse_update=True):
         super().__init__()
+
+        n_slots = _positive_int("n_slots", n_slots)
+        key_dim = _positive_int("key_dim", key_dim)
+        val_dim = _positive_int("val_dim", val_dim)
+        reference_chunk_len = _positive_int(
+            "reference_chunk_len",
+            reference_chunk_len,
+        )
+        lr = _bounded_float("lr", lr, minimum=0.0)
+        momentum = _bounded_float(
+            "momentum",
+            momentum,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        wd = _bounded_float("wd", wd, minimum=0.0)
+        forget_rate = _bounded_float(
+            "forget_rate",
+            forget_rate,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        score_grad_scale = _bounded_float(
+            "score_grad_scale",
+            score_grad_scale,
+            minimum=0.0,
+        )
         
         # --- Slow Weights (Long-Term Consolidation) ---
         self.keys = nn.Parameter(torch.randn(n_slots, key_dim) * 0.02)
@@ -185,18 +247,29 @@ class LTMModule(nn.Module):
         expand_shape = index_leading + (tensor.shape[-1],)
         return tensor.reshape(view_shape).expand(expand_shape)
 
-    def _gather_topk_cuda(self, idx_clamped: torch.LongTensor, effective_memory: torch.Tensor,
-                          current_timestamps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        effective_memory = effective_memory.float()
-        if effective_memory.dim() == 2:
+    def _gather_slot_values(
+        self,
+        idx_clamped: torch.LongTensor,
+        memory: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather selected slots without materializing a broadcast full store."""
+        memory = memory.float()
+        if memory.dim() == 2:
             flat_idx = idx_clamped.reshape(-1)
-            gathered_vals = effective_memory.index_select(0, flat_idx)
-            gathered_vals = gathered_vals.view(*idx_clamped.shape, effective_memory.shape[-1])
+            gathered_vals = memory.index_select(0, flat_idx)
+            gathered_vals = gathered_vals.view(
+                *idx_clamped.shape,
+                memory.shape[-1],
+            )
         else:
-            memory_view = self._expand_slot_tensor_for_index(effective_memory, idx_clamped)
+            memory_view = self._expand_slot_tensor_for_index(memory, idx_clamped)
             gather_idx = idx_clamped.unsqueeze(-1).expand(*idx_clamped.shape, memory_view.shape[-1])
             gathered_vals = torch.gather(memory_view, dim=-2, index=gather_idx)
+        return gathered_vals.contiguous()
 
+    def _gather_topk_cuda(self, idx_clamped: torch.LongTensor, memory: torch.Tensor,
+                          current_timestamps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        gathered_vals = self._gather_slot_values(idx_clamped, memory)
         current_timestamps = current_timestamps.to(device=idx_clamped.device, dtype=torch.float32)
         if current_timestamps.dim() == 1:
             ts_retrieved = current_timestamps.index_select(0, idx_clamped.reshape(-1))
@@ -205,7 +278,7 @@ class LTMModule(nn.Module):
             ts_view = self._expand_slot_metadata_for_index(current_timestamps, idx_clamped)
             ts_retrieved = torch.gather(ts_view, dim=-1, index=idx_clamped)
 
-        return gathered_vals.contiguous(), ts_retrieved
+        return gathered_vals, ts_retrieved
 
     def _inject_score_gradients(self, gathered_vals: torch.Tensor, selected_sim: torch.Tensor) -> torch.Tensor:
         """Give the address path gradients without changing retrieved values."""
@@ -437,7 +510,6 @@ class LTMModule(nn.Module):
             idx_ret = torch.where(selected_valid, idx, torch.full_like(idx, -1))
             
             current_fast_vals = fast_vals if fast_vals is not None else self.fast_vals
-            effective_memory = self.vals + current_fast_vals
             
             effective_memory_size = self.vals.shape[0]
             idx_clamped = idx.clamp(min=0, max=effective_memory_size-1)
@@ -447,11 +519,16 @@ class LTMModule(nn.Module):
                 selected_sim = torch.where(selected_valid, selected_sim, torch.zeros_like(selected_sim))
 
             if use_gather_retrieval:
-                weighted_vals, ts_retrieved = self._gather_topk_cuda(
+                slow_vals, ts_retrieved = self._gather_topk_cuda(
                     idx_clamped,
-                    effective_memory,
+                    self.vals,
                     current_timestamps,
                 )
+                fast_selected = self._gather_slot_values(
+                    idx_clamped,
+                    current_fast_vals,
+                )
+                weighted_vals = slow_vals + fast_selected
                 weighted_vals = self._inject_score_gradients(weighted_vals, selected_sim)
                 weighted_vals = weighted_vals * selected_valid.unsqueeze(-1).to(weighted_vals.dtype)
                 ts_retrieved = torch.where(selected_valid, ts_retrieved, torch.zeros_like(ts_retrieved))
@@ -480,7 +557,10 @@ class LTMModule(nn.Module):
             
             one_hot = (idx_clamped.unsqueeze(-1) == range_tensor).float()
 
-            gathered_vals = torch.matmul(one_hot, effective_memory.float())
+            gathered_vals = (
+                torch.matmul(one_hot, self.vals.float())
+                + torch.matmul(one_hot, current_fast_vals.float())
+            )
             
             # --- FINAL LTM FIX: Clean Concatenation Signal ---
             # With normalization handling the bleeding, we can now use the 

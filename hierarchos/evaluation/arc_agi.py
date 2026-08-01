@@ -17,7 +17,9 @@ from ..inference.chat import (
     boundary_drift_seed,
     resolve_inference_prefill_chunk_size,
     uses_full_sample_inference_recurrence,
+    wrap_for_hierarchos,
 )
+from ..utils.tokenizer import validate_inference_tokenizer_identity
 
 
 Grid = List[List[int]]
@@ -175,7 +177,7 @@ def generate_text(
     total_tokens_seen = 0
 
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         prefill_step = prefill_chunk_size if prefill_chunk_size > 0 else input_ids.shape[1]
         prefill_step = max(1, int(prefill_step))
         chunk_drift_state = None
@@ -191,6 +193,13 @@ def generate_text(
                 drift_state=chunk_drift_state,
                 ltm_memory_state=ltm_state,
                 global_pos_offset=start,
+                suppress_hebbian=True,
+                return_topk_values=False,
+                return_raw_topk_values=False,
+                return_topk_indices=False,
+                return_step_telemetry=False,
+                return_numerics=False,
+                return_last_logit_only=True,
             )
             h_state = outputs.get("h_state")
             l_state = outputs.get("l_state")
@@ -218,6 +227,16 @@ def generate_text(
             generated.append(token_id)
             if eos_token_id is not None and token_id == int(eos_token_id):
                 break
+            # ARC answers are self-delimiting JSON. Once a complete valid grid
+            # exists, later autoregressive tokens cannot improve the parsed
+            # answer and only spend benchmark compute.
+            if len(generated) >= 3:
+                partial_text = tokenizer.decode(
+                    generated,
+                    skip_special_tokens=True,
+                )
+                if extract_json_grid(partial_text) is not None:
+                    break
 
             next_input = next_token.reshape(1, 1).to(device)
             generation_drift_state = boundary_drift_seed(
@@ -236,6 +255,13 @@ def generate_text(
                 drift_state=generation_drift_state,
                 ltm_memory_state=ltm_state,
                 global_pos_offset=total_tokens_seen,
+                suppress_hebbian=True,
+                return_topk_values=False,
+                return_raw_topk_values=False,
+                return_topk_indices=False,
+                return_step_telemetry=False,
+                return_numerics=False,
+                return_last_logit_only=True,
             )
             total_tokens_seen += 1
             h_state = outputs.get("h_state")
@@ -274,14 +300,27 @@ def run_arc_agi_eval(
     keep_samples: bool = False,
     result_key: str = "arc_agi",
 ) -> Dict[str, Any]:
+    validate_inference_tokenizer_identity(
+        tokenizer,
+        getattr(model, "_hierarchos_checkpoint_metadata", {}),
+    )
     tasks = load_arc_agi_tasks(dataset_path, max_tasks=max_tasks)
     total = 0
     correct = 0
     parse_failures = 0
     samples = []
+    model_config = getattr(model, "config", {})
+    alpaca_mode = bool(
+        model_config.get("alpaca", False)
+        if isinstance(model_config, dict)
+        else getattr(model_config, "alpaca", False)
+    )
 
     for task, test_idx, example in _iter_test_items(tasks, max_test_items=max_test_items):
-        prompt = build_arc_agi_prompt(task, example.input)
+        prompt = wrap_for_hierarchos(
+            build_arc_agi_prompt(task, example.input),
+            alpaca_mode=alpaca_mode,
+        )
         raw = generate_text(
             model=model,
             tokenizer=tokenizer,
@@ -326,6 +365,11 @@ def run_arc_agi_eval(
             "max_test_items": max_test_items,
             "max_new_tokens": max_new_tokens,
             "temperature": temperature,
+            "prompt_format": (
+                "alpaca-instruction-response"
+                if alpaca_mode
+                else "user-assistant"
+            ),
         },
     }
     if keep_samples:

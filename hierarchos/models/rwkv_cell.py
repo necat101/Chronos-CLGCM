@@ -11,6 +11,27 @@ def _clamp_preserve_nonfinite(tensor: torch.Tensor, minimum: float, maximum: flo
     return torch.where(torch.isfinite(tensor), clamped, tensor)
 
 
+def _parameter_matmul(
+    left: torch.Tensor,
+    parameter: torch.Tensor,
+) -> torch.Tensor:
+    """Use autocast's cached leaf-parameter conversion when available.
+
+    Explicitly copying each low-rank matrix to the activation dtype inside the
+    recurrent loop creates a new weight tensor for every token/refinement.
+    Outside autocast, retain that conversion for mixed-dtype callers.
+    """
+    if left.dtype == parameter.dtype:
+        return left @ parameter
+    try:
+        autocast_enabled = torch.is_autocast_enabled(left.device.type)
+    except TypeError:  # Older PyTorch accepted no device argument.
+        autocast_enabled = torch.is_autocast_enabled()
+    if autocast_enabled:
+        return left @ parameter
+    return left @ parameter.to(dtype=left.dtype, device=left.device)
+
+
 def _choose_head_size(n_embd: int, requested=None) -> int:
     n_embd = int(n_embd)
     if requested:
@@ -103,7 +124,14 @@ class RWKVCell(nn.Module):
         self.matrix_offset = 4 if self.state_readout_mode == "explicit-output" else 3
         self.state_size = self.matrix_offset + self.head_size
         self.state_clamp = None if state_clamp is None else float(state_clamp)
-        self.allow_legacy_state_migration = True
+        # Corrected explicit-output states are part of the coherent-v9 learned
+        # function and must not silently accept a different runtime layout.
+        # Legacy-input-cache cells retain the historical best-effort migration
+        # behavior.  The checked chat-state legacy importer can temporarily
+        # enable migration on a coherent cell after validating provenance.
+        self.allow_legacy_state_migration = (
+            self.state_readout_mode == "legacy-input-cache"
+        )
         self._compiled_impl = None
         try:
             self.channel_mix_key_clamp = float(channel_mix_key_clamp or 0.0)
@@ -235,7 +263,8 @@ class RWKVCell(nn.Module):
         if state.dim() == 4 and state.shape[0] == 1:
             state = state.squeeze(0)
         state = state.to(device=x.device, dtype=torch.float32)
-        if state.shape == (B, self.n_embd, self.state_size):
+        expected_shape = (B, self.n_embd, self.state_size)
+        if state.shape == expected_shape:
             if not self.allow_legacy_state_migration:
                 return state
             # Old scalar-WKV states also used 5 slots and stored pp=-1e30 in
@@ -251,6 +280,13 @@ class RWKVCell(nn.Module):
                 and (state_tail.numel() == 0 or state_tail.amin() > -1e20)
             ):
                 return state
+
+        if not self.allow_legacy_state_migration:
+            raise ValueError(
+                "RWKV recurrent state layout does not match the strict "
+                f"{self.state_readout_mode!r} contract: expected "
+                f"{expected_shape}, got {tuple(state.shape)}"
+            )
 
         migrated = self.initial_state(B, device=x.device, dtype=torch.float32)
         if state.dim() != 3:
@@ -348,11 +384,32 @@ class RWKVCell(nn.Module):
         else:
             v_first = state[:, :, 2].to(dtype=x_dtype)
             v = v + (v_first - v) * torch.sigmoid(
-                self.v0.to(x_dtype) + (xv @ self.v1.to(x_dtype)) @ self.v2.to(x_dtype)
+                self.v0.to(x_dtype)
+                + _parameter_matmul(
+                    _parameter_matmul(xv, self.v1),
+                    self.v2,
+                )
             )
-        a = torch.sigmoid(self.a0.to(x_dtype) + (xa @ self.a1.to(x_dtype)) @ self.a2.to(x_dtype))
-        g = torch.sigmoid(xg @ self.g1.to(x_dtype)) @ self.g2.to(x_dtype)
-        w = -F.softplus(-(self.w0.to(x_dtype) + torch.tanh(xw @ self.w1.to(x_dtype)) @ self.w2.to(x_dtype))) - 0.5
+        a = torch.sigmoid(
+            self.a0.to(x_dtype)
+            + _parameter_matmul(
+                _parameter_matmul(xa, self.a1),
+                self.a2,
+            )
+        )
+        g = _parameter_matmul(
+            torch.sigmoid(_parameter_matmul(xg, self.g1)),
+            self.g2,
+        )
+        w = -F.softplus(
+            -(
+                self.w0.to(x_dtype)
+                + _parameter_matmul(
+                    torch.tanh(_parameter_matmul(xw, self.w1)),
+                    self.w2,
+                )
+            )
+        ) - 0.5
 
         kk = k * self.k_k.to(x_dtype)
         kk = F.normalize(kk.view(B, H, N), dim=-1, p=2.0).view(B, C)

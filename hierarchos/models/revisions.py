@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Any, Mapping
 
 
 LEGACY_REVISION = "legacy-v8"
 COHERENT_REVISION = "coherent-v9"
 ARCHITECTURE_CONTRACT_SCHEMA_VERSION = 2
+LEGACY_TRAINING_CHUNK_SIZE = 128
+COHERENT_TRAINING_CHUNK_SIZE = 256
 
 
 # These fields alter tensor geometry, the learned function, recurrent/memory
@@ -122,6 +125,266 @@ def _setdefault(config, name: str, value) -> None:
         _set(config, name, value)
 
 
+def _canonical_contract_int(
+    config,
+    name: str,
+    *,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int | None:
+    """Validate and persist one integer-valued architecture setting."""
+
+    if not _contains(config, name):
+        return None
+    raw_value = _get(config, name, None)
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool):
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}")
+    try:
+        numeric_value = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
+    if not math.isfinite(numeric_value) or not numeric_value.is_integer():
+        raise ValueError(f"{name} must be a finite integer, got {raw_value!r}")
+    value = int(numeric_value)
+    if minimum is not None and value < minimum:
+        if minimum == 1:
+            raise ValueError(
+                f"{name} must be a positive integer, got {raw_value!r}"
+            )
+        raise ValueError(f"{name} must be >= {minimum}, got {raw_value!r}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}, got {raw_value!r}")
+    _set(config, name, value)
+    return value
+
+
+def _canonical_contract_float(
+    config,
+    name: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    minimum_inclusive: bool = True,
+    maximum_inclusive: bool = True,
+) -> float | None:
+    """Validate and persist one finite floating-point architecture setting."""
+
+    if not _contains(config, name):
+        return None
+    raw_value = _get(config, name, None)
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool):
+        raise ValueError(f"{name} must be a finite number, got {raw_value!r}")
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{name} must be a finite number, got {raw_value!r}"
+        ) from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {raw_value!r}")
+    if minimum is not None:
+        below_minimum = value < minimum if minimum_inclusive else value <= minimum
+        if below_minimum:
+            comparator = ">=" if minimum_inclusive else ">"
+            raise ValueError(
+                f"{name} must be {comparator} {minimum}, got {raw_value!r}"
+            )
+    if maximum is not None:
+        above_maximum = value > maximum if maximum_inclusive else value >= maximum
+        if above_maximum:
+            comparator = "<=" if maximum_inclusive else "<"
+            raise ValueError(
+                f"{name} must be {comparator} {maximum}, got {raw_value!r}"
+            )
+    _set(config, name, value)
+    return value
+
+
+def validate_architecture_numeric_contract(config) -> None:
+    """Canonicalize numeric learned-function settings or fail closed.
+
+    Architecture hashes must describe the function that the forward actually
+    executes.  Runtime helpers historically replaced invalid/non-positive raw
+    values with private defaults, which allowed (for example) a contract that
+    hashed ``recurrent_state_clamp=0`` while the cell executed a clamp of 50.
+    Validate at the shared revision boundary so checkpoint hashing, model
+    construction, expansion, training, and inference all see one concrete
+    numeric contract.
+
+    Missing geometry is allowed because callers may resolve a partial contract
+    before tokenizer-dependent dimensions are known.  Every present value is
+    canonicalized, and dependent constraints are checked when both operands are
+    available.
+    """
+
+    positive_int_fields = (
+        "vocab_size",
+        "context_dim",
+        "ltm_slots",
+        "ltm_key_dim",
+        "ltm_val_dim",
+        "ltm_topk",
+        "h_hidden",
+        "l_hidden",
+        "h_stride",
+        "max_h_steps",
+        "max_l_steps",
+        "min_h_steps",
+        "training_chunk_size",
+        "reference_chunk_len",
+    )
+    for name in positive_int_fields:
+        _canonical_contract_int(config, name, minimum=1)
+
+    _canonical_contract_int(
+        config,
+        "core_recurrence_version",
+        minimum=1,
+        maximum=2,
+    )
+    _canonical_contract_int(config, "persistent_dim", minimum=0)
+    _canonical_contract_int(config, "rwkv_n_layer_hint", minimum=2)
+    _canonical_contract_int(config, "memory_gate_warmup_steps", minimum=0)
+
+    # Zero/None/"auto" remain supported head-size sentinels until the concrete
+    # cell widths resolve them during model construction.
+    for name in (
+        "rwkv_head_size",
+        "h_rwkv_head_size",
+        "l_rwkv_head_size",
+    ):
+        raw_value = _get(config, name, None)
+        if raw_value in (None, "", "auto", 0):
+            continue
+        _canonical_contract_int(config, name, minimum=1)
+
+    raw_adapter_rank = _get(config, "token_adapter_rank", None)
+    if raw_adapter_rank not in (None, "", "auto", 0):
+        _canonical_contract_int(config, "token_adapter_rank", minimum=1)
+
+    rosa_max_context = _canonical_contract_int(
+        config,
+        "rosa_max_context",
+        minimum=0,
+    )
+    if (
+        bool(_get(config, "use_rosa", True))
+        and bool(_get(config, "enforce_rosa_max_context", False))
+        and (rosa_max_context is None or rosa_max_context <= 0)
+    ):
+        raise ValueError(
+            "rosa_max_context must be positive when bounded ROSA is enabled"
+        )
+
+    strictly_positive_float_fields = (
+        "halt_logit_clamp",
+        "recurrent_state_clamp",
+        "context_state_clamp",
+        "drift_state_clamp",
+        "activation_clamp",
+        "l_conv_atol",
+        "act_depth_temperature",
+        "ponder_huber_beta",
+    )
+    for name in strictly_positive_float_fields:
+        _canonical_contract_float(
+            config,
+            name,
+            minimum=0.0,
+            minimum_inclusive=False,
+        )
+
+    nonnegative_float_fields = (
+        # Explicit zero disables these clamps/scales/objectives.
+        "drift_norm_clamp",
+        "drift_delta_scale",
+        "rwkv_channel_mix_key_clamp",
+        "rwkv_channel_mix_deepembed_clamp",
+        "inference_logit_clamp",
+        "commitment_threshold",
+        "ltm_lr",
+        "ltm_weight_decay",
+        "ltm_score_grad_scale",
+        "ponder_target_scale",
+        "ponder_loss_weight",
+        "commitment_loss_weight",
+        "max_commitment_cost_for_backward",
+        "max_ponder_cost_for_backward",
+        "z_loss_weight",
+    )
+    for name in nonnegative_float_fields:
+        _canonical_contract_float(config, name, minimum=0.0)
+
+    _canonical_contract_float(
+        config,
+        "h_halt_thresh",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    _canonical_contract_float(
+        config,
+        "ltm_momentum",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    _canonical_contract_float(
+        config,
+        "ltm_forget_rate",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    _canonical_contract_float(
+        config,
+        "memory_gate_warmup_floor",
+        minimum=0.0,
+        maximum=0.95,
+    )
+
+    ltm_slots = _get(config, "ltm_slots", None)
+    ltm_topk = _get(config, "ltm_topk", None)
+    if ltm_slots is not None and ltm_topk is not None and ltm_topk > ltm_slots:
+        raise ValueError(
+            "ltm_topk cannot exceed ltm_slots; larger values allocate dead "
+            f"readout blocks (got ltm_topk={ltm_topk}, ltm_slots={ltm_slots})"
+        )
+
+    min_h_steps = _get(config, "min_h_steps", None)
+    max_h_steps = _get(config, "max_h_steps", None)
+    if (
+        min_h_steps is not None
+        and max_h_steps is not None
+        and min_h_steps > max_h_steps
+    ):
+        raise ValueError(
+            "min_h_steps cannot exceed max_h_steps; "
+            f"got min_h_steps={min_h_steps}, max_h_steps={max_h_steps}"
+        )
+
+    shared_head_size = _get(config, "rwkv_head_size", None)
+    for width_name, head_name in (
+        ("h_hidden", "h_rwkv_head_size"),
+        ("l_hidden", "l_rwkv_head_size"),
+    ):
+        width = _get(config, width_name, None)
+        # An explicitly supplied per-cell sentinel disables the shared request,
+        # matching the exact fallback semantics in HierarchosCore.
+        head_size = (
+            _get(config, head_name, None)
+            if _contains(config, head_name)
+            else shared_head_size
+        )
+        if width is not None and head_size not in (None, "", "auto", 0):
+            if width % head_size != 0:
+                raise ValueError(
+                    f"{head_name}={head_size} does not divide "
+                    f"{width_name}={width}"
+                )
+
+
 def normalize_architecture_revision(value) -> str:
     normalized = str(value or LEGACY_REVISION).strip().lower().replace("_", "-")
     aliases = {
@@ -139,6 +402,29 @@ def normalize_architecture_revision(value) -> str:
             f"got {value!r}"
         )
     return normalized
+
+
+def architecture_default_training_chunk_size(config_or_revision=None) -> int:
+    """Return the compatibility-safe TBPTT/LTM geometry for a revision.
+
+    Historical configs used 128 when the field was absent.  The supported v9
+    CLI and GUI both expose 256, so a bare coherent-v9 config must resolve to
+    the same learned-function contract instead of quietly hashing a different
+    LTM reference geometry.
+    """
+
+    if isinstance(config_or_revision, str) or config_or_revision is None:
+        revision_value = config_or_revision
+    else:
+        revision_value = _get(
+            config_or_revision,
+            "architecture_revision",
+            None,
+        )
+    revision = normalize_architecture_revision(revision_value)
+    if revision == COHERENT_REVISION:
+        return COHERENT_TRAINING_CHUNK_SIZE
+    return LEGACY_TRAINING_CHUNK_SIZE
 
 
 def apply_architecture_revision_defaults(config) -> str:
@@ -160,13 +446,10 @@ def apply_architecture_revision_defaults(config) -> str:
     if _contains(config, "detach_every_n_steps"):
         raw_detach = _get(config, "detach_every_n_steps", None)
         if raw_detach is not None:
-            try:
-                normalized_detach = int(raw_detach)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "detach_every_n_steps must be an integer or None, "
-                    f"got {raw_detach!r}"
-                ) from exc
+            normalized_detach = _canonical_contract_int(
+                config,
+                "detach_every_n_steps",
+            )
             _set(
                 config,
                 "detach_every_n_steps",
@@ -182,12 +465,18 @@ def apply_architecture_revision_defaults(config) -> str:
             "rosa_embedding_mode": "shared-factorized",
             "enforce_rosa_max_context": True,
             "rosa_zero_no_prediction": True,
+            # Gradient-written fast memory is unavailable during ordinary
+            # autoregressive generation (there is no target-label loss then).
+            # Keep new coherent runs train/chat aligned unless the experiment
+            # explicitly opts into the legacy Titans inner-update ablation.
+            "ltm_training_mode": "read-only",
             "adaptive_ponder": True,
             "ponder_objective": "symmetric-huber",
             "inference_logit_clamp": 0.0,
             "inference_logit_parity": True,
             "l_conv_atol": 1e-4,
             "commitment_threshold": 0.05,
+            "training_chunk_size": COHERENT_TRAINING_CHUNK_SIZE,
         }
     else:
         defaults = {
@@ -199,12 +488,14 @@ def apply_architecture_revision_defaults(config) -> str:
             "rosa_embedding_mode": "legacy-table",
             "enforce_rosa_max_context": False,
             "rosa_zero_no_prediction": False,
+            "ltm_training_mode": "inner-update",
             "adaptive_ponder": False,
             "ponder_objective": "auto",
             "inference_logit_clamp": 30.0,
             "inference_logit_parity": False,
             "l_conv_atol": 0.01,
             "commitment_threshold": 0.1,
+            "training_chunk_size": LEGACY_TRAINING_CHUNK_SIZE,
         }
     for name, value in defaults.items():
         _setdefault(config, name, value)
@@ -249,7 +540,6 @@ def apply_architecture_revision_defaults(config) -> str:
         "ltm_weight_decay": 1e-4,
         "ltm_forget_rate": 0.01,
         "ltm_score_grad_scale": 1.0,
-        "training_chunk_size": 128,
         "allow_untrained_hebbian_writer": False,
         "memory_gate_warmup_steps": 0,
         "memory_gate_warmup_floor": 0.0,
@@ -273,11 +563,16 @@ def apply_architecture_revision_defaults(config) -> str:
     if context_dim is not None:
         _setdefault(config, "h_hidden", context_dim)
         _setdefault(config, "l_hidden", context_dim)
-        _setdefault(config, "token_adapter_rank", min(64, int(context_dim)))
+        if _get(config, "token_adapter_rank", None) in (None, "", "auto", 0):
+            _set(config, "token_adapter_rank", min(64, int(context_dim)))
     _setdefault(
         config,
         "reference_chunk_len",
-        _get(config, "training_chunk_size", 128),
+        _get(
+            config,
+            "training_chunk_size",
+            architecture_default_training_chunk_size(config),
+        ),
     )
     _setdefault(
         config,
@@ -288,6 +583,7 @@ def apply_architecture_revision_defaults(config) -> str:
             else "tbptt"
         ),
     )
+    validate_architecture_numeric_contract(config)
     return revision
 
 

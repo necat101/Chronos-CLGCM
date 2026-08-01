@@ -12,12 +12,14 @@ from ..models.revisions import (
     normalize_architecture_revision,
     validate_architecture_contract,
 )
+from .safe_loading import load_tensor_payload_safely
 
 TRANSIENT_LTM_STATE_KEYS = (
     "ltm.fast_vals",
     "ltm._mom_vals",
     "ltm.timestamps",
     "ltm.sources",
+    "ltm.wallclock_timestamps",
 )
 
 DETERMINISTIC_STATE_KEYS = (
@@ -27,7 +29,12 @@ DETERMINISTIC_STATE_KEYS = (
 RUNTIME_CHECKPOINT_METADATA_KEYS = (
     "checkpoint_version",
     "checkpoint_kind",
+    "derived_from_checkpoint_kind",
+    "derived_from_checkpoint_version",
+    "derived_from_checkpoint_sha256",
     "completed_epoch",
+    "tokenizer_identity",
+    "expansion_provenance",
     "run_identity",
     "best_metric_state",
     "selection_metric",
@@ -35,6 +42,120 @@ RUNTIME_CHECKPOINT_METADATA_KEYS = (
     "optimizer_grouping_version",
     "training_complete",
 )
+
+LTM_PERSISTENT_METADATA_VERSION = 1
+LTM_WALLCLOCK_SEMANTICS = "unix-seconds-utc-user-memory-write-v1"
+
+
+def _validate_run_identity_digest(checkpoint: Dict[str, Any], source: str) -> bool:
+    """Verify the self-digest on exact-run metadata when one is present."""
+    run_identity = checkpoint.get("run_identity")
+    if not isinstance(run_identity, dict):
+        return False
+    saved_digest = run_identity.get("sha256")
+    if saved_digest is None:
+        return False
+    if (
+        not isinstance(saved_digest, str)
+        or len(saved_digest) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in saved_digest)
+    ):
+        raise ValueError(f"Run identity in {source} has an invalid SHA-256 digest.")
+    digest_payload = {
+        key: value
+        for key, value in run_identity.items()
+        if key != "sha256"
+    }
+    actual_digest = hashlib.sha256(
+        json.dumps(
+            digest_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    if actual_digest != saved_digest.lower():
+        raise ValueError(
+            f"Run identity SHA-256 verification failed for {source}: "
+            "checkpoint provenance/tokenizer/objective metadata is inconsistent."
+        )
+    return True
+
+
+def _validate_expansion_provenance(checkpoint: Dict[str, Any], source: str) -> bool:
+    """Verify the self-digest and output bindings of expansion lineage metadata."""
+    provenance = checkpoint.get("expansion_provenance")
+    if provenance is None:
+        return False
+    if not isinstance(provenance, dict):
+        raise ValueError(f"Expansion provenance in {source} must be a dictionary.")
+    saved_digest = provenance.get("sha256")
+    if (
+        not isinstance(saved_digest, str)
+        or len(saved_digest) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in saved_digest)
+    ):
+        raise ValueError(f"Expansion provenance in {source} has an invalid SHA-256 digest.")
+    digest_payload = {
+        key: value
+        for key, value in provenance.items()
+        if key != "sha256"
+    }
+    actual_digest = hashlib.sha256(
+        json.dumps(
+            digest_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+    if actual_digest != saved_digest.lower():
+        raise ValueError(
+            f"Expansion provenance SHA-256 verification failed for {source}."
+        )
+
+    source_info = provenance.get("source")
+    expanded_info = provenance.get("expanded")
+    if not isinstance(source_info, dict) or not isinstance(expanded_info, dict):
+        raise ValueError(
+            f"Expansion provenance in {source} must contain source and expanded mappings."
+        )
+    source_checkpoint_digest = source_info.get("checkpoint_sha256")
+    if (
+        not isinstance(source_checkpoint_digest, str)
+        or len(source_checkpoint_digest) != 64
+        or any(
+            char not in "0123456789abcdefABCDEF"
+            for char in source_checkpoint_digest
+        )
+    ):
+        raise ValueError(
+            f"Expansion provenance in {source} has an invalid source checkpoint digest."
+        )
+
+    checkpoint_contract_hash = checkpoint.get("architecture_contract_sha256")
+    provenance_contract_hash = expanded_info.get(
+        "architecture_contract_sha256"
+    )
+    if (
+        checkpoint_contract_hash is not None
+        and str(checkpoint_contract_hash).strip().lower()
+        != str(provenance_contract_hash or "").strip().lower()
+    ):
+        raise ValueError(
+            f"Expansion provenance architecture hash disagrees with the checkpoint in {source}."
+        )
+    direct_tokenizer = checkpoint.get("tokenizer_identity")
+    provenance_tokenizer = expanded_info.get("tokenizer_identity")
+    if (
+        isinstance(direct_tokenizer, dict)
+        and isinstance(provenance_tokenizer, dict)
+        and direct_tokenizer != provenance_tokenizer
+    ):
+        raise ValueError(
+            f"Expansion provenance tokenizer identity disagrees with the checkpoint in {source}."
+        )
+    return True
 
 
 def _clean_state_dict_key(key: str) -> str:
@@ -132,28 +253,44 @@ def _legacy_numpy_checkpoint_safe_globals():
 def load_checkpoint_payload_compatible(path: str, map_location="cpu"):
     """Load Hierarchos payloads safely, including legacy NumPy RNG metadata."""
     checksum_path = path + ".sha256"
+    checkpoint_source = path
+    verified_checkpoint_file = None
     if os.path.exists(checksum_path):
         with open(checksum_path, "r", encoding="utf-8") as checksum_file:
-            expected = checksum_file.read().strip().split()[0].lower()
+            checksum_parts = checksum_file.read().strip().split()
+        if not checksum_parts:
+            raise RuntimeError(f"Checkpoint SHA-256 sidecar is empty: {checksum_path}")
+        expected = checksum_parts[0].lower()
+        if (
+            len(expected) != 64
+            or any(character not in "0123456789abcdef" for character in expected)
+        ):
+            raise RuntimeError(
+                f"Checkpoint SHA-256 sidecar is malformed: {checksum_path}"
+            )
         hasher = hashlib.sha256()
-        with open(path, "rb") as checkpoint_file:
+        # Hash and deserialize the same open file description. Reopening by
+        # path after verification leaves a TOCTOU window where a replacement
+        # file can bypass the sidecar identity check.
+        verified_checkpoint_file = open(path, "rb")
+        try:
             while True:
-                chunk = checkpoint_file.read(8 << 20)
+                chunk = verified_checkpoint_file.read(8 << 20)
                 if not chunk:
                     break
                 hasher.update(chunk)
+        except Exception:
+            verified_checkpoint_file.close()
+            raise
         actual = hasher.hexdigest()
-        if not expected or actual != expected:
+        if actual != expected:
+            verified_checkpoint_file.close()
             raise RuntimeError(
                 f"Checkpoint SHA-256 verification failed for {path}: "
                 f"expected={expected!r}, actual={actual!r}"
             )
-    try:
-        from torch.serialization import safe_globals
-    except (ImportError, AttributeError):
-        # PyTorch releases predating safe_globals retain their legacy loader.
-        return torch.load(path, map_location=map_location)
-
+        verified_checkpoint_file.seek(0)
+        checkpoint_source = verified_checkpoint_file
     # Current exact-resume checkpoints can contain the deterministic,
     # project-owned ROSA automaton carried at a TBPTT boundary. Keep the
     # allowlist narrow: arbitrary user classes must remain rejected.
@@ -164,8 +301,15 @@ def load_checkpoint_payload_compatible(path: str, map_location="cpu"):
         ROSAState,
         *_legacy_numpy_checkpoint_safe_globals(),
     ]
-    with safe_globals(allowed_globals):
-        return torch.load(path, map_location=map_location, weights_only=True)
+    try:
+        return load_tensor_payload_safely(
+            checkpoint_source,
+            map_location=map_location,
+            allowed_globals=allowed_globals,
+        )
+    finally:
+        if verified_checkpoint_file is not None:
+            verified_checkpoint_file.close()
 
 def _resolve_weights_path(model_path: str) -> Tuple[str, str]:
     """Resolve a Hierarchos model source to (weights_path, model_dir)."""
@@ -510,6 +654,8 @@ def validate_checkpoint_architecture_contract(
     exports, and exact-resume identity each remain independently inspectable.
     Any disagreement is treated as corruption/configuration drift.
     """
+    _validate_run_identity_digest(checkpoint, source)
+    _validate_expansion_provenance(checkpoint, source)
 
     contracts = []
     hashes = []
@@ -585,6 +731,81 @@ def validate_checkpoint_architecture_contract(
     return True
 
 
+def _restore_persistent_ltm_metadata(model, checkpoint: Dict[str, Any], source: str) -> bool:
+    """Restore metadata for an explicitly consolidated inference LTM export."""
+    metadata = checkpoint.get("ltm_persistent_metadata")
+    if metadata is None:
+        return False
+    if checkpoint.get("checkpoint_kind") != "inference-ltm-consolidated":
+        raise ValueError(
+            f"Unexpected persistent LTM metadata in {source}: only an "
+            "inference-ltm-consolidated checkpoint may carry it."
+        )
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Persistent LTM metadata in {source} must be a dictionary.")
+    try:
+        version = int(metadata.get("version", 0))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"Persistent LTM metadata in {source} has an invalid version.") from exc
+    if version != LTM_PERSISTENT_METADATA_VERSION:
+        raise ValueError(
+            f"Unsupported persistent LTM metadata version {version} in {source}."
+        )
+    if metadata.get("wallclock_semantics") != LTM_WALLCLOCK_SEMANTICS:
+        raise ValueError(
+            f"Persistent LTM metadata in {source} has unsupported wall-clock semantics."
+        )
+    ltm = getattr(model, "ltm", None)
+    if ltm is None:
+        raise ValueError(f"Persistent LTM metadata in {source} has no target LTM module.")
+
+    with torch.no_grad():
+        for name in ("timestamps", "sources", "wallclock_timestamps"):
+            value = metadata.get(name)
+            target = getattr(ltm, name, None)
+            if not torch.is_tensor(value) or not torch.is_tensor(target):
+                raise ValueError(
+                    f"Persistent LTM metadata {name!r} is missing or is not a tensor "
+                    f"in {source}."
+                )
+            if tuple(value.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Persistent LTM metadata {name!r} shape mismatch in {source}: "
+                    f"saved={tuple(value.shape)}, expected={tuple(target.shape)}."
+                )
+            if name == "sources":
+                if value.dtype != torch.long:
+                    raise ValueError(
+                        f"Persistent LTM metadata 'sources' must use torch.int64 in {source}."
+                    )
+                min_source = int(value.min().item()) if value.numel() else 0
+                max_source = int(value.max().item()) if value.numel() else 0
+                allowed_max = max(
+                    int(getattr(ltm, "SRC_UNKNOWN", 0)),
+                    int(getattr(ltm, "SRC_USER_INTERACTION", 1)),
+                    int(getattr(ltm, "SRC_TRAINING_DATA", 2)),
+                    int(getattr(ltm, "SRC_CORRECTION", 3)),
+                )
+                if min_source < 0 or max_source > allowed_max:
+                    raise ValueError(
+                        f"Persistent LTM metadata 'sources' contains an unknown source "
+                        f"identifier in {source}."
+                    )
+            else:
+                if not value.is_floating_point():
+                    raise ValueError(
+                        f"Persistent LTM metadata {name!r} must be floating point in {source}."
+                    )
+                finite_nonnegative = torch.isfinite(value) & (value >= 0)
+                if not bool(finite_nonnegative.all().item()):
+                    raise ValueError(
+                        f"Persistent LTM metadata {name!r} contains a non-finite or "
+                        f"negative value in {source}."
+                    )
+            target.copy_(value.to(device=target.device, dtype=target.dtype))
+    return True
+
+
 def load_full_model_with_config(model_path: str, device):
     """Loads a full-precision model from a directory or direct .pt file."""
     weights_path, model_dir = _resolve_weights_path(model_path)
@@ -654,6 +875,7 @@ def load_full_model_with_config(model_path: str, device):
     model.to(device)
     if checkpoint.get('training_complete', False) and hasattr(model, 'reset_memory'):
         model.reset_memory()
+    _restore_persistent_ltm_metadata(model, checkpoint, weights_path)
     # Retain only small identity metadata needed by inference-side re-exports.
     # Keeping it on the loaded model avoids rereading a multi-gigabyte checkpoint
     # merely to preserve its contract and training provenance after an LTM edit.
@@ -674,6 +896,7 @@ def save_checkpoint_safely(checkpoint_dict: Dict[str, Any], path: str):
     backup_path = path + ".bak"
     backup_checksum_path = backup_path + ".sha256"
     moved_existing_to_backup = False
+    published_new_checkpoint = False
 
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -715,11 +938,12 @@ def save_checkpoint_safely(checkpoint_dict: Dict[str, Any], path: str):
             if os.path.exists(backup_checksum_path):
                 os.remove(backup_checksum_path)
             os.replace(path, backup_path)
+            moved_existing_to_backup = True
             if os.path.exists(checksum_path):
                 os.replace(checksum_path, backup_checksum_path)
-            moved_existing_to_backup = True
 
         os.replace(temp_path, path)
+        published_new_checkpoint = True
         os.replace(temp_checksum_path, checksum_path)
         print(
             f"INFO: Checkpoint saved safely to {path} "
@@ -731,6 +955,19 @@ def save_checkpoint_safely(checkpoint_dict: Dict[str, Any], path: str):
             os.remove(temp_path)
         if os.path.exists(temp_checksum_path):
             os.remove(temp_checksum_path)
+        if published_new_checkpoint and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as remove_error:
+                print(
+                    f"CRITICAL: Could not remove incompletely published checkpoint "
+                    f"'{path}': {remove_error}"
+                )
+        if published_new_checkpoint and os.path.exists(checksum_path):
+            try:
+                os.remove(checksum_path)
+            except OSError:
+                pass
         if moved_existing_to_backup and not os.path.exists(path) and os.path.exists(backup_path):
             try:
                 os.replace(backup_path, path)

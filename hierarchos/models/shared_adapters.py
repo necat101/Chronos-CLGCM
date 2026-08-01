@@ -159,7 +159,21 @@ class SharedTokenAdapter(nn.Module):
                 f"Expected token feature width {self.input_dim}, "
                 f"got {token_features.shape[-1]}"
             )
-        hidden = torch.nn.functional.silu(self.down(self.norm(token_features)))
+        return self.forward_normalized(self.norm(token_features))
+
+    def forward_normalized(
+        self,
+        normalized_token_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project features already normalized by an equivalent shared norm."""
+        if normalized_token_features.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"Expected normalized token feature width {self.input_dim}, "
+                f"got {normalized_token_features.shape[-1]}"
+            )
+        hidden = torch.nn.functional.silu(
+            self.down(normalized_token_features)
+        )
         return self.bias + self.up(hidden)
 
 

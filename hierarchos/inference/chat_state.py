@@ -16,6 +16,7 @@ from ..models.revisions import (
     architecture_contract_hash,
     validate_architecture_contract,
 )
+from ..utils.rosa import ROSAState
 
 
 CHAT_STATE_KIND = "hierarchos_chat_runtime_state"
@@ -202,13 +203,15 @@ def _payload_version(payload: Dict[str, Any]) -> int:
 def _validate_strict_recurrent_shapes(
     payload: Dict[str, Any],
     model: Any,
-) -> None:
+) -> Optional[int]:
     saved_shapes = payload.get("recurrent_state_shapes")
     if not isinstance(saved_shapes, dict):
         raise RuntimeError(
             "Version-4 chat state is missing recurrent_state_shapes metadata."
         )
 
+    batch_size: Optional[int] = None
+    present_states = []
     for state_name, module_name in (
         ("h_state", "h_rnn"),
         ("l_state", "l_rnn"),
@@ -223,6 +226,7 @@ def _validate_strict_recurrent_shapes(
             )
         if state is None:
             continue
+        present_states.append(state_name)
         if state.dim() != 3 or int(state.shape[0]) <= 0:
             raise RuntimeError(
                 f"Chat state {state_name} must have exact [B, C, S] shape; "
@@ -239,6 +243,217 @@ def _validate_strict_recurrent_shapes(
                 f"Chat state recurrent tensor shape mismatch for {state_name}: "
                 f"saved={actual_shape}, current={expected_shape}."
             )
+        if state.is_floating_point() and not bool(torch.isfinite(state).all().item()):
+            raise RuntimeError(f"Chat state {state_name} contains non-finite values.")
+        if batch_size is None:
+            batch_size = int(state.shape[0])
+        elif int(state.shape[0]) != batch_size:
+            raise RuntimeError(
+                "Chat state recurrent tensors disagree on batch size: "
+                f"expected {batch_size}, got {int(state.shape[0])} for {state_name}."
+            )
+
+    if len(present_states) == 1:
+        raise RuntimeError(
+            "Version-4 chat state must contain both h_state and l_state, or neither."
+        )
+    return batch_size
+
+
+def _validate_strict_context_states(
+    payload: Dict[str, Any],
+    config: Any,
+    batch_size: Optional[int],
+) -> Optional[int]:
+    """Validate every non-recurrent tensor carrier in a current chat state."""
+    context_dim = int(_config_value(config, "context_dim", 0) or 0)
+    if context_dim <= 0:
+        raise RuntimeError("Current model has no valid context_dim for chat-state validation.")
+
+    context_names = ("prev_context", "target_context", "drift_state")
+    present = [name for name in context_names if payload.get(name) is not None]
+    if batch_size is not None and len(present) != len(context_names):
+        missing = sorted(set(context_names) - set(present))
+        raise RuntimeError(
+            "Version-4 chat state is missing context carrier(s): "
+            + ", ".join(missing)
+        )
+    if batch_size is None and present:
+        raise RuntimeError(
+            "Version-4 chat state cannot contain context carriers without recurrent state."
+        )
+
+    for name in present:
+        value = payload.get(name)
+        if not torch.is_tensor(value):
+            raise RuntimeError(f"Chat state {name} must be a tensor.")
+        expected = (int(batch_size), context_dim)
+        if tuple(value.shape) != expected:
+            raise RuntimeError(
+                f"Chat state {name} shape mismatch: saved={tuple(value.shape)}, "
+                f"current={expected}."
+            )
+        if value.is_floating_point() and not bool(torch.isfinite(value).all().item()):
+            raise RuntimeError(f"Chat state {name} contains non-finite values.")
+    return batch_size
+
+
+def _validated_total_tokens(payload: Dict[str, Any]) -> int:
+    value = payload.get("total_tokens_generated", 0)
+    if isinstance(value, bool):
+        raise RuntimeError("Chat state total_tokens_generated cannot be boolean.")
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "Chat state total_tokens_generated must be a nonnegative integer."
+        ) from exc
+    if value < 0:
+        raise RuntimeError(
+            "Chat state total_tokens_generated must be a nonnegative integer."
+        )
+    return value
+
+
+def _validate_rosa_state_structure(state: ROSAState, row_tokens: list[int]) -> None:
+    """Reject malformed current ROSA state instead of silently rebuilding it."""
+    if state.tokens != row_tokens:
+        raise RuntimeError(
+            "Version-4 chat ROSA automaton tokens do not match rosa_past_tokens."
+        )
+    try:
+        num_states = int(state.num_states)
+        last_state = int(state.last_state)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError("Chat ROSA state has invalid scalar metadata.") from exc
+    if (
+        num_states <= 0
+        or num_states > 2 * len(row_tokens) + 1
+        or last_state < 0
+        or last_state >= num_states
+    ):
+        raise RuntimeError("Chat ROSA state has invalid state-count metadata.")
+    if not isinstance(state.transitions, dict):
+        raise RuntimeError("Chat ROSA state transitions must be a dictionary.")
+    for name in ("suffix_links", "lengths", "endpos"):
+        value = getattr(state, name, None)
+        if not isinstance(value, list) or len(value) != num_states:
+            raise RuntimeError(
+                f"Chat ROSA state {name} does not exactly cover its declared states."
+            )
+    if (
+        state.suffix_links[0] != -1
+        or state.lengths[0] != 0
+        or set(state.transitions) != set(range(num_states))
+    ):
+        raise RuntimeError("Chat ROSA state has an invalid root/state table.")
+
+    token_count = len(row_tokens)
+    for index in range(num_states):
+        suffix_link = state.suffix_links[index]
+        length = state.lengths[index]
+        end_position = state.endpos[index]
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (suffix_link, length, end_position)
+        ):
+            raise RuntimeError("Chat ROSA state arrays must contain integers.")
+        if length < 0 or length > token_count:
+            raise RuntimeError("Chat ROSA state contains an invalid match length.")
+        if end_position < -1 or end_position >= token_count:
+            raise RuntimeError("Chat ROSA state contains an invalid end position.")
+        if index == 0:
+            if suffix_link != -1:
+                raise RuntimeError("Chat ROSA root must have suffix link -1.")
+        elif (
+            suffix_link < 0
+            or suffix_link >= num_states
+            or state.lengths[suffix_link] >= length
+        ):
+            # Strictly decreasing lengths make every suffix walk finite and
+            # rule out cycles in untrusted persisted automata.
+            raise RuntimeError("Chat ROSA state contains an invalid suffix link.")
+    if state.lengths[last_state] != token_count:
+        raise RuntimeError("Chat ROSA final state does not cover its token history.")
+
+    history_symbols = set(row_tokens)
+    for source, transitions in state.transitions.items():
+        if (
+            isinstance(source, bool)
+            or not isinstance(source, int)
+            or source < 0
+            or source >= num_states
+            or not isinstance(transitions, dict)
+        ):
+            raise RuntimeError("Chat ROSA state contains an invalid transition source.")
+        for token, target in transitions.items():
+            if (
+                isinstance(token, bool)
+                or not isinstance(token, int)
+                or token not in history_symbols
+                or isinstance(target, bool)
+                or not isinstance(target, int)
+                or target < 0
+                or target >= num_states
+                or state.lengths[target] <= state.lengths[source]
+            ):
+                raise RuntimeError("Chat ROSA state contains an invalid transition.")
+
+
+def _validate_strict_rosa_state(
+    payload: Dict[str, Any],
+    config: Any,
+    batch_size: Optional[int],
+    total_tokens: int,
+) -> None:
+    past_tokens = payload.get("rosa_past_tokens")
+    rosa_states = payload.get("rosa_states")
+    if past_tokens is None:
+        if rosa_states is not None:
+            raise RuntimeError(
+                "Version-4 chat state cannot contain ROSA automata without token history."
+            )
+        return
+    if not torch.is_tensor(past_tokens):
+        raise RuntimeError("Chat state rosa_past_tokens must be a tensor.")
+    if past_tokens.dtype != torch.long or past_tokens.dim() != 2:
+        raise RuntimeError(
+            "Chat state rosa_past_tokens must have int64 [B, T] layout."
+        )
+    rosa_batch = int(past_tokens.shape[0])
+    if rosa_batch <= 0:
+        raise RuntimeError("Chat state ROSA history must contain at least one batch row.")
+    if batch_size is not None and rosa_batch != batch_size:
+        raise RuntimeError(
+            f"Chat state ROSA batch {rosa_batch} does not match recurrent batch "
+            f"{batch_size}."
+        )
+    vocab_size = int(_config_value(config, "vocab_size", 0) or 0)
+    if vocab_size <= 0:
+        raise RuntimeError("Current model has no valid vocabulary for ROSA validation.")
+    if past_tokens.numel() > 0:
+        valid_ids = (past_tokens >= 0) & (past_tokens < vocab_size)
+        if not bool(valid_ids.all().item()):
+            raise RuntimeError(
+                "Chat state ROSA history contains token IDs outside the model vocabulary."
+            )
+    if total_tokens < int(past_tokens.shape[1]):
+        raise RuntimeError(
+            "Chat state token offset is shorter than its retained ROSA history."
+        )
+    if rosa_states is None:
+        # A checked rebuild from token history is an explicitly supported state.
+        return
+    if not isinstance(rosa_states, (list, tuple)) or len(rosa_states) != rosa_batch:
+        raise RuntimeError(
+            "Chat state rosa_states must contain exactly one automaton per batch row."
+        )
+    for row, state in enumerate(rosa_states):
+        if state is None:
+            continue
+        if not isinstance(state, ROSAState):
+            raise RuntimeError("Chat state contains an unsupported ROSA automaton type.")
+        _validate_rosa_state_structure(state, past_tokens[row].tolist())
 
 
 def validate_chat_state_payload_compatible(
@@ -302,7 +517,15 @@ def validate_chat_state_payload_compatible(
         raise RuntimeError(
             "Version-4 chat state is missing recurrent_state_layout metadata."
         )
-    _validate_strict_recurrent_shapes(payload, model)
+    batch_size = _validate_strict_recurrent_shapes(payload, model)
+    _validate_strict_context_states(payload, config, batch_size)
+    total_tokens = _validated_total_tokens(payload)
+    _validate_strict_rosa_state(
+        payload,
+        config,
+        batch_size,
+        total_tokens,
+    )
 
     expected_contract = payload.get("architecture_contract")
     expected_hash = payload.get("architecture_contract_sha256")

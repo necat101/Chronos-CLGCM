@@ -15,6 +15,7 @@ from hierarchos.utils.rosa import (
     ROSA_BOUNDED_CONTEXT_MODE,
     ROSA_UNBOUNDED_CONTEXT_MODE,
 )
+from hierarchos.utils.safe_loading import load_tensor_payload_safely
 
 
 def _shared_epoch_counter():
@@ -71,9 +72,18 @@ class LengthGroupedBatchSampler(Sampler):
         )
         self.seed = int(seed if seed is not None else torch.initial_seed()) % (2**63 - 1)
         self.epoch = 0
+        # A resume cursor is deliberately separate from epoch/seed state. It
+        # changes only where iteration begins, never the deterministic epoch
+        # permutation itself. Keeping __len__ at the full-epoch value also
+        # preserves scheduler and accumulation geometry across a mid-epoch
+        # resume.
+        self.start_batch = 0
 
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
+
+    def set_start_batch(self, start_batch: int):
+        self.start_batch = max(0, min(int(start_batch), len(self)))
 
     def __len__(self):
         if self.drop_last:
@@ -121,7 +131,12 @@ class LengthGroupedBatchSampler(Sampler):
                     batch_order = torch.randperm(batch_count, generator=generator)
                 else:
                     batch_order = range(batch_count)
-                for local_batch_idx in batch_order:
+                for local_output_idx, local_batch_idx in enumerate(batch_order):
+                    global_batch_idx = (
+                        (bucket_start // self.batch_size) + local_output_idx
+                    )
+                    if global_batch_idx < self.start_batch:
+                        continue
                     batch_start = bucket_start + int(local_batch_idx) * self.batch_size
                     batch_end = min(bucket_end, batch_start + self.batch_size)
                     if batch_end - batch_start == self.batch_size or not self.drop_last:
@@ -133,7 +148,9 @@ class LengthGroupedBatchSampler(Sampler):
             batch_order = torch.randperm(batch_count, generator=generator)
         else:
             batch_order = range(batch_count)
-        for batch_idx in batch_order:
+        for output_batch_idx, batch_idx in enumerate(batch_order):
+            if output_batch_idx < self.start_batch:
+                continue
             batch_start = int(batch_idx) * self.batch_size
             batch_end = min(sample_count, batch_start + self.batch_size)
             if batch_end - batch_start == self.batch_size or not self.drop_last:
@@ -146,9 +163,13 @@ class EpochShuffleSampler(Sampler):
         self.shuffle = bool(shuffle)
         self.seed = int(seed if seed is not None else torch.initial_seed()) % (2**63 - 1)
         self.epoch = 0
+        self.start_index = 0
 
     def set_epoch(self, epoch: int):
         self.epoch = int(epoch)
+
+    def set_start_index(self, start_index: int):
+        self.start_index = max(0, min(int(start_index), len(self.data_source)))
 
     def __len__(self):
         return len(self.data_source)
@@ -158,9 +179,10 @@ class EpochShuffleSampler(Sampler):
         if self.shuffle and length > 1:
             generator = torch.Generator()
             generator.manual_seed((self.seed + self.epoch) % (2**63 - 1))
-            yield from torch.randperm(length, generator=generator).tolist()
+            indices = torch.randperm(length, generator=generator)
+            yield from indices[self.start_index:].tolist()
         else:
-            yield from range(length)
+            yield from range(self.start_index, length)
 
 _INTEGER_LENGTH_DTYPES = {
     torch.uint8,
@@ -307,6 +329,88 @@ def _create_dataloader(dataset, *, batch_size=None, collate_fn=None, num_workers
             raise
         kwargs.pop("in_order", None)
         return DataLoader(**kwargs)
+
+
+def _load_tensor_artifact_weights_only(path):
+    """Load project tensor artifacts without permitting arbitrary pickle code."""
+    return load_tensor_payload_safely(path, map_location="cpu")
+
+
+def _validate_pt_chunk_container(data, path):
+    if not isinstance(data, (list, tuple)):
+        raise ValueError(
+            f"PT chunk {path} must contain a list/tuple of tensor sample mappings"
+        )
+    return data
+
+
+def _validate_pt_chunk_item(item, path, index):
+    if not isinstance(item, dict):
+        raise ValueError(
+            f"PT chunk {path} sample {index} must be a mapping"
+        )
+    input_ids = item.get("input_ids")
+    labels = item.get("labels")
+    if not torch.is_tensor(input_ids) or not torch.is_tensor(labels):
+        raise ValueError(
+            f"PT chunk {path} sample {index} is missing tensor input_ids/labels"
+        )
+    if input_ids.ndim != 1 or labels.ndim != 1 or input_ids.shape != labels.shape:
+        raise ValueError(
+            f"PT chunk {path} sample {index} has incompatible input/label geometry"
+        )
+    if (
+        input_ids.dtype not in _INTEGER_LENGTH_DTYPES
+        or labels.dtype not in _INTEGER_LENGTH_DTYPES
+    ):
+        raise ValueError(
+            f"PT chunk {path} sample {index} input_ids/labels must use integer dtypes"
+        )
+    attention_mask = item.get("attention_mask")
+    if attention_mask is not None and (
+        not torch.is_tensor(attention_mask)
+        or attention_mask.ndim != 1
+        or attention_mask.shape != input_ids.shape
+        or (
+            attention_mask.dtype != torch.bool
+            and attention_mask.dtype not in _INTEGER_LENGTH_DTYPES
+        )
+    ):
+        raise ValueError(
+            f"PT chunk {path} sample {index} has an incompatible attention mask"
+        )
+    for field_name in ("rosa_ids", "loss_weights"):
+        value = item.get(field_name)
+        if value is not None and (
+            not torch.is_tensor(value)
+            or value.ndim != 1
+            or value.shape != input_ids.shape
+        ):
+            raise ValueError(
+                f"PT chunk {path} sample {index} has incompatible {field_name}"
+            )
+    rosa_ids = item.get("rosa_ids")
+    if rosa_ids is not None and rosa_ids.dtype not in _INTEGER_LENGTH_DTYPES:
+        raise ValueError(
+            f"PT chunk {path} sample {index} rosa_ids must use an integer dtype"
+        )
+    loss_weights = item.get("loss_weights")
+    if loss_weights is not None and not (
+        loss_weights.is_floating_point()
+        or loss_weights.dtype in _INTEGER_LENGTH_DTYPES
+    ):
+        raise ValueError(
+            f"PT chunk {path} sample {index} loss_weights must be numeric"
+        )
+    if loss_weights is not None and (
+        not bool(torch.isfinite(loss_weights).all().item())
+        or bool((loss_weights < 0).any().item())
+    ):
+        raise ValueError(
+            f"PT chunk {path} sample {index} loss_weights must be finite and nonnegative"
+        )
+    return item
+
 
 def _as_long_tensor(value):
     if isinstance(value, torch.Tensor):
@@ -942,7 +1046,7 @@ def create_dataloader_for_chunked(path, max_length, batch_size, num_workers=0,
 class PTChunkedDataset(Dataset):
     def __init__(self, directory_path: str, max_length: int, cache_size: int = 2):
         super().__init__()
-        self.directory_path = directory_path
+        self.directory_path = os.path.abspath(directory_path)
         self.max_length = max_length
         self.cache_size = max(1, int(cache_size or 1))
         self.chunk_pointers = []
@@ -958,7 +1062,37 @@ class PTChunkedDataset(Dataset):
                 line = line.strip()
                 if not line: continue
                 entry = json.loads(line)
-                self.chunk_pointers.append((os.path.join(self.directory_path, entry["file_path"]), entry["index_in_file"]))
+                if not isinstance(entry, dict):
+                    raise ValueError("Each PT manifest row must be a JSON object")
+                relative_path = entry.get("file_path")
+                if not isinstance(relative_path, str) or not relative_path:
+                    raise ValueError("PT manifest row is missing a non-empty file_path")
+                chunk_path = os.path.abspath(
+                    os.path.join(self.directory_path, relative_path)
+                )
+                try:
+                    inside_root = (
+                        os.path.normcase(os.path.commonpath([
+                            self.directory_path,
+                            chunk_path,
+                        ]))
+                        == os.path.normcase(self.directory_path)
+                    )
+                except ValueError:
+                    inside_root = False
+                if not inside_root:
+                    raise ValueError(
+                        f"PT manifest path escapes its dataset directory: {relative_path!r}"
+                    )
+                try:
+                    index_in_file = int(entry["index_in_file"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "PT manifest row has an invalid index_in_file"
+                    ) from exc
+                if index_in_file < 0:
+                    raise ValueError("PT manifest index_in_file must be nonnegative")
+                self.chunk_pointers.append((chunk_path, index_in_file))
                 length = entry.get("length", entry.get("seq_len", entry.get("valid_length")))
                 try:
                     self.sample_lengths.append(max(1, int(length)))
@@ -974,7 +1108,10 @@ class PTChunkedDataset(Dataset):
             self.last_loaded_data = cached
             return cached
 
-        data = torch.load(path, map_location='cpu')
+        data = _validate_pt_chunk_container(
+            _load_tensor_artifact_weights_only(path),
+            path,
+        )
         self._chunk_cache[path] = data
         self._chunk_cache.move_to_end(path)
         while len(self._chunk_cache) > self.cache_size:
@@ -985,12 +1122,17 @@ class PTChunkedDataset(Dataset):
 
     def __getitem__(self, idx):
         path, index = self.chunk_pointers[idx]
-        item = self._get_chunk(path)[index]
-        if isinstance(item, dict):
-            length = self.sample_lengths[idx] if idx < len(self.sample_lengths) else None
-            if length is not None and "_length" not in item:
-                item = dict(item)
-                item["_length"] = length
+        data = self._get_chunk(path)
+        if index >= len(data):
+            raise IndexError(
+                f"PT manifest index {index} is outside chunk {path} "
+                f"with {len(data)} sample(s)"
+            )
+        item = _validate_pt_chunk_item(data[index], path, index)
+        length = self.sample_lengths[idx] if idx < len(self.sample_lengths) else None
+        if length is not None and "_length" not in item:
+            item = dict(item)
+            item["_length"] = length
         return item
     def get_sample_lengths(self):
         if self.sample_lengths and all(length is not None for length in self.sample_lengths):
@@ -1004,14 +1146,27 @@ class PTChunkedDataset(Dataset):
 
         for path, entries in positions_by_path.items():
             try:
-                data = torch.load(path, map_location='cpu')
-            except Exception:
-                return None
+                data = _validate_pt_chunk_container(
+                    _load_tensor_artifact_weights_only(path),
+                    path,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Could not safely inspect PT training chunk {path}: {exc}"
+                ) from exc
             for position, index in entries:
                 try:
-                    lengths[position] = _sample_effective_length(data[index], self.max_length)
-                except Exception:
-                    lengths[position] = self.max_length
+                    if index < 0 or index >= len(data):
+                        raise IndexError(index)
+                    item = _validate_pt_chunk_item(data[index], path, index)
+                    lengths[position] = _sample_effective_length(
+                        item,
+                        self.max_length,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Invalid PT training sample {path}[{index}]: {exc}"
+                    ) from exc
 
         self.sample_lengths = lengths
         return self.sample_lengths
@@ -1078,10 +1233,7 @@ class TokenizedBinaryDataset(Dataset):
         if not os.path.exists(data_path):
             raise FileNotFoundError(f"Token cache data file not found: {data_path}")
 
-        try:
-            index = torch.load(index_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            index = torch.load(index_path, map_location="cpu")
+        index = load_tensor_payload_safely(index_path, map_location="cpu")
         if not isinstance(index, dict) or "offsets" not in index or "lengths" not in index:
             raise ValueError("Token cache index must contain offsets and lengths")
         self.offsets = index["offsets"].to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
@@ -1297,57 +1449,94 @@ class TokenizedBinaryDataset(Dataset):
             raise ValueError("Token cache is missing palette-RLE loss-weight metadata")
         try:
             run_offsets = torch.as_tensor(
-                index["loss_run_offsets"], dtype=torch.long, device="cpu"
+                index["loss_run_offsets"], device="cpu"
             ).reshape(-1).contiguous()
             run_ends_long = torch.as_tensor(
-                index["loss_run_ends"], dtype=torch.long, device="cpu"
+                index["loss_run_ends"], device="cpu"
             ).reshape(-1).contiguous()
             run_codes_long = torch.as_tensor(
-                index["loss_run_codes"], dtype=torch.long, device="cpu"
+                index["loss_run_codes"], device="cpu"
             ).reshape(-1).contiguous()
         except (TypeError, ValueError, RuntimeError) as exc:
             raise ValueError("Token cache has invalid palette-RLE loss-weight tensors") from exc
+        for name, value in (
+            ("loss-run offsets", run_offsets),
+            ("loss-run ends", run_ends_long),
+            ("loss-run codes", run_codes_long),
+        ):
+            if value.dtype not in _INTEGER_LENGTH_DTYPES:
+                raise ValueError(f"Token-cache {name} must use an integer dtype")
+        # Offsets participate in indexing and subtraction throughout validation;
+        # retain compact int32 ends/uint8 codes but canonicalize offsets to long.
+        run_offsets = run_offsets.to(dtype=torch.long)
 
         sample_count = int(raw_lengths.numel())
+        validation_chunk = 1_048_576
         if run_offsets.numel() != sample_count + 1:
             raise ValueError(
                 "Token-cache loss-run offsets must contain one entry per sample plus one"
             )
-        if int(run_offsets[0].item()) != 0 or bool((run_offsets < 0).any().item()):
+        offsets_nonnegative = True
+        for start in range(0, run_offsets.numel(), validation_chunk):
+            if bool((run_offsets[start:start + validation_chunk] < 0).any().item()):
+                offsets_nonnegative = False
+                break
+        if int(run_offsets[0].item()) != 0 or not offsets_nonnegative:
             raise ValueError("Token-cache loss-run offsets must start at zero and be nonnegative")
-        run_counts = run_offsets[1:] - run_offsets[:-1]
-        if bool((run_counts <= 0).any().item()):
-            raise ValueError("Every token-cache sample must contain at least one loss-weight run")
+        for start in range(0, sample_count, validation_chunk):
+            stop = min(sample_count, start + validation_chunk)
+            if bool((run_offsets[start + 1:stop + 1] <= run_offsets[start:stop]).any().item()):
+                raise ValueError("Every token-cache sample must contain at least one loss-weight run")
         run_count = int(run_offsets[-1].item())
         if run_count != run_ends_long.numel() or run_count != run_codes_long.numel():
             raise ValueError("Token-cache loss-run offsets/ends/codes size mismatch")
-        if bool((run_ends_long <= 0).any().item()):
-            raise ValueError("Token-cache loss-run ends must be positive")
-        if bool((run_codes_long < 0).any().item()) or bool(
-            (run_codes_long >= palette.numel()).any().item()
-        ):
-            raise ValueError("Token-cache loss-run code is outside the declared palette")
+        for start in range(0, run_count, validation_chunk):
+            stop = min(run_count, start + validation_chunk)
+            ends_chunk = run_ends_long[start:stop]
+            codes_chunk = run_codes_long[start:stop]
+            if bool((ends_chunk <= 0).any().item()):
+                raise ValueError("Token-cache loss-run ends must be positive")
+            if bool((codes_chunk < 0).any().item()) or bool(
+                (codes_chunk >= palette.numel()).any().item()
+            ):
+                raise ValueError("Token-cache loss-run code is outside the declared palette")
 
-        final_run_indices = run_offsets[1:] - 1
-        if not torch.equal(
-            run_ends_long.index_select(0, final_run_indices),
-            raw_lengths,
-        ):
-            raise ValueError(
-                "Each token-cache sample's final loss run must end at its stored length"
-            )
-        if run_count > 1:
-            starts_new_sample = torch.zeros(run_count, dtype=torch.bool)
-            if sample_count > 1:
-                starts_new_sample[run_offsets[1:-1]] = True
-            invalid_order = (
-                (run_ends_long[1:] <= run_ends_long[:-1])
-                & ~starts_new_sample[1:]
-            )
-            if bool(invalid_order.any().item()):
+        for start in range(0, sample_count, validation_chunk):
+            stop = min(sample_count, start + validation_chunk)
+            final_run_indices = run_offsets[start + 1:stop + 1] - 1
+            if not torch.equal(
+                run_ends_long.index_select(0, final_run_indices),
+                raw_lengths[start:stop],
+            ):
                 raise ValueError(
-                    "Token-cache loss-run ends must increase strictly within each sample"
+                    "Each token-cache sample's final loss run must end at its stored length"
                 )
+        if run_count > 1:
+            sample_boundaries = run_offsets[1:-1]
+            for start in range(1, run_count, validation_chunk):
+                stop = min(run_count, start + validation_chunk)
+                invalid_order = (
+                    run_ends_long[start:stop]
+                    <= run_ends_long[start - 1:stop - 1]
+                )
+                if sample_boundaries.numel() > 0:
+                    left = int(torch.searchsorted(
+                        sample_boundaries,
+                        torch.tensor(start, dtype=sample_boundaries.dtype),
+                    ).item())
+                    right = int(torch.searchsorted(
+                        sample_boundaries,
+                        torch.tensor(stop, dtype=sample_boundaries.dtype),
+                    ).item())
+                    if right > left:
+                        boundary_positions = (
+                            sample_boundaries[left:right] - start
+                        )
+                        invalid_order[boundary_positions] = False
+                if bool(invalid_order.any().item()):
+                    raise ValueError(
+                        "Token-cache loss-run ends must increase strictly within each sample"
+                    )
 
         self.loss_weight_palette = palette.contiguous()
         self._loss_weight_palette_values = tuple(

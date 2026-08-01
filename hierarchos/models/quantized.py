@@ -7,6 +7,7 @@ import os
 from typing import Optional, Tuple, Dict, Any
 from .rwkv_cell import RWKVCell
 from .ltm import LTMModule
+from .revisions import architecture_default_training_chunk_size
 from ..utils.device import is_directml_device, get_device_type
 from torch.utils.data import Dataset, DataLoader
 
@@ -269,7 +270,15 @@ class QuantizedHierarchos:
                                  momentum=getattr(self.config, 'ltm_momentum', 0.9),
                                  wd=getattr(self.config, 'ltm_weight_decay', 1e-4),
                                  forget_rate=getattr(self.config, 'ltm_forget_rate', 0.01),
-                                 reference_chunk_len=getattr(self.config, 'reference_chunk_len', getattr(self.config, 'training_chunk_size', 128)),
+                                 reference_chunk_len=getattr(
+                                     self.config,
+                                     'reference_chunk_len',
+                                     getattr(
+                                         self.config,
+                                         'training_chunk_size',
+                                         architecture_default_training_chunk_size(self.config),
+                                     ),
+                                 ),
                                  score_grad_scale=getattr(self.config, 'ltm_score_grad_scale', 1.0))
                                  
             ltm_state = {}

@@ -28,10 +28,16 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ..utils.device import is_directml_device
 from ..utils.checkpoint import (
+    LTM_PERSISTENT_METADATA_VERSION,
+    LTM_WALLCLOCK_SEMANTICS,
+    load_checkpoint_payload_compatible,
     load_full_model_with_config,
     sanitize_model_state_dict,
     save_checkpoint_safely,
 )
+from ..utils.tokenizer import tokenizer_identity, validate_inference_tokenizer_identity
+from ..utils.rosa import ROSAState
+from ..utils.safe_loading import load_tensor_payload_safely
 from ..models.revisions import architecture_contract, architecture_contract_hash
 from .chat_state import (
     CHAT_STATE_KIND,
@@ -215,7 +221,79 @@ def _default_chat_state_path(model_path: str) -> str:
 
 
 def _normalize_chat_state_path(path: str) -> str:
-    return os.path.abspath(os.path.expanduser((path or "").strip().strip('"')))
+    raw_path = os.fspath(path) if path is not None else ""
+    return os.path.abspath(os.path.expanduser(raw_path.strip().strip('"')))
+
+
+def _chat_runtime_identity(config, model=None, tokenizer=None):
+    """Bind a continuation state to the function that produced its carriers.
+
+    Architecture geometry alone is insufficient: two checkpoints with the same
+    shapes produce different recurrent values, and equal vocabularies can still
+    tokenize text differently. Safe checkpoints expose a cheap SHA-256 sidecar;
+    legacy files fall back to stable file attributes plus retained run metadata.
+    """
+    identity = {
+        "version": 1,
+        "architecture_contract_sha256": architecture_contract_hash(config),
+    }
+    metadata = getattr(model, "_hierarchos_checkpoint_metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    for source_key in ("checkpoint_kind", "completed_epoch"):
+        value = metadata.get(source_key)
+        if value is not None:
+            identity[source_key] = value
+    run_identity = metadata.get("run_identity")
+    if isinstance(run_identity, dict) and run_identity.get("sha256"):
+        identity["run_identity_sha256"] = str(run_identity["sha256"])
+
+    source = metadata.get("source_weights_path")
+    if isinstance(source, str) and source:
+        source = os.path.abspath(source)
+        checksum_path = source + ".sha256"
+        try:
+            with open(checksum_path, "r", encoding="utf-8") as checksum_file:
+                digest = checksum_file.read().strip().split()[0].lower()
+            if len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+                identity["checkpoint_sha256"] = digest
+        except (OSError, IndexError):
+            pass
+        if "checkpoint_sha256" not in identity:
+            try:
+                stat = os.stat(source)
+                identity.update({
+                    "source_basename": os.path.basename(source),
+                    "source_size": int(stat.st_size),
+                    "source_mtime_ns": int(stat.st_mtime_ns),
+                })
+            except OSError:
+                pass
+
+    if tokenizer is not None:
+        current_tokenizer = tokenizer_identity(tokenizer)
+        identity["tokenizer_vocab_size"] = current_tokenizer.get("vocab_size")
+        identity["tokenizer_sha256"] = current_tokenizer.get("sha256")
+        behavior_digest = current_tokenizer.get("behavior_sha256_v2")
+        if behavior_digest is not None:
+            identity["tokenizer_behavior_sha256_v2"] = behavior_digest
+    return identity
+
+
+def _validate_chat_runtime_identity(payload, config, model=None, tokenizer=None):
+    """Validate new weight/tokenizer bindings; legacy states lack this proof."""
+    saved = payload.get("runtime_identity")
+    if saved is None:
+        return False
+    if not isinstance(saved, dict):
+        raise RuntimeError("Chat state has malformed runtime identity metadata.")
+    current = _chat_runtime_identity(config, model=model, tokenizer=tokenizer)
+    if saved != current:
+        raise RuntimeError(
+            "Chat state belongs to different model weights or tokenizer behavior. "
+            "Start a fresh state for the loaded runtime."
+        )
+    return True
 
 
 def save_hierarchical_chat_state(
@@ -231,6 +309,7 @@ def save_hierarchical_chat_state(
     drift_state,
     ltm_state=None,
     total_tokens_generated,
+    tokenizer=None,
 ):
     """Save only tiny chat continuation tensors; never LTM/model weights."""
     path = _normalize_chat_state_path(path)
@@ -253,6 +332,11 @@ def save_hierarchical_chat_state(
         "drift_state": _tensor_to_cpu(drift_state),
         "rosa_past_tokens": rosa_past_tokens,
         "rosa_states": rosa_states,
+        "runtime_identity": _chat_runtime_identity(
+            config,
+            model=model,
+            tokenizer=tokenizer,
+        ),
     }
     payload.update(chat_state_architecture_metadata(config))
     payload.update(
@@ -263,18 +347,39 @@ def save_hierarchical_chat_state(
             l_state=l_state,
         )
     )
+    # Refuse to persist a state that the current loader would reject. This
+    # catches corrupted live carriers before an atomic save replaces the last
+    # known-good continuation file.
+    validate_chat_state_payload_compatible(
+        payload,
+        config,
+        model=model,
+    )
+    _validate_chat_runtime_identity(
+        payload,
+        config,
+        model=model,
+        tokenizer=tokenizer,
+    )
     tmp_path = path + ".tmp"
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
     return path
 
 
-def load_hierarchical_chat_state(path, *, config, device, model=None):
+def load_hierarchical_chat_state(
+    path,
+    *,
+    config,
+    device,
+    model=None,
+    tokenizer=None,
+):
     """Load a tiny chat state file without restoring LTM working memory."""
     path = _normalize_chat_state_path(path)
     if not os.path.exists(path):
         raise FileNotFoundError(f"Chat state file not found: {path}")
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload = load_checkpoint_payload_compatible(path, map_location="cpu")
     if not isinstance(payload, dict) or payload.get("kind") != CHAT_STATE_KIND:
         raise RuntimeError(f"Not a Hierarchos chat runtime state file: {path}")
 
@@ -282,6 +387,12 @@ def load_hierarchical_chat_state(path, *, config, device, model=None):
         payload,
         config,
         model=model,
+    )
+    _validate_chat_runtime_identity(
+        payload,
+        config,
+        model=model,
+        tokenizer=tokenizer,
     )
 
     def tensor(name):
@@ -330,7 +441,31 @@ def _rosa_past_tokens_from_ltm_state(ltm_state):
     """Extract full ROSA token history from an LTM state tuple."""
     if ltm_state is None or not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 3:
         return None
-    return _tensor_to_cpu(ltm_state[2])
+    past_tokens = _tensor_to_cpu(ltm_state[2])
+    if past_tokens is not None:
+        return past_tokens
+
+    # The live incremental path keeps ROSAState authoritative so it need not
+    # clone/cat an ever-growing history tensor on every generated token.
+    # Materialize the portable tensor exactly once when state is serialized.
+    if len(ltm_state) < 4 or ltm_state[3] is None:
+        return None
+    rosa_states = ltm_state[3]
+    if not isinstance(rosa_states, (list, tuple)) or not rosa_states:
+        raise ValueError("Cannot save malformed ROSA state history.")
+    if all(state is None for state in rosa_states):
+        return None
+    if any(not isinstance(state, ROSAState) for state in rosa_states):
+        raise ValueError(
+            "Cannot save ROSA history without one valid automaton per batch row."
+        )
+    histories = [list(state.tokens) for state in rosa_states]
+    lengths = {len(history) for history in histories}
+    if len(lengths) != 1:
+        raise ValueError(
+            "Cannot save batched ROSA histories with different retained lengths."
+        )
+    return torch.tensor(histories, dtype=torch.long)
 
 
 def _rosa_states_from_ltm_state(ltm_state):
@@ -430,6 +565,21 @@ def should_stop_generation_from_uncertainty(logits, response_ids, tokenizer=None
     if logits is None:
         return False
     try:
+        generated_count = len(response_ids or [])
+        entropy_threshold = float(_setting_value(settings, "entropy_stop_threshold", 0.0) or 0.0)
+        min_tokens = int(_setting_value(settings, "entropy_stop_min_tokens", 3) or 0)
+        top_prob_ceiling = float(_setting_value(settings, "entropy_stop_top_prob", 0.05) or 0.0)
+        eos_prob_threshold = float(_setting_value(settings, "eos_stop_prob", 0.0) or 0.0)
+        eos_id = getattr(tokenizer, "eos_token_id", None) if tokenizer is not None else None
+
+        entropy_guard_active = entropy_threshold > 0 and generated_count >= min_tokens
+        eos_guard_active = eos_prob_threshold > 0 and generated_count >= 1 and eos_id is not None
+        # Both guards are opt-in and disabled by default. Avoid a second
+        # vocabulary-wide softmax (and its host synchronizations) before the
+        # sampler when neither guard can stop this token.
+        if not entropy_guard_active and not eos_guard_active:
+            return False
+
         if logits.dim() == 3:
             logits = logits[:, -1, :]
         logits = logits.float()
@@ -437,27 +587,18 @@ def should_stop_generation_from_uncertainty(logits, response_ids, tokenizer=None
         if torch.isnan(probs).any() or torch.isinf(probs).any():
             return True
 
-        generated_count = len(response_ids or [])
-        entropy_threshold = float(_setting_value(settings, "entropy_stop_threshold", 0.0) or 0.0)
-        min_tokens = int(_setting_value(settings, "entropy_stop_min_tokens", 3) or 0)
-        top_prob_ceiling = float(_setting_value(settings, "entropy_stop_top_prob", 0.05) or 0.0)
-        eos_prob_threshold = float(_setting_value(settings, "eos_stop_prob", 0.0) or 0.0)
-
-        top_prob = float(probs.max().item())
-        eos_id = getattr(tokenizer, "eos_token_id", None) if tokenizer is not None else None
         if (
-            eos_id is not None
+            eos_guard_active
             and 0 <= int(eos_id) < probs.shape[-1]
-            and eos_prob_threshold > 0
-            and generated_count >= 1
         ):
             eos_prob = float(probs[0, int(eos_id)].item())
             if eos_prob >= eos_prob_threshold:
                 return True
 
-        if entropy_threshold <= 0 or generated_count < min_tokens:
+        if not entropy_guard_active:
             return False
 
+        top_prob = float(probs.max().item())
         entropy = -((probs * torch.log(probs + 1e-10)).sum(-1)).item()
         return entropy >= entropy_threshold and (
             top_prob_ceiling <= 0 or top_prob <= top_prob_ceiling
@@ -474,53 +615,129 @@ def sample_next_token(
     top_p=1.0,
     repetition_penalty=1.0,
     previous_tokens=None,
+    _logits_prevalidated=False,
 ):
-    """Sample one token without mutating caller-owned logits."""
+    """Sample one token without mutating caller-owned logits.
+
+    ``_logits_prevalidated`` is reserved for logits returned directly by
+    ``HierarchosCore``, whose forward contract has already performed the same
+    full-vocabulary finite audit. Public/direct callers retain the fail-closed
+    check by default.
+    """
     if logits.dim() == 1:
         logits = logits.unsqueeze(0)
     if logits.dim() != 2:
         raise ValueError(f"Expected [batch, vocab] logits, got shape {tuple(logits.shape)}")
-    if not bool(torch.isfinite(logits).all().item()):
+    if not _logits_prevalidated and not bool(torch.isfinite(logits).all().item()):
         raise RuntimeError("Refusing to sample from non-finite logits.")
 
-    scores = logits.float().clone()
     repetition_penalty = float(repetition_penalty)
     if repetition_penalty <= 0:
         raise ValueError("repetition_penalty must be greater than zero")
+    penalized_token_ids = []
     if previous_tokens is not None and len(previous_tokens) > 0 and repetition_penalty != 1.0:
-        token_ids = sorted({int(token) for token in previous_tokens if 0 <= int(token) < scores.shape[-1]})
-        if token_ids:
-            token_index = torch.tensor(token_ids, device=scores.device, dtype=torch.long)
-            selected = scores.index_select(1, token_index)
-            selected = torch.where(selected > 0, selected / repetition_penalty, selected * repetition_penalty)
-            scores.index_copy_(1, token_index, selected)
+        token_ids = sorted(
+            {
+                int(token)
+                for token in previous_tokens
+                if 0 <= int(token) < logits.shape[-1]
+            }
+        )
+        penalized_token_ids = token_ids
 
     temperature = float(temperature)
-    if temperature <= 0:
-        return scores.argmax(dim=-1, keepdim=True)
-    scores.div_(max(temperature, 1e-6))
-
     top_k = int(top_k or 0)
-    if top_k > 0 and top_k < scores.shape[-1]:
-        threshold = torch.topk(scores, top_k, dim=-1).values[:, -1:]
-        scores.masked_fill_(scores < threshold, -torch.inf)
+    candidate_indices = None
+    use_compact_top_k = top_k > 0 and top_k < logits.shape[-1]
+
+    if not penalized_token_ids and temperature <= 0:
+        # Argmax is dtype-invariant for the already-materialized logits. Avoid
+        # copying/promoting the complete vocabulary on the common greedy path.
+        return logits.argmax(dim=-1, keepdim=True)
+
+    if not penalized_token_ids and use_compact_top_k:
+        # Keep the compact candidate representation. The previous path masked
+        # the full vocabulary and then sorted/normalized all V entries for
+        # nucleus sampling even though only K entries could be selected. Select
+        # in the model's existing dtype, then promote only K scores to FP32.
+        scores, candidate_indices = torch.topk(
+            logits,
+            top_k,
+            dim=-1,
+            largest=True,
+            sorted=True,
+        )
+        scores = scores.float()
+    else:
+        # ``copy=True`` guarantees caller immutability without the extra
+        # conversion-then-clone allocation incurred by ``float().clone()`` for
+        # reduced-precision logits.
+        scores = logits.to(dtype=torch.float32, copy=True)
+        if penalized_token_ids:
+            token_index = torch.tensor(
+                penalized_token_ids,
+                device=scores.device,
+                dtype=torch.long,
+            )
+            selected = scores.index_select(1, token_index)
+            selected = torch.where(
+                selected > 0,
+                selected / repetition_penalty,
+                selected * repetition_penalty,
+            )
+            scores.index_copy_(1, token_index, selected)
+        if temperature <= 0:
+            return scores.argmax(dim=-1, keepdim=True)
+        if use_compact_top_k:
+            scores, candidate_indices = torch.topk(
+                scores,
+                top_k,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            )
+
+    scores.div_(max(temperature, 1e-6))
 
     top_p = float(top_p)
     if not 0.0 < top_p <= 1.0:
         raise ValueError("top_p must be in the interval (0, 1]")
     if top_p < 1.0:
-        sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+        if candidate_indices is None:
+            sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+        else:
+            # torch.topk(..., sorted=True) already produced descending scores.
+            sorted_scores, sorted_indices = scores, None
         cumulative_probs = torch.cumsum(F.softmax(sorted_scores, dim=-1), dim=-1)
         remove = cumulative_probs > top_p
         remove[..., 1:] = remove[..., :-1].clone()
         remove[..., 0] = False
-        remove = torch.zeros_like(remove).scatter(1, sorted_indices, remove)
-        scores.masked_fill_(remove, -torch.inf)
+        if sorted_indices is None:
+            scores = sorted_scores.masked_fill(remove, -torch.inf)
+        else:
+            remove = torch.zeros_like(remove).scatter(1, sorted_indices, remove)
+            scores.masked_fill_(remove, -torch.inf)
 
     probs = F.softmax(scores, dim=-1)
-    if not bool(torch.isfinite(probs).all().item()) or bool((probs.sum(dim=-1) <= 0).any().item()):
+    valid_distribution = torch.isfinite(probs).all() & (probs.sum(dim=-1) > 0).all()
+    if not bool(valid_distribution.item()):
         raise RuntimeError("Sampling filters produced an invalid probability distribution.")
-    return torch.multinomial(probs, num_samples=1)
+    sampled_index = torch.multinomial(probs, num_samples=1)
+    if candidate_indices is not None:
+        return candidate_indices.gather(1, sampled_index)
+    return sampled_index
+
+
+def _queue_chat_sampled_token(next_token_id, eos_token_id):
+    """Materialize and classify one sample while queuing EOS for state advance."""
+    if next_token_id is None:
+        return None, None, False, False
+    sampled_token = int(next_token_id.item())
+    terminal = (
+        eos_token_id is not None
+        and sampled_token == int(eos_token_id)
+    )
+    return next_token_id, sampled_token, True, terminal
 
 
 def tbptt_chunk_ranges(length, chunk_size, global_offset=0):
@@ -640,6 +857,7 @@ def advance_chat_model_state(
     source_filter=None,
     is_quantized=False,
     inference_device=None,
+    return_last_logit_only=False,
 ):
     """Consume tokens once and return the model outputs plus updated runtime state."""
     model_input_ids = token_ids.cpu() if is_quantized else token_ids.to(device)
@@ -659,6 +877,15 @@ def advance_chat_model_state(
         "min_timestamp": min_timestamp,
         "min_wallclock_timestamp": min_wallclock_timestamp,
         "source_filter": source_filter,
+        # Normal chat consumes recurrent/LTM state and the final logits only.
+        # Avoid retaining and stacking per-token retrieval/ACT diagnostics on
+        # every autoregressive step.
+        "return_topk_values": False,
+        "return_raw_topk_values": False,
+        "return_topk_indices": False,
+        "return_step_telemetry": False,
+        "return_numerics": False,
+        "return_last_logit_only": bool(return_last_logit_only),
     }
     if is_quantized:
         call_kwargs["device"] = inference_device
@@ -742,12 +969,32 @@ def ltm_replay_seed_state(ltm_state):
     """Reuse fast memory while replaying the supervised sequence from fresh ROSA history."""
     if not isinstance(ltm_state, (tuple, list)) or len(ltm_state) < 2:
         return ltm_state
-    state = list(ltm_state)
+    # Normal chat runs under inference_mode for lower dispatch/autograd overhead.
+    # Materialize ordinary tensors before a feedback replay needs to build a
+    # gradient graph from the carried memory state.
+    state = [
+        value.detach().clone()
+        if torch.is_tensor(value) and torch.is_inference(value)
+        else value
+        for value in ltm_state
+    ]
     if len(state) >= 3:
         state[2] = None
     if len(state) >= 4:
         state[3] = None
     return tuple(state)
+
+
+def _materialize_ltm_state_for_update(ltm_state):
+    """Convert inference tensors before an in-place online-memory update."""
+    if not isinstance(ltm_state, (tuple, list)):
+        return ltm_state
+    return tuple(
+        value.detach().clone()
+        if torch.is_tensor(value) and torch.is_inference(value)
+        else value
+        for value in ltm_state
+    )
 
 
 def _detach_ltm_replay_state(ltm_state):
@@ -822,6 +1069,12 @@ def replay_online_feedback_with_training_recurrence(
             min_wallclock_timestamp=min_wallclock_timestamp,
             source_filter=source_filter,
             suppress_hebbian=True,
+            return_topk_values=False,
+            return_raw_topk_values=True,
+            return_topk_indices=True,
+            return_step_telemetry=False,
+            return_numerics=False,
+            return_last_logit_only=False,
         )
         if not isinstance(outputs, dict) or outputs.get("logits") is None:
             raise RuntimeError("Online feedback replay requires model logits")
@@ -882,6 +1135,30 @@ def _validated_overlay_tensor(value, reference, name):
     return value.detach()
 
 
+def _validate_overlay_metadata_tensor(ltm, value, reference, name):
+    value = _validated_overlay_tensor(value, reference, name)
+    if name == "sources":
+        if value.dtype != torch.long:
+            raise ValueError("LTM overlay sources must use torch.int64")
+        allowed_max = max(
+            int(getattr(ltm, "SRC_UNKNOWN", 0)),
+            int(getattr(ltm, "SRC_USER_INTERACTION", 1)),
+            int(getattr(ltm, "SRC_TRAINING_DATA", 2)),
+            int(getattr(ltm, "SRC_CORRECTION", 3)),
+        )
+        if value.numel():
+            min_source = int(value.min().item())
+            max_source = int(value.max().item())
+            if min_source < 0 or max_source > allowed_max:
+                raise ValueError("LTM overlay sources contain an unknown source identifier")
+    else:
+        if not value.is_floating_point():
+            raise ValueError(f"LTM overlay {name} must be floating point")
+        if not bool((value >= 0).all().item()):
+            raise ValueError(f"LTM overlay {name} contains negative values")
+    return value
+
+
 def load_ltm_delta_overlay(model, path):
     """Apply a legacy tensor or versioned cumulative LTM overlay.
 
@@ -892,13 +1169,19 @@ def load_ltm_delta_overlay(model, path):
     ltm = getattr(model, "ltm", None)
     if ltm is None:
         raise ValueError("Model has no LTM module")
-    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload = load_tensor_payload_safely(path, map_location="cpu")
     if torch.is_tensor(payload):
         delta = payload
         metadata = {}
         version = 1
     elif isinstance(payload, dict):
-        version = int(payload.get("version", 0) or 0)
+        raw_version = payload.get("version", 0)
+        if isinstance(raw_version, bool):
+            raise ValueError("LTM overlay version cannot be boolean")
+        try:
+            version = int(raw_version or 0)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("LTM overlay has an invalid version") from exc
         delta = payload.get("delta")
         metadata = payload
         if version != LTM_DELTA_OVERLAY_VERSION:
@@ -907,24 +1190,49 @@ def load_ltm_delta_overlay(model, path):
         raise ValueError("LTM overlay must be a tensor or versioned dictionary")
 
     delta = _validated_overlay_tensor(delta, ltm.vals, "delta")
-    with torch.no_grad():
-        ltm.vals.add_(delta.to(device=ltm.vals.device, dtype=ltm.vals.dtype))
-        if hasattr(ltm, "ltm_deltas"):
-            ltm.ltm_deltas.copy_(
-                delta.to(device=ltm.ltm_deltas.device, dtype=ltm.ltm_deltas.dtype)
-            )
+    if not delta.is_floating_point():
+        raise ValueError("LTM overlay delta must be floating point")
+    prepared_metadata = {}
+    for key, attr in (
+        ("timestamps", "timestamps"),
+        ("sources", "sources"),
+        ("wallclock_timestamps", "wallclock_timestamps"),
+    ):
+        value = metadata.get(key)
+        target = getattr(ltm, attr, None)
+        if value is None or not torch.is_tensor(target):
+            continue
+        value = _validate_overlay_metadata_tensor(
+            ltm,
+            value,
+            target,
+            key,
+        )
+        prepared_metadata[attr] = value.to(
+            device=target.device,
+            dtype=target.dtype,
+        )
 
-        for key, attr in (
-            ("timestamps", "timestamps"),
-            ("sources", "sources"),
-            ("wallclock_timestamps", "wallclock_timestamps"),
-        ):
-            value = metadata.get(key)
-            target = getattr(ltm, attr, None)
-            if value is None or not torch.is_tensor(target):
-                continue
-            value = _validated_overlay_tensor(value, target, key)
-            target.copy_(value.to(device=target.device, dtype=target.dtype))
+    delta_for_vals = delta.to(device=ltm.vals.device, dtype=torch.float32)
+    updated_vals = ltm.vals.detach().float() + delta_for_vals
+    if not bool(torch.isfinite(updated_vals).all().item()):
+        raise ValueError("LTM overlay delta would produce non-finite slow memory")
+    prepared_delta_accumulator = None
+    if hasattr(ltm, "ltm_deltas"):
+        prepared_delta_accumulator = delta.to(
+            device=ltm.ltm_deltas.device,
+            dtype=ltm.ltm_deltas.dtype,
+        )
+
+    # Apply only after every tensor has been validated and converted. A corrupt
+    # metadata field must not leave slow values partially updated when loading
+    # raises and the interactive caller elects to continue.
+    with torch.no_grad():
+        ltm.vals.copy_(updated_vals.to(dtype=ltm.vals.dtype))
+        if prepared_delta_accumulator is not None:
+            ltm.ltm_deltas.copy_(prepared_delta_accumulator)
+        for attr, value in prepared_metadata.items():
+            getattr(ltm, attr).copy_(value)
     return version
 
 
@@ -994,12 +1302,84 @@ def consolidate_ltm_state_for_save(model, ltm_state) -> bool:
     if not bool(torch.isfinite(fast_vals).all().item()):
         raise ValueError("Cannot save non-finite LTM fast memory")
     with torch.no_grad():
+        for state_index, attr_name in (
+            (4, "timestamps"),
+            (5, "sources"),
+            (6, "wallclock_timestamps"),
+        ):
+            if not isinstance(ltm_state, (tuple, list)) or len(ltm_state) <= state_index:
+                continue
+            source = ltm_state[state_index]
+            target = getattr(ltm, attr_name, None)
+            if not torch.is_tensor(source) or not torch.is_tensor(target):
+                continue
+            source = source.detach()
+            if source.dim() == target.dim() + 1 and source.shape[0] == 1:
+                source = source.squeeze(0)
+            if tuple(source.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Cannot consolidate LTM {attr_name} with shape "
+                    f"{tuple(source.shape)} into {tuple(target.shape)}"
+                )
+            if source.is_floating_point() and not bool(torch.isfinite(source).all().item()):
+                raise ValueError(f"Cannot consolidate non-finite LTM {attr_name}")
+            target.copy_(source.to(device=target.device, dtype=target.dtype))
+
         consolidated = slow_vals.float() + fast_vals.to(device=slow_vals.device, dtype=torch.float32)
         if not bool(torch.isfinite(consolidated).all().item()):
             raise ValueError("LTM consolidation produced non-finite slow values")
         slow_vals.copy_(consolidated.to(dtype=slow_vals.dtype))
-    clear_ltm_working_memory(model)
+        # Metadata describes the consolidated slot contents and must survive.
+        # Only optimizer-like working tensors are transient after the fold.
+        module_fast = getattr(ltm, "fast_vals", None)
+        module_momentum = getattr(ltm, "_mom_vals", None)
+        if torch.is_tensor(module_fast):
+            module_fast.zero_()
+        if torch.is_tensor(module_momentum):
+            module_momentum.zero_()
     return True
+
+
+def _persistent_ltm_metadata_payload(model):
+    """Serialize metadata attached to explicitly consolidated user memory.
+
+    Wall-clock values use portable Unix UTC seconds. They can reveal when a
+    user chose to write memories, so they are included only in the explicit
+    learned-LTM checkpoint export (as they already are in LTM delta overlays).
+    """
+    ltm = getattr(model, "ltm", None)
+    if ltm is None:
+        return None
+    fields = {}
+    for name in ("timestamps", "sources", "wallclock_timestamps"):
+        value = getattr(ltm, name, None)
+        if not torch.is_tensor(value):
+            raise ValueError(f"Cannot export LTM metadata without tensor {name}")
+        if name == "sources":
+            if value.dtype != torch.long:
+                raise ValueError("Cannot export LTM sources unless they use torch.int64")
+            allowed_max = max(
+                int(getattr(ltm, "SRC_UNKNOWN", 0)),
+                int(getattr(ltm, "SRC_USER_INTERACTION", 1)),
+                int(getattr(ltm, "SRC_TRAINING_DATA", 2)),
+                int(getattr(ltm, "SRC_CORRECTION", 3)),
+            )
+            if value.numel() and (
+                int(value.min().item()) < 0
+                or int(value.max().item()) > allowed_max
+            ):
+                raise ValueError("Cannot export unknown LTM source identifiers")
+        elif (
+            not value.is_floating_point()
+            or not bool((torch.isfinite(value) & (value >= 0)).all().item())
+        ):
+            raise ValueError(f"Cannot export invalid LTM metadata {name}")
+        fields[name] = value.detach().cpu().clone()
+    return {
+        "version": LTM_PERSISTENT_METADATA_VERSION,
+        "wallclock_semantics": LTM_WALLCLOCK_SEMANTICS,
+        **fields,
+    }
 
 
 def build_chat_ltm_checkpoint_payload(model):
@@ -1029,14 +1409,20 @@ def build_chat_ltm_checkpoint_payload(model):
         "derived_from_checkpoint_kind": str(
             source_metadata.get("checkpoint_kind") or "unknown"
         ),
+        "derived_from_checkpoint_version": source_metadata.get(
+            "checkpoint_version"
+        ),
         "model_state_dict": sanitize_model_state_dict(model),
         "config": saved_config,
         "architecture_contract": contract,
         "architecture_contract_sha256": contract_hash,
+        "ltm_persistent_metadata": _persistent_ltm_metadata_payload(model),
         "training_complete": True,
     }
     for key in (
         "completed_epoch",
+        "tokenizer_identity",
+        "expansion_provenance",
         "run_identity",
         "best_metric_state",
         "selection_metric",
@@ -1051,6 +1437,10 @@ def build_chat_ltm_checkpoint_payload(model):
 # --- Simple Generation Helper ---
 def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temperature=0.7, top_k=50, top_p=0.9):
     """Simple generation for testing/comparison."""
+    validate_inference_tokenizer_identity(
+        tokenizer,
+        getattr(model, "_hierarchos_checkpoint_metadata", {}),
+    )
     model.eval()
     previous_suppress_hebbian = getattr(model, "suppress_hebbian", False)
     model.suppress_hebbian = True
@@ -1065,7 +1455,7 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
 
     try:
         generated = tokens
-        with torch.no_grad():
+        with torch.inference_mode():
             prefill_len = int(tokens.shape[1])
             prefill_step = prefill_chunk_size if prefill_chunk_size > 0 else prefill_len
             prefill_step = max(1, int(prefill_step))
@@ -1083,6 +1473,12 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
                     ltm_memory_state=ltm_state,
                     global_pos_offset=start,
                     suppress_hebbian=True,
+                    return_topk_values=False,
+                    return_raw_topk_values=False,
+                    return_topk_indices=False,
+                    return_step_telemetry=False,
+                    return_numerics=False,
+                    return_last_logit_only=True,
                 )
                 h_state, l_state = outputs['h_state'], outputs['l_state']
                 p_ctx, t_ctx = outputs['prev_context'], outputs['target_context']
@@ -1103,6 +1499,7 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
                     temperature=temperature,
                     top_k=top_k,
                     top_p=top_p,
+                    _logits_prevalidated=True,
                 )
                 generated = torch.cat([generated, next_token], dim=1)
                 if next_token.item() == tokenizer.eos_token_id:
@@ -1123,6 +1520,12 @@ def generate_sample(model, tokenizer, prompt, device, max_new_tokens=100, temper
                     ltm_memory_state=ltm_state,
                     global_pos_offset=total_tokens_generated,
                     suppress_hebbian=True,
+                    return_topk_values=False,
+                    return_raw_topk_values=False,
+                    return_topk_indices=False,
+                    return_step_telemetry=False,
+                    return_numerics=False,
+                    return_last_logit_only=True,
                 )
                 total_tokens_generated += 1
                 h_state, l_state = outputs['h_state'], outputs['l_state']
@@ -1265,6 +1668,22 @@ def chat(args, device, tokenizer):
         )
         print("Use the exact tokenizer from training; generation with mismatched token IDs is invalid.")
         sys.exit(1)
+    try:
+        tokenizer_identity_verified = validate_inference_tokenizer_identity(
+            tokenizer,
+            getattr(model, "_hierarchos_checkpoint_metadata", {}),
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        print("Use the exact tokenizer from training; generation with mismatched token IDs is invalid.")
+        sys.exit(1)
+    if tokenizer_identity_verified:
+        print("INFO: Training tokenizer content fingerprint verified.")
+    else:
+        print(
+            "WARNING: This legacy checkpoint has no strong tokenizer fingerprint; "
+            "only vocabulary size compatibility could be checked."
+        )
 
     # =================================================================
     # 3. LTM & OPTIMIZER SETUP
@@ -1659,15 +2078,21 @@ def chat(args, device, tokenizer):
                     l_state=local_l if is_quantized else None,
                     prev_context=local_prev if is_quantized else None,
                     target_context=local_target if is_quantized else None,
-                    ltm_memory_state=ltm_state,
                     global_pos_offset=0,
                     min_timestamp=min_ts_filter,
                     min_wallclock_timestamp=min_wallclock_ts_filter,
                     source_filter=source_id_filter,
                     allow_hebbian_update=True,
+                    ltm_memory_state=_materialize_ltm_state_for_update(ltm_state),
                     memory_write_source=source_id,
                     memory_write_timestamp=write_timestamp,
                     memory_write_wallclock_timestamp=write_wallclock_timestamp,
+                    return_topk_values=False,
+                    return_raw_topk_values=False,
+                    return_topk_indices=False,
+                    return_step_telemetry=False,
+                    return_numerics=False,
+                    return_last_logit_only=True,
                 )
 
             updated_ltm = outputs.get("ltm_memory_state")
@@ -1752,6 +2177,7 @@ def chat(args, device, tokenizer):
                 drift_state=drift_state,
                 ltm_state=ltm_state,
                 total_tokens_generated=total_tokens_generated,
+                tokenizer=tokenizer,
             )
             if not silent:
                 print(f"Saved hierarchical chat state to {path}")
@@ -1789,6 +2215,7 @@ def chat(args, device, tokenizer):
                 print("\nInterrupted. Hierarchical chat state will be discarded.")
                 break
 
+    chat_state_resume_valid = True
     try:
         min_ts_filter = 0.0
         min_wallclock_ts_filter = 0.0
@@ -1831,13 +2258,13 @@ def chat(args, device, tokenizer):
             print("Chat prefill chunking: OFF (single full prompt forward).")
         print(
             "Chat decoding: "
-            f"temperature={float(getattr(args, 'temperature', 1.0)):.2f}, "
+            f"temperature={float(getattr(args, 'temperature', 0.7)):.2f}, "
             f"top-k={int(getattr(args, 'top_k', 0) or 0)}, "
             f"top-p={float(getattr(args, 'top_p', 1.0)):.2f}, "
             f"repetition-penalty={float(getattr(args, 'repetition_penalty', 1.0)):.2f}"
         )
         if (
-            float(getattr(args, "temperature", 1.0)) > 0.0
+            float(getattr(args, "temperature", 0.7)) > 0.0
             or float(getattr(args, "repetition_penalty", 1.0)) != 1.0
         ):
             print(
@@ -1885,6 +2312,7 @@ def chat(args, device, tokenizer):
                     config=config,
                     device=rnn_device,
                     model=model,
+                    tokenizer=tokenizer,
                 )
                 if restored["h_state"] is not None:
                     h_state = restored["h_state"]
@@ -1903,10 +2331,16 @@ def chat(args, device, tokenizer):
                     restored.get("rosa_states"),
                 )
                 print(f"Resumed hierarchical chat state from {chat_state_path}")
-            except FileNotFoundError:
-                print(f"No state file found yet; a new one will be created at {chat_state_path}")
+            except FileNotFoundError as exc:
+                chat_state_resume_valid = False
+                raise RuntimeError(
+                    f"Requested chat continuation state does not exist: {chat_state_path}"
+                ) from exc
             except Exception as exc:
-                print(f"WARNING: Could not resume chat state: {exc}")
+                chat_state_resume_valid = False
+                raise RuntimeError(
+                    f"Could not resume the requested chat continuation state: {exc}"
+                ) from exc
 
         # --- Startup Diagnostic: Verify model produces reasonable predictions ---
         print("INFO: Running inference diagnostic...")
@@ -1917,11 +2351,17 @@ def chat(args, device, tokenizer):
                 alpaca_mode=alpaca_chat_format,
             )
             _diag_ids = tokenizer.encode(_diag_prompt, return_tensors="pt").to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 _diag_out = model(
                     _diag_ids if not is_quantized else _diag_ids.cpu(),
                     h_state=None, l_state=None,
                     prev_context=None, target_context=None,
+                    return_topk_values=False,
+                    return_raw_topk_values=False,
+                    return_topk_indices=False,
+                    return_step_telemetry=False,
+                    return_numerics=False,
+                    return_last_logit_only=True,
                 )
                 _diag_logits = _diag_out["logits"][:, -1, :]
                 _diag_probs = torch.softmax(_diag_logits.float(), dim=-1)
@@ -2219,7 +2659,7 @@ def chat(args, device, tokenizer):
             # around gradient-derived LTM updates from raw_topk_vals, so normal
             # chat learning should happen through explicit feedback/validation.
             model.suppress_hebbian = True
-            with torch.no_grad():
+            with torch.inference_mode():
                 prefill_len = int(prompt_ids.shape[1])
                 outputs = None
                 prefill_ranges = tbptt_chunk_ranges(
@@ -2251,6 +2691,7 @@ def chat(args, device, tokenizer):
                         source_filter=source_id_filter,
                         is_quantized=is_quantized,
                         inference_device=inference_device,
+                        return_last_logit_only=True,
                     )
                     (
                         h_state,
@@ -2274,33 +2715,41 @@ def chat(args, device, tokenizer):
                         top_p=args.top_p,
                         repetition_penalty=getattr(args, 'repetition_penalty', 1.2),
                         previous_tokens=response_ids,
+                        _logits_prevalidated=True,
                     )
                 else:
                     next_token_id = None
 
-                pending_state_token = False
-                if next_token_id is not None and next_token_id.item() != tokenizer.eos_token_id:
-                    response_ids.append(next_token_id.item())
-                    decoded_token = tokenizer.decode([next_token_id.item()])
-                    # Buffer output to catch JSON closing syntax
-                    _display_buffer += decoded_token
-                    if len(_display_buffer) > 2:
-                        _flush = _display_buffer[:-2]
-                        print(_flush, end="", flush=True)
-                        _display_buffer = _display_buffer[-2:]
-                    current_ids = next_token_id
-                    pending_state_token = True
-                else:
-                    current_ids = None
-
+                (
+                    current_ids,
+                    sampled_token,
+                    pending_state_token,
+                    terminal_state_token,
+                ) = _queue_chat_sampled_token(
+                    next_token_id,
+                    tokenizer.eos_token_id,
+                )
+                if sampled_token is not None:
+                    if not terminal_state_token:
+                        decoded_token = tokenizer.decode([sampled_token])
+                        if "###" in decoded_token and len(decoded_token) <= 5:
+                            terminal_state_token = True
+                        else:
+                            response_ids.append(sampled_token)
+                            # Buffer output to catch JSON closing syntax
+                            _display_buffer += decoded_token
+                            if len(_display_buffer) > 2:
+                                _flush = _display_buffer[:-2]
+                                print(_flush, end="", flush=True)
+                                _display_buffer = _display_buffer[-2:]
             # 2. INCREMENTAL GENERATION LOOP
             # CRITICAL: Suppress Hebbian LTM updates during autoregressive
             # generation. Each generated token was triggering momentum-amplified
             # memory updates that compound exponentially, causing the latent
             # space to bleed (gibberish output after ~10-15 tokens).
             model.suppress_hebbian = True
-            if current_ids is not None:
-                with torch.no_grad():
+            if current_ids is not None and not terminal_state_token:
+                with torch.inference_mode():
                     for i in range(max_new_tokens - 1):
                         if _interrupt_flag:
                             _interrupt_flag = False
@@ -2329,6 +2778,7 @@ def chat(args, device, tokenizer):
                             source_filter=source_id_filter,
                             is_quantized=is_quantized,
                             inference_device=inference_device,
+                            return_last_logit_only=True,
                         )
                         (
                             h_state,
@@ -2354,35 +2804,50 @@ def chat(args, device, tokenizer):
                             top_p=args.top_p,
                             repetition_penalty=getattr(args, 'repetition_penalty', 1.2),
                             previous_tokens=response_ids,
+                            _logits_prevalidated=True,
                         )
 
-                        if next_token_id.item() == tokenizer.eos_token_id:
+                        (
+                            current_ids,
+                            sampled_token,
+                            pending_state_token,
+                            terminal_state_token,
+                        ) = _queue_chat_sampled_token(
+                            next_token_id,
+                            tokenizer.eos_token_id,
+                        )
+                        if terminal_state_token:
+                            # EOS is part of the generated token stream even
+                            # though it is not displayed. Consume it below so a
+                            # carried/autosaved recurrent and ROSA state exactly
+                            # describes the sequence that terminated.
                             break
 
-                        response_ids.append(next_token_id.item())
                         try:
-                            decoded_token = tokenizer.decode([next_token_id.item()])
-                        except Exception as e:
+                            decoded_token = tokenizer.decode([sampled_token])
+                        except Exception:
                             decoded_token = ""
 
                         if "###" in decoded_token and len(decoded_token) <= 5:
-                            current_ids = None
+                            # Treat a generated next-section header like EOS:
+                            # hide it from the response/feedback target, but
+                            # still consume the sampled token so carried and
+                            # autosaved recurrent/ROSA state is exact.
+                            terminal_state_token = True
                             break
 
+                        response_ids.append(sampled_token)
                         # Buffer output to catch JSON closing syntax
                         _display_buffer += decoded_token
                         if len(_display_buffer) > 2:
                             _flush = _display_buffer[:-2]
                             print(_flush, end="", flush=True)
                             _display_buffer = _display_buffer[-2:]
-                        current_ids = next_token_id
-                        pending_state_token = True
-
             # The sampled token that reaches max_new_tokens has not yet been
             # consumed by the recurrent model. Flush it once so carried/saved
             # state and ROSA history describe every token already shown.
             if pending_state_token and current_ids is not None:
-                with torch.no_grad():
+                with torch.inference_mode():
                     _, runtime_state = advance_chat_model_state(
                         model,
                         current_ids,
@@ -2405,6 +2870,7 @@ def chat(args, device, tokenizer):
                         source_filter=source_id_filter,
                         is_quantized=is_quantized,
                         inference_device=inference_device,
+                        return_last_logit_only=True,
                     )
                     (
                         h_state,
@@ -2574,4 +3040,7 @@ def chat(args, device, tokenizer):
         elif ltm_has_been_updated:
             print("\n[Warning] LTM was updated, but no valid save configuration was found. Changes lost.")
 
-        prompt_save_chat_state_on_exit()
+        # Never replace an explicitly requested continuation file with freshly
+        # initialized carriers after its validation/load failed.
+        if chat_state_resume_valid:
+            prompt_save_chat_state_on_exit()
