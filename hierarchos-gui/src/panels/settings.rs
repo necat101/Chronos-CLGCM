@@ -16,7 +16,6 @@ pub struct AppSettings {
 
     // Online Learning
     pub passive_learning: bool,
-    pub surprise_threshold: f32,
     pub passive_lr: f64,
     pub ltm_lr: f64,
 
@@ -38,8 +37,7 @@ impl Default for AppSettings {
             ],
             python_path: "bundled".to_string(),
             pending_load: false,
-            passive_learning: true,
-            surprise_threshold: 1.0,
+            passive_learning: false,
             passive_lr: 5e-6,
             ltm_lr: 1e-3,
             font_size: 14.0,
@@ -317,28 +315,11 @@ fn draw_learning_section(ui: &mut egui::Ui, settings: &mut AppSettings) {
             );
         });
         ui.label(
-            RichText::new("Automatically update LTM after each generation turn based on surprise.")
+            RichText::new(
+                "After a completed turn, apply a bounded update using only the user prompt. Generated responses are never self-trained.",
+            )
                 .color(HierarchosColors::TEXT_MUTED)
                 .size(11.0),
-        );
-
-        ui.add_space(8.0);
-
-        // Surprise threshold
-        ui.label(
-            RichText::new("Surprise Threshold")
-                .color(HierarchosColors::TEXT_SECONDARY)
-                .size(12.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut settings.surprise_threshold, 0.0..=5.0)
-                .step_by(0.1)
-                .text(""),
-        );
-        ui.label(
-            RichText::new("Only learn when loss > threshold (higher = more conservative)")
-                .color(HierarchosColors::TEXT_MUTED)
-                .size(10.0),
         );
 
         ui.add_space(8.0);
@@ -360,7 +341,7 @@ fn draw_learning_section(ui: &mut egui::Ui, settings: &mut AppSettings) {
 
         // LTM LR
         ui.label(
-            RichText::new("LTM Learning Rate")
+            RichText::new("Explicit Feedback LTM Rate")
                 .color(HierarchosColors::TEXT_SECONDARY)
                 .size(12.0),
         );

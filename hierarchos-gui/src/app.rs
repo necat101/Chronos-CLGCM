@@ -356,7 +356,9 @@ impl eframe::App for HierarchosApp {
             )
             .show(ctx, |ui| {
                 match self.active_panel {
-                    Panel::Chat => draw_chat_panel(ui, &mut self.chat_state, &self.bridge),
+                    Panel::Chat => {
+                        draw_chat_panel(ui, &mut self.chat_state, &self.bridge, &self.settings)
+                    }
                     Panel::Training => {
                         draw_training_panel(ui, &mut self.training_state, &self.bridge)
                     }

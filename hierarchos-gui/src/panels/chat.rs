@@ -5,6 +5,7 @@
 // sampling parameter sidebar, and feedback buttons.
 
 use crate::bridge::{PythonBridge, SamplingParams};
+use crate::panels::settings::AppSettings;
 use crate::theme::{get_accent, HierarchosColors};
 use crate::widgets::message_bubble::{typing_indicator, MessageBubble, MessageRole};
 use egui::{self, Color32, CornerRadius as Rounding, RichText, ScrollArea, Stroke, Vec2};
@@ -370,7 +371,12 @@ impl ChatState {
 }
 
 /// Draw the chat panel.
-pub fn draw_chat_panel(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBridge) {
+pub fn draw_chat_panel(
+    ui: &mut egui::Ui,
+    state: &mut ChatState,
+    bridge: &PythonBridge,
+    settings: &AppSettings,
+) {
     let total_width = ui.available_width();
 
     // Chat header — always at the top
@@ -457,7 +463,7 @@ pub fn draw_chat_panel(ui: &mut egui::Ui, state: &mut ChatState, bridge: &Python
                                             .on_hover_text("Good response — reinforce memory")
                                             .clicked()
                                         {
-                                            bridge.send_feedback(true);
+                                            bridge.send_feedback(true, settings.ltm_lr);
                                             state.on_status("Positive feedback sent.".to_string());
                                         }
                                         if ui
@@ -473,7 +479,7 @@ pub fn draw_chat_panel(ui: &mut egui::Ui, state: &mut ChatState, bridge: &Python
                                             .on_hover_text("Bad response — penalize memory")
                                             .clicked()
                                         {
-                                            bridge.send_feedback(false);
+                                            bridge.send_feedback(false, settings.ltm_lr);
                                             state.on_status("Negative feedback sent.".to_string());
                                         }
                                     });
@@ -488,7 +494,7 @@ pub fn draw_chat_panel(ui: &mut egui::Ui, state: &mut ChatState, bridge: &Python
             ui.add_space(4.0);
 
             // Input area
-            draw_input_area(ui, state, bridge);
+            draw_input_area(ui, state, bridge, settings);
         });
     });
 
@@ -599,7 +605,12 @@ fn draw_chat_header(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBri
     });
 }
 
-fn draw_input_area(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBridge) {
+fn draw_input_area(
+    ui: &mut egui::Ui,
+    state: &mut ChatState,
+    bridge: &PythonBridge,
+    settings: &AppSettings,
+) {
     let frame = egui::Frame::new()
         .fill(HierarchosColors::BG_SURFACE)
         .stroke(Stroke::new(1.0, get_accent().border))
@@ -690,7 +701,12 @@ fn draw_input_area(ui: &mut egui::Ui, state: &mut ChatState, bridge: &PythonBrid
                         state.is_generating = true;
                         state.current_stream.clear();
                         let _ = state.save_active_chat();
-                        bridge.send_message(text, state.sampling.clone());
+                        bridge.send_message(
+                            text,
+                            state.sampling.clone(),
+                            settings.passive_learning,
+                            settings.passive_lr,
+                        );
                     }
                     state.scroll_to_bottom = true;
 

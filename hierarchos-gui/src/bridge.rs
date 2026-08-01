@@ -828,7 +828,13 @@ impl PythonBridge {
     }
 
     /// Send a chat message and stream tokens back.
-    pub fn send_message(&self, message: String, params: SamplingParams) {
+    pub fn send_message(
+        &self,
+        message: String,
+        params: SamplingParams,
+        passive_learning: bool,
+        passive_lr: f64,
+    ) {
         if !self.connected.load(Ordering::SeqCst) || !self.model_loaded.load(Ordering::SeqCst) {
             self.event_tx
                 .send(BridgeEvent::Error(
@@ -866,6 +872,10 @@ impl PythonBridge {
                     "repetition_penalty": params.repetition_penalty,
                     "max_new_tokens": params.max_new_tokens,
                     "cpu_threads": params.cpu_threads,
+                },
+                "online_learning": {
+                    "passive_learning": passive_learning,
+                    "passive_lr": passive_lr,
                 }
             }),
         );
@@ -993,11 +1003,12 @@ impl PythonBridge {
     }
 
     /// Send feedback for online learning.
-    pub fn send_feedback(&self, positive: bool) {
+    pub fn send_feedback(&self, positive: bool, learning_rate: f64) {
         self.send_rpc(
             "send_feedback",
             serde_json::json!({
                 "positive": positive,
+                "learning_rate": learning_rate,
             }),
         );
     }
