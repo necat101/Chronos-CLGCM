@@ -814,7 +814,13 @@ def check_static_source_contracts(audit: Audit) -> None:
     expand_source = (ROOT / "expand_model.py").read_text(encoding="utf-8")
 
     audit.require("model.suppress_hebbian = True" in chat_source, "chat explicitly suppresses normal Hebbian writes")
-    audit.require("allow_hebbian_update=True" in chat_source, "chat validation path is the explicit Hebbian write gate")
+    audit.require(
+        "def apply_online_feedback_transaction(" in chat_source
+        and "result = apply_online_feedback_transaction(" in chat_source
+        and "return_memory_trace=not compute_only" in chat_source
+        and "candidate_loss <= loss_before + tolerance" in chat_source,
+        "chat online adaptation uses the explicit objective-validated transaction gate",
+    )
     audit.require("--carry-chat-state" in cli_source, "chat recurrent state carry is opt-in")
     audit.require("--chat-prefill-chunk-size" in cli_source, "chat exposes TBPTT prefill chunk sizing")
     audit.require("getattr(config, \"training_chunk_size\", 0)" in chat_source, "chat defaults prefill chunking from checkpoint training_chunk_size")
