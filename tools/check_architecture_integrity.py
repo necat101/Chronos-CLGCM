@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""Architecture integrity checks for the active Hierarchos v8 code path.
+"""Architecture integrity checks for the active Hierarchos code paths.
 
 This is intentionally broader than a single unit test. It probes the pieces
 that can silently drift apart during rescue runs: RWKV state shape, LTM
 train/chat mode alignment, DeepEmbed clamp/decay behavior, checkpoint guards,
-and quantized-loader architecture status.
+quantized-loader architecture status, and the coherent-v9 compute budget.
 """
 
 from __future__ import annotations
@@ -214,7 +214,10 @@ def check_core_forward(audit: Audit) -> None:
     audit.require(outputs["logits"].shape == (2, 8, config.vocab_size), "forward logits shape is stable")
     audit.require(outputs["loss"] is not None and torch.isfinite(outputs["loss"]), "forward loss is finite")
     audit.require(tensor_tree_is_finite(outputs), "forward output tensor tree is finite")
-    audit.require(len(outputs["ltm_memory_state"]) == 6, "LTM runtime state carries fast/momentum/ROSA/timestamps/sources")
+    audit.require(
+        len(outputs["ltm_memory_state"]) == 7,
+        "LTM runtime state carries fast/momentum/ROSA/token-time/source/wall-time metadata",
+    )
     drift_norm = outputs["drift_state"].float().norm(dim=-1).max().item()
     audit.require(drift_norm <= config.drift_norm_clamp + 1e-4, "drift state respects L2 norm clamp")
 
@@ -227,6 +230,119 @@ def check_core_forward(audit: Audit) -> None:
     )
     audit.require(isinstance(inner_outputs["raw_topk_vals"], list), "inner-update forward exposes raw retrieval tensors")
     audit.require(inner_outputs["topk_idx"] is not None, "inner-update forward exposes top-k indices")
+
+
+def check_coherent_v9_efficiency_contract(audit: Audit) -> None:
+    """Keep the reference v9 model compact and its cheap inference path exact."""
+    reference_overrides = dict(
+        vocab_size=50_257,
+        context_dim=448,
+        h_hidden=448,
+        l_hidden=448,
+        persistent_dim=128,
+        ltm_slots=1_024,
+        ltm_key_dim=128,
+        ltm_val_dim=128,
+        ltm_topk=4,
+        max_h_steps=5,
+        max_l_steps=5,
+        h_stride=4,
+        rwkv_head_size=64,
+    )
+    with torch.device("meta"):
+        legacy = HierarchosCore(
+            tiny_config(
+                **reference_overrides,
+                architecture_revision="legacy-v8",
+            )
+        )
+        coherent = HierarchosCore(
+            tiny_config(
+                **reference_overrides,
+                architecture_revision="coherent-v9",
+            )
+        )
+    legacy_count = sum(parameter.numel() for parameter in legacy.parameters())
+    coherent_count = sum(
+        parameter.numel() for parameter in coherent.parameters()
+    )
+    audit.require(
+        legacy_count == 232_516_229,
+        "reference legacy-v8 parameter budget is stable",
+    )
+    audit.require(
+        coherent_count == 30_227_653,
+        "reference coherent-v9 parameter budget is stable",
+    )
+    audit.require(
+        coherent_count / legacy_count < 0.131,
+        "coherent-v9 removes more than 86.9% of legacy parameters",
+    )
+
+    torch.manual_seed(9)
+    model = HierarchosCore(
+        tiny_config(
+            architecture_revision="coherent-v9",
+            use_rosa=False,
+            isolate_batch_ltm=True,
+        )
+    )
+    model.eval()
+    model.suppress_hebbian = True
+    ids = torch.tensor(
+        [
+            [3, 4, 5, 6],
+            [7, 8, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1],
+            [1, 1, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    common_kwargs = dict(
+        attention_mask=attention_mask,
+        suppress_hebbian=True,
+        return_topk_values=False,
+        return_raw_topk_values=False,
+        return_topk_indices=False,
+        return_step_telemetry=False,
+        return_numerics=False,
+    )
+    with torch.inference_mode():
+        full = model(ids, **common_kwargs)
+        last_only = model(
+            ids,
+            return_last_logit_only=True,
+            **common_kwargs,
+        )
+    expected = torch.stack(
+        [
+            full["logits"][0, 3],
+            full["logits"][1, 1],
+        ],
+        dim=0,
+    ).unsqueeze(1)
+    audit.require(
+        last_only["logits"].shape == (2, 1, model.config.vocab_size),
+        "last-logit inference allocates one vocabulary row per batch row",
+    )
+    last_only_diff = (last_only["logits"] - expected).abs().max().item()
+    audit.require(
+        last_only_diff <= 2e-6,
+        (
+            "last-logit inference selects each right-padded row's final active "
+            f"token within FP32 kernel tolerance (max diff {last_only_diff:.3e})"
+        ),
+    )
+    ltm_state = last_only["ltm_memory_state"]
+    audit.require(
+        ltm_state[0].ndim == 2 and ltm_state[1].ndim == 2,
+        "read-only inference shares LTM fast/momentum storage across batch rows",
+    )
 
 
 def check_ltm_train_modes(audit: Audit) -> None:
@@ -252,7 +368,10 @@ def check_ltm_train_modes(audit: Audit) -> None:
         running_states=(None, None, None, None, None, None),
     )
     audit.require(outputs is not None, "read-only train_step completed")
-    audit.require(states[5] is not None and len(states[5]) == 6, "read-only train_step carries LTM/ROSA state")
+    audit.require(
+        states[5] is not None and len(states[5]) == 7,
+        "read-only train_step carries complete LTM/ROSA state",
+    )
 
     inner_model = HierarchosCore(tiny_config())
     inner_model.train()
@@ -545,6 +664,9 @@ def check_train_eval_parity_after_memory_warmup(audit: Audit) -> None:
     warmup_steps = 5
     model = HierarchosCore(
         tiny_config(
+            architecture_revision="coherent-v9",
+            use_deepembed=False,
+            use_rosa=False,
             isolate_batch_ltm=False,
             memory_gate_warmup_steps=warmup_steps,
             memory_gate_warmup_floor=0.10,
@@ -557,6 +679,15 @@ def check_train_eval_parity_after_memory_warmup(audit: Audit) -> None:
         model.suppress_hebbian = True
         model.set_training_step(0)
         train_warmup_logits = model(
+            ids,
+            suppress_hebbian=True,
+            return_topk_values=False,
+            return_raw_topk_values=False,
+            return_topk_indices=False,
+        )["logits"].float()
+
+        model.eval()
+        eval_warmup_logits = model(
             ids,
             suppress_hebbian=True,
             return_topk_values=False,
@@ -577,7 +708,7 @@ def check_train_eval_parity_after_memory_warmup(audit: Audit) -> None:
 
         model.eval()
         model.suppress_hebbian = True
-        eval_logits = model(
+        eval_done_logits = model(
             ids,
             suppress_hebbian=True,
             return_topk_values=False,
@@ -585,10 +716,22 @@ def check_train_eval_parity_after_memory_warmup(audit: Audit) -> None:
             return_topk_indices=False,
         )["logits"].float()
 
-    done_diff = (train_done_logits - eval_logits).abs().max().item()
+    warmup_parity_diff = (
+        train_warmup_logits - eval_warmup_logits
+    ).abs().max().item()
+    audit.require(
+        warmup_parity_diff <= 1e-6,
+        "coherent-v9 train/eval logits match at memory-gate schedule step 0",
+    )
+    done_diff = (train_done_logits - eval_done_logits).abs().max().item()
     audit.require(done_diff <= 1e-6, "train/eval logits match after memory-gate warmup is complete")
-    warmup_diff = (train_warmup_logits - eval_logits).abs().max().item()
-    audit.require(warmup_diff > 1e-5, "train-mode warmup step 0 intentionally differs from eval")
+    schedule_diff = (
+        eval_warmup_logits - eval_done_logits
+    ).abs().max().item()
+    audit.require(
+        schedule_diff > 1e-5,
+        "persisted memory-gate schedule position changes both train and eval coherently",
+    )
 
 
 def check_clamps_and_optimizer(audit: Audit) -> None:
@@ -646,27 +789,29 @@ def check_checkpoint_and_quantized_guards(audit: Audit) -> None:
     v8_q = {"h_rnn.x_r": None, "h_rnn.r_k": None}
     mixed_q = {"h_rnn.time_decay": None, "h_rnn.x_r": None}
     audit.require(detect_quantized_rwkv_format(legacy_q) == "legacy-scalar", "quantized legacy RWKV format is detected")
-    try:
-        validate_quantized_rwkv_format(v8_q, "fake-v8.npz")
-    except ValueError:
-        audit.ok("v8 quantized archive is refused by legacy quantized loader")
-    else:
-        audit.fail("v8 quantized archive was accepted by legacy quantized loader")
-    try:
-        validate_quantized_rwkv_format(mixed_q, "fake-mixed.npz")
-    except ValueError:
-        audit.ok("mixed quantized archive is refused")
-    else:
-        audit.fail("mixed quantized archive was accepted")
+    for archive, source, label in (
+        (legacy_q, "fake-legacy.npz", "legacy scalar"),
+        (v8_q, "fake-v8.npz", "v8 matrix-state"),
+        (mixed_q, "fake-mixed.npz", "mixed"),
+    ):
+        try:
+            validate_quantized_rwkv_format(archive, source)
+        except ValueError:
+            audit.ok(f"{label} quantized archive is intentionally refused")
+        else:
+            audit.fail(f"{label} quantized archive was accepted")
 
 
 def check_static_source_contracts(audit: Audit) -> None:
     cli_source = (ROOT / "hierarchos_cli.py").read_text(encoding="utf-8")
     chat_source = (ROOT / "hierarchos" / "inference" / "chat.py").read_text(encoding="utf-8")
+    core_source = (ROOT / "hierarchos" / "models" / "core.py").read_text(encoding="utf-8")
     trainer_source = (ROOT / "hierarchos" / "training" / "trainer.py").read_text(encoding="utf-8")
     quantized_source = (ROOT / "hierarchos" / "models" / "quantized.py").read_text(encoding="utf-8")
+    legacy_monolith_source = (ROOT / "hierarchos.py").read_text(encoding="utf-8")
     benchmarks_source = (ROOT / "hierarchos" / "evaluation" / "benchmarks.py").read_text(encoding="utf-8")
     lm_eval_source = (ROOT / "hierarchos" / "evaluation" / "lm_eval_wrapper.py").read_text(encoding="utf-8")
+    expand_source = (ROOT / "expand_model.py").read_text(encoding="utf-8")
 
     audit.require("model.suppress_hebbian = True" in chat_source, "chat explicitly suppresses normal Hebbian writes")
     audit.require("allow_hebbian_update=True" in chat_source, "chat validation path is the explicit Hebbian write gate")
@@ -675,7 +820,16 @@ def check_static_source_contracts(audit: Audit) -> None:
     audit.require("getattr(config, \"training_chunk_size\", 0)" in chat_source, "chat defaults prefill chunking from checkpoint training_chunk_size")
     audit.require("boundary_drift_seed(" in chat_source and "tbptt_chunk_ranges(" in chat_source, "chat feeds drift only at absolute TBPTT boundaries")
     audit.require("if pending_state_token and current_ids is not None:" in chat_source, "chat consumes the final emitted token before carrying or saving state")
-    audit.require("_set_online_update_warmup_complete(update_model)" in chat_source, "chat LTM gradient updates run with memory-gate warmup completed")
+    audit.require(
+        "_set_online_update_warmup_complete" not in chat_source
+        and "set_training_step(" not in chat_source,
+        "chat preserves the checkpoint's persisted memory-gate schedule position",
+    )
+    audit.require(
+        '"memory_gate_warmup_step"' in core_source
+        and "persistent=True" in core_source,
+        "memory-gate schedule position is checkpoint-persistent",
+    )
     audit.require("_merge_ltm_state_into_model_state(model, ltm_state)" in chat_source, "chat save path persists active LTM fast-memory state")
     audit.require("--benchmark-preset" in cli_source and "rog-ally" in cli_source, "CLI exposes bounded ROG Ally benchmark preset")
     audit.require('"rog-ally": ("arc_easy", "hellaswag", "truthfulqa_mc1")' in benchmarks_source, "ROG Ally suite stays light and runnable")
@@ -684,10 +838,89 @@ def check_static_source_contracts(audit: Audit) -> None:
     audit.require("suppress_hebbian=True" in lm_eval_source, "lm-eval wrapper explicitly suppresses Hebbian writes")
     audit.require("target_context=target_ctx, drift_state=drift_state, ltm_memory_state=ltm_state" in trainer_source, "trainer preserves epoch-13 TBPTT boundary drift default")
     audit.require("ltm_inner_updates_enabled(args)" in trainer_source, "trainer gates supervised LTM inner updates")
+    audit.require(
+        "advance_cached_rosa_history=rosa_ids is None" in trainer_source
+        and 'kwargs.pop("advance_cached_rosa_history", True)' in core_source,
+        "cached ROSA training skips duplicate host-history reconstruction",
+    )
+    audit.require(
+        'not hasattr(args, "persist_state")' in trainer_source
+        and 'bool(getattr(args, "persist_state", False))' in trainer_source,
+        "independent-sample checkpoints omit unused terminal recurrent state",
+    )
     audit.require("--ltm-value-alignment-weight" in cli_source, "CLI exposes opt-in Hebbian writer training")
-    audit.require('"ltm_lr": f"{get_current_ltm_lr(args):.2e}" if use_ltm_inner_updates else "off"' in trainer_source, "finetune reports LTM LR as off in read-only mode")
-    audit.require("validate_quantized_rwkv_format" in quantized_source, "quantized loader validates recurrent architecture format")
-    audit.warn("quantized CPU/Vulkan inference remains legacy scalar-RWKV only; full-precision v8 is the coherent path for current rescue runs")
+    finetune_source = trainer_source.split("def finetune(", 1)[-1]
+    audit.require(
+        "outputs, running_states = train_step(" in finetune_source,
+        "LoRA finetune delegates to the canonical TBPTT training step",
+    )
+    audit.require(
+        'postfix["ltm_lr"] = "off"' in finetune_source,
+        "LoRA finetune reports LTM LR as off in read-only mode",
+    )
+    audit.require(
+        "source_artifact = _load_source_artifact(" in expand_source
+        and "source_artifact=source_artifact" in expand_source,
+        "model expansion loads and authenticates the source checkpoint only once",
+    )
+    audit.require(
+        'if name == "qproj.weight"' in expand_source
+        and 'if name == "l_input_proj.weight"' in expand_source
+        and 'if name == "in_proj.weight"' in expand_source,
+        "model expansion maps concatenated projections by semantic feature blocks",
+    )
+    audit.require(
+        'source_artifact["state_dict"] = {}' in expand_source
+        and "gc.collect()" in expand_source,
+        "model expansion releases source and resume-only state before publication",
+    )
+    audit.require(
+        "save_checkpoint_safely(checkpoint_payload" in expand_source
+        and "_publish_directory_atomically(" in expand_source
+        and "validate_inference_tokenizer_identity(" in expand_source,
+        "model expansion stages, authenticates, and atomically publishes a complete package",
+    )
+    audit.require(
+        "Model expansion cannot change vocabulary size" in expand_source
+        and '"expansion_provenance": provenance' in expand_source,
+        "model expansion binds tokenizer IDs and persists hashed source provenance",
+    )
+    audit.require(
+        'output_dir = path.with_suffix("")' in expand_source
+        and "recognized Hierarchos model package" in expand_source,
+        "model expansion cannot reinterpret a legacy file output as a broad parent-directory overwrite",
+    )
+    audit.require(
+        '"expansion_provenance"' in chat_source
+        and '"expansion_provenance"' in cli_source,
+        "inference re-exports preserve expansion provenance",
+    )
+    audit.require(
+        "Quantized .npz inference is intentionally unsupported" in quantized_source,
+        "all legacy .npz quantized inference paths fail closed",
+    )
+    audit.require(
+        "Quantized export is intentionally disabled" in cli_source,
+        "CLI quantized export fails closed",
+    )
+    audit.require(
+        "ignored the stale/unsupported .npz artifact" in chat_source
+        and "load_full_model_with_config" in chat_source,
+        "chat falls back to a same-directory full-precision checkpoint",
+    )
+    audit.require(
+        "_LEGACY_QUANTIZATION_UNSUPPORTED" in legacy_monolith_source,
+        "legacy monolith marks its obsolete quantized path unsupported",
+    )
+    audit.require(
+        "hierarchos.py is an unsupported historical monolith" in legacy_monolith_source
+        and "SystemExit(2)" in legacy_monolith_source,
+        "direct execution of the stale monolith fails closed",
+    )
+    audit.ok(
+        "quantized CPU/Vulkan inference is disabled until it implements the "
+        "full coherent-v9 recurrence and logit contract"
+    )
 
 
 def main() -> int:
@@ -698,6 +931,7 @@ def main() -> int:
     audit = Audit(strict=args.strict)
     checks = [
         check_core_forward,
+        check_coherent_v9_efficiency_contract,
         check_ltm_train_modes,
         check_inference_memory_contract,
         check_hebbian_writer_training_contract,
