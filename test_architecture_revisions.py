@@ -12,6 +12,7 @@ from hierarchos.models.revisions import (
     architecture_default_training_chunk_size,
     architecture_contract,
     architecture_contract_hash,
+    normalize_ltm_training_mode,
 )
 
 
@@ -27,6 +28,9 @@ def test_absent_revision_is_strictly_legacy():
     assert config["enforce_rosa_max_context"] is False
     assert config["rosa_zero_no_prediction"] is False
     assert config["ltm_training_mode"] == "inner-update"
+    assert config["ltm_time_feature_mode"] == "absolute-sinusoidal"
+    assert config["ltm_value_alignment_weight"] == 0.0
+    assert config["ltm_value_alignment_stride"] == 1
     assert config["adaptive_ponder"] is False
     assert config["training_chunk_size"] == LEGACY_TRAINING_CHUNK_SIZE
     assert config["reference_chunk_len"] == LEGACY_TRAINING_CHUNK_SIZE
@@ -45,6 +49,13 @@ def test_coherent_revision_resolves_corrected_contract():
     assert config.enforce_rosa_max_context is True
     assert config.rosa_zero_no_prediction is True
     assert config.ltm_training_mode == "read-only"
+    assert config.ltm_time_feature_mode == "metadata-only"
+    assert config.ltm_value_alignment_weight == 0.01
+    assert config.ltm_value_alignment_stride == 8
+    assert config.ltm_value_alignment_min_updates == 100
+    assert config.ltm_value_alignment_ready_threshold == 0.95
+    assert config.ltm_value_alignment_ema_decay == 0.95
+    assert config.ltm_value_writer_max_norm == 64.0
     assert config.adaptive_ponder is True
     assert config.ponder_objective == "symmetric-huber"
     assert config.training_chunk_size == COHERENT_TRAINING_CHUNK_SIZE
@@ -78,6 +89,8 @@ def test_explicit_ablation_is_preserved_and_changes_contract_hash():
 
 
 def test_contract_covers_geometry_recurrence_memory_and_objective_settings():
+    assert ARCHITECTURE_CONTRACT_SCHEMA_VERSION == 3
+
     base = {
         "architecture_revision": "coherent-v9",
         "vocab_size": 100,
@@ -99,6 +112,13 @@ def test_contract_covers_geometry_recurrence_memory_and_objective_settings():
         ("recurrent_state_clamp", 40.0),
         ("rosa_max_context", 256),
         ("ponder_loss_weight", 0.02),
+        ("ltm_time_feature_mode", "absolute-sinusoidal"),
+        ("ltm_value_alignment_weight", 0.02),
+        ("ltm_value_alignment_stride", 4),
+        ("ltm_value_alignment_min_updates", 50),
+        ("ltm_value_alignment_ready_threshold", 0.5),
+        ("ltm_value_alignment_ema_decay", 0.9),
+        ("ltm_value_writer_max_norm", 32.0),
     ):
         changed = dict(base)
         changed[changed_field] = changed_value
@@ -145,6 +165,39 @@ def test_unknown_revision_fails_closed():
 
 
 @pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        ("inner", "inner-update"),
+        ("gradient", "inner-update"),
+        ("readonly", "read-only"),
+        ("inference-like", "read-only"),
+    ),
+)
+def test_ltm_training_mode_aliases_have_one_contract(value, expected):
+    config = {
+        "architecture_revision": "coherent-v9",
+        "ltm_training_mode": value,
+    }
+
+    assert normalize_ltm_training_mode(value) == expected
+    apply_architecture_revision_defaults(config)
+    assert config["ltm_training_mode"] == expected
+
+
+def test_unknown_ltm_training_mode_fails_closed():
+    with pytest.raises(ValueError, match="ltm_training_mode"):
+        normalize_ltm_training_mode("inner-updtae")
+
+    with pytest.raises(ValueError, match="ltm_training_mode"):
+        apply_architecture_revision_defaults(
+            {
+                "architecture_revision": "coherent-v9",
+                "ltm_training_mode": "inner-updtae",
+            }
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     (
         ("core_recurrence_version", 3),
@@ -156,6 +209,11 @@ def test_unknown_revision_fails_closed():
         ("memory_gate_warmup_floor", 0.951),
         ("ltm_forget_rate", 1.1),
         ("ltm_momentum", float("nan")),
+        ("ltm_value_alignment_stride", 0),
+        ("ltm_value_alignment_min_updates", 0),
+        ("ltm_value_alignment_ready_threshold", -0.1),
+        ("ltm_value_alignment_ema_decay", 1.0),
+        ("ltm_value_writer_max_norm", -1.0),
         ("rosa_max_context", 0),
     ),
 )

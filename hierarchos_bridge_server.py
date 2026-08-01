@@ -35,6 +35,9 @@ _target_context = None
 _drift_state = None
 _ltm_state = None
 _total_tokens_generated = 0
+_pending_feedback = None
+_ltm_token_clock = 0
+_ltm_overlay_write_blocked_reason = None
 _stop_generation = threading.Event()
 _stop_training = threading.Event()
 _cpu_threads = max(1, (os.cpu_count() or 2) // 2)
@@ -166,6 +169,7 @@ def _release_loaded_model():
     global _model, _tokenizer, _tokenizer_identity, _model_identity
     global _config, _model_dir
     global _h_state, _l_state, _prev_context, _target_context, _drift_state, _ltm_state
+    global _ltm_token_clock, _ltm_overlay_write_blocked_reason
 
     old_device = _device
     _model = None
@@ -175,6 +179,8 @@ def _release_loaded_model():
     _config = {}
     _model_dir = None
     _reset_runtime_state()
+    _ltm_token_clock = 0
+    _ltm_overlay_write_blocked_reason = None
 
     try:
         import torch
@@ -436,26 +442,80 @@ def _sync_runtime_ltm_to_module():
         _copy_ltm_tensor(ltm, "timestamps", _ltm_state[4])
     if len(_ltm_state) >= 6:
         _copy_ltm_tensor(ltm, "sources", _ltm_state[5])
+    if len(_ltm_state) >= 7:
+        _copy_ltm_tensor(ltm, "wallclock_timestamps", _ltm_state[6])
+
+
+def _refresh_ltm_token_clock() -> int:
+    """Resume the monotonic online-memory clock from validated slot metadata."""
+    global _ltm_token_clock
+    try:
+        import torch
+
+        timestamps = getattr(getattr(_model, "ltm", None), "timestamps", None)
+        if torch.is_tensor(timestamps) and timestamps.numel():
+            finite = timestamps.detach().float()
+            finite = finite[torch.isfinite(finite)]
+            if finite.numel():
+                _ltm_token_clock = max(0, int(finite.max().item()))
+                return _ltm_token_clock
+    except Exception:
+        pass
+    _ltm_token_clock = 0
+    return _ltm_token_clock
 
 
 def _apply_saved_ltm_updates():
     """Load durable LTM sidecar data, if present, without restoring working memory."""
-    global _ltm_state
+    global _ltm_state, _ltm_overlay_write_blocked_reason
     if _model is None or not hasattr(_model, "ltm") or not _model_dir:
         return
 
+    ltm = _model.ltm
+    if hasattr(ltm, "accumulate_deltas"):
+        ltm.accumulate_deltas = True
+
     path = _ltm_updates_path()
     if not os.path.exists(path):
+        _ltm_overlay_write_blocked_reason = None
+        _refresh_ltm_token_clock()
         return
 
     import torch
     from hierarchos.utils.checkpoint import load_checkpoint_payload_compatible
 
     payload = load_checkpoint_payload_compatible(path, map_location="cpu")
-    ltm = _model.ltm
     target_vals = getattr(ltm, "vals", None)
     if not torch.is_tensor(target_vals):
         raise ValueError("Loaded model does not expose persistent LTM values.")
+
+    raw_version = payload.get("version", 0) if isinstance(payload, dict) else 1
+    if isinstance(raw_version, bool):
+        raise ValueError("LTM sidecar version cannot be boolean.")
+    try:
+        payload_version = int(raw_version or 0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("LTM sidecar has an invalid version.") from exc
+
+    if payload_version == 3:
+        from hierarchos.inference.chat import load_ltm_delta_overlay
+
+        if payload.get("bridge_runtime_identity") is not None:
+            _validate_bridge_runtime_identity(payload)
+        loaded_version = load_ltm_delta_overlay(
+            _model,
+            path,
+            tokenizer=_tokenizer,
+        )
+        if loaded_version != 3:
+            raise RuntimeError(
+                f"Expected LTM overlay v3 but shared loader returned v{loaded_version}."
+            )
+        _ltm_state = None
+        _ltm_overlay_write_blocked_reason = None
+        _refresh_ltm_token_clock()
+        emit_status(f"Loaded identity-bound LTM overlay v3 from {path}.")
+        return
 
     metadata = {}
     legacy_bridge_payload = False
@@ -546,6 +606,8 @@ def _apply_saved_ltm_updates():
             target.copy_(value.to(device=target.device, dtype=target.dtype))
 
     _ltm_state = None
+    _ltm_overlay_write_blocked_reason = None
+    _refresh_ltm_token_clock()
     emit_status(f"Loaded saved LTM updates from {path}.")
     if legacy_bridge_payload:
         emit_status(
@@ -556,7 +618,7 @@ def _apply_saved_ltm_updates():
 
 def _reset_runtime_state():
     global _h_state, _l_state, _prev_context, _target_context
-    global _drift_state, _ltm_state, _total_tokens_generated
+    global _drift_state, _ltm_state, _total_tokens_generated, _pending_feedback
     _h_state = None
     _l_state = None
     _prev_context = None
@@ -564,6 +626,7 @@ def _reset_runtime_state():
     _drift_state = None
     _ltm_state = None
     _total_tokens_generated = 0
+    _pending_feedback = None
 
 
 def _chat_state_config_signature():
@@ -706,7 +769,7 @@ def _validate_chat_state_signature(payload: dict):
 def _load_chat_runtime_state(path: str):
     """Restore hierarchical continuation state without restoring LTM working memory."""
     global _h_state, _l_state, _prev_context, _target_context
-    global _drift_state, _ltm_state, _total_tokens_generated
+    global _drift_state, _ltm_state, _total_tokens_generated, _pending_feedback
 
     path = _normalize_chat_state_path(path)
     if not os.path.exists(path):
@@ -825,6 +888,7 @@ def _load_chat_runtime_state(path: str):
         rosa_past_tokens,
         rosa_states,
     )
+    _pending_feedback = None
     return path
 
 
@@ -988,12 +1052,174 @@ def _sample_next_token(logits, generated_ids, sampling, tokenizer=None):
     )
 
 
+def _validated_online_learning_rate(
+    value,
+    *,
+    default: float,
+    maximum: float,
+    label: str,
+) -> float:
+    """Validate an online-memory rate and cap it at the bridge safety limit."""
+    import math
+
+    raw_value = default if value is None else value
+    if isinstance(raw_value, bool):
+        raise ValueError(f"{label} must be a finite positive number.")
+    try:
+        rate = float(raw_value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} must be a finite positive number.") from exc
+    if not math.isfinite(rate) or rate <= 0.0:
+        raise ValueError(f"{label} must be a finite positive number.")
+    return min(rate, float(maximum))
+
+
+def _apply_bridge_online_ltm_transaction(
+    input_ids,
+    label_ids,
+    *,
+    source_id: int,
+    penalty: bool,
+    learning_rate: float,
+    learn_input_tokens: bool = False,
+):
+    """Commit and persist one bounded online-memory transaction."""
+    global _ltm_state, _ltm_token_clock
+
+    import torch
+    from hierarchos.inference.chat import (
+        apply_online_feedback_transaction,
+        save_ltm_delta_overlay_atomic,
+    )
+
+    ltm = getattr(_model, "ltm", None)
+    if ltm is None:
+        raise ValueError("Loaded model does not expose online LTM memory.")
+    if hasattr(ltm, "accumulate_deltas"):
+        ltm.accumulate_deltas = True
+    if _ltm_overlay_write_blocked_reason:
+        return {
+            "committed": False,
+            "reason": "persistence-blocked",
+            "ltm_state": _ltm_state,
+            "token_clock": int(_ltm_token_clock),
+            "persistence_error": (
+                "sidecar overwrite is blocked because the existing overlay "
+                f"failed validation: {_ltm_overlay_write_blocked_reason}"
+            ),
+        }
+
+    # The shared transaction commits to module buffers once its objective gate
+    # accepts. Snapshot every mutated durable/runtime tensor so the GUI can
+    # extend that transaction boundary through the atomic sidecar replace.
+    rollback_tensors = {}
+    for attr in (
+        "fast_vals",
+        "_mom_vals",
+        "timestamps",
+        "sources",
+        "wallclock_timestamps",
+        "ltm_deltas",
+    ):
+        value = getattr(ltm, attr, None)
+        if torch.is_tensor(value):
+            rollback_tensors[attr] = value.detach().clone()
+    prior_ltm_state = _ltm_state
+    prior_token_clock = int(_ltm_token_clock)
+
+    def _rollback_module_state():
+        global _ltm_state, _ltm_token_clock
+        with torch.no_grad():
+            for attr, snapshot in rollback_tensors.items():
+                target = getattr(ltm, attr, None)
+                if torch.is_tensor(target) and tuple(target.shape) == tuple(snapshot.shape):
+                    target.copy_(snapshot.to(device=target.device, dtype=target.dtype))
+        _ltm_state = prior_ltm_state
+        _ltm_token_clock = prior_token_clock
+
+    model_config = getattr(_model, "config", _config)
+    try:
+        result = apply_online_feedback_transaction(
+            _model,
+            input_ids,
+            label_ids,
+            config=model_config,
+            ltm_state=_ltm_state,
+            source_id=int(source_id),
+            penalty=bool(penalty),
+            learning_rate=float(learning_rate),
+            grad_clip=float(_config.get("online_ltm_grad_clip", 0.75)),
+            max_delta_norm=float(
+                _config.get("online_ltm_max_delta_norm", 1.0)
+            ),
+            max_fast_norm=float(
+                _config.get("online_ltm_max_fast_norm", 64.0)
+            ),
+            max_slot_norm=float(
+                _config.get("online_ltm_max_slot_norm", 4.0)
+            ),
+            token_clock=int(_ltm_token_clock),
+            learn_input_tokens=bool(learn_input_tokens),
+        )
+    except Exception:
+        _rollback_module_state()
+        raise
+    result = dict(result or {})
+    if not bool(result.get("committed", False)):
+        return result
+
+    accepted_state = result.get("ltm_state")
+    if not isinstance(accepted_state, (tuple, list)):
+        raise RuntimeError("Accepted feedback did not return an LTM state.")
+    accepted_state = tuple(accepted_state)
+    try:
+        persisted_path = save_ltm_delta_overlay_atomic(
+            _model,
+            _ltm_updates_path(),
+            accepted_state,
+            tokenizer=_tokenizer,
+            extra_metadata={
+                "total_tokens_generated": int(_total_tokens_generated),
+                "base_model_identity": copy.deepcopy(_model_identity),
+                "bridge_runtime_identity": _bridge_runtime_identity(),
+            },
+        )
+    except Exception as exc:
+        _rollback_module_state()
+        result.update(
+            {
+                "committed": False,
+                "reason": "persistence-failed",
+                "ltm_state": prior_ltm_state,
+                "token_clock": prior_token_clock,
+                "persisted": False,
+                "path": None,
+                "persistence_error": str(exc),
+                "rolled_back": True,
+            }
+        )
+        return result
+
+    _ltm_state = accepted_state
+    _ltm_token_clock = int(result.get("token_clock", _ltm_token_clock))
+
+    result.update(
+        {
+            "persisted": True,
+            "path": persisted_path,
+            "persistence_error": None,
+        }
+    )
+    return result
+
+
 # ── Handlers ─────────────────────────────────────────────────────────────────
 
 def handle_load_model(params: dict):
     """Load a Hierarchos model from a local folder/file or Hugging Face repo."""
     global _model, _tokenizer, _tokenizer_identity, _model_identity
     global _device, _config, _model_dir, _cpu_threads
+    global _ltm_token_clock, _ltm_overlay_write_blocked_reason
     from transformers import AutoTokenizer
     import argparse
 
@@ -1052,20 +1278,15 @@ def handle_load_model(params: dict):
         _model = model
         _model.eval()
         _model.suppress_hebbian = True
+        if hasattr(_model.ltm, "accumulate_deltas"):
+            _model.ltm.accumulate_deltas = True
         _config = dict(cfg) if hasattr(cfg, 'items') else {}
         _model_identity = _checkpoint_file_identity(_model)
         _reset_runtime_state()
-        emit_load_progress(0.76, "Checking saved LTM updates")
-        try:
-            _apply_saved_ltm_updates()
-        except Exception as exc:
-            clear_ltm_working_memory(_model)
-            emit_status(
-                "WARNING: Ignored incompatible or corrupt saved LTM updates: "
-                f"{exc}"
-            )
+        _ltm_token_clock = 0
+        _ltm_overlay_write_blocked_reason = None
 
-        emit_load_progress(0.82, "Loading tokenizer")
+        emit_load_progress(0.76, "Loading tokenizer")
         tokenizer_candidates = []
         if tokenizer_ref:
             tokenizer_candidates.append(tokenizer_ref)
@@ -1143,6 +1364,21 @@ def handle_load_model(params: dict):
                 "only vocabulary compatibility could be checked."
             )
 
+        emit_load_progress(0.92, "Checking saved LTM updates")
+        try:
+            _apply_saved_ltm_updates()
+        except Exception as exc:
+            clear_ltm_working_memory(_model)
+            if hasattr(_model.ltm, "accumulate_deltas"):
+                _model.ltm.accumulate_deltas = True
+            _ltm_token_clock = 0
+            _ltm_overlay_write_blocked_reason = str(exc)
+            emit_status(
+                "WARNING: Ignored incompatible or corrupt saved LTM updates and "
+                "disabled sidecar overwrites for this load: "
+                f"{exc}"
+            )
+
         emit_load_progress(0.94, "Finalizing model")
         total_params = sum(p.numel() for p in _model.parameters())
 
@@ -1204,6 +1440,7 @@ def handle_generate(params: dict):
     global _model, _tokenizer, _device
     global _h_state, _l_state, _prev_context, _target_context
     global _drift_state, _ltm_state, _total_tokens_generated, _cpu_threads
+    global _pending_feedback
 
     if _model is None:
         emit_error("No model loaded.", operation="generation")
@@ -1220,11 +1457,44 @@ def handle_generate(params: dict):
         emit("generation_complete", {"status": "rejected"})
         return
 
+    online_learning = params.get("online_learning", {})
+    if not isinstance(online_learning, dict):
+        emit_error(
+            "Generation online_learning settings must be a JSON object.",
+            operation="generation",
+        )
+        emit("generation_complete", {"status": "rejected"})
+        return
+    passive_learning = online_learning.get("passive_learning", False)
+    if not isinstance(passive_learning, bool):
+        emit_error(
+            "passive_learning must be a boolean.",
+            operation="generation",
+        )
+        emit("generation_complete", {"status": "rejected"})
+        return
+    passive_learning_rate = None
+    if passive_learning:
+        try:
+            passive_learning_rate = _validated_online_learning_rate(
+                online_learning.get("passive_lr"),
+                default=float(_config.get("passive_ltm_lr", 5e-6)),
+                maximum=1e-3,
+                label="Passive LTM learning rate",
+            )
+        except ValueError as exc:
+            emit_error(str(exc), operation="generation")
+            emit("generation_complete", {"status": "rejected"})
+            return
+
     claimed, active = _try_begin_operation("generation")
     if not claimed:
         _reject_busy("generation", active, terminal_event="generation_complete")
         return
 
+    # Once a new causal turn begins, feedback for the prior turn is no longer
+    # eligible. A replacement is published only after this generation commits.
+    _pending_feedback = None
     _stop_generation.clear()
     try:
         _apply_thread_count(sampling.get("cpu_threads", _cpu_threads))
@@ -1237,6 +1507,7 @@ def handle_generate(params: dict):
     def _gen():
         global _h_state, _l_state, _prev_context, _target_context
         global _drift_state, _ltm_state, _total_tokens_generated
+        global _pending_feedback
 
         status = "error"
         try:
@@ -1373,6 +1644,54 @@ def handle_generate(params: dict):
             _ltm_state = zero_ltm_momentum_state(_model, _ltm_state)
             _model.suppress_hebbian = True
             status = "stopped" if _stop_generation.is_set() else "completed"
+            if status == "completed" and passive_learning:
+                try:
+                    from hierarchos.models.ltm import LTMModule
+
+                    passive_result = _apply_bridge_online_ltm_transaction(
+                        prompt_ids[0].detach().to("cpu"),
+                        None,
+                        source_id=LTMModule.SRC_USER_INTERACTION,
+                        penalty=False,
+                        learning_rate=passive_learning_rate,
+                        learn_input_tokens=True,
+                    )
+                    if bool(passive_result.get("committed", False)):
+                        emit_status(
+                            "Passive prompt-only LTM update committed; generated "
+                            "response tokens were not used as training targets."
+                        )
+                        if passive_result.get("persisted"):
+                            emit_status(
+                                "Online LTM overlay autosaved to "
+                                f"{passive_result.get('path')}."
+                            )
+                        elif passive_result.get("persistence_error"):
+                            emit_error(
+                                "Passive prompt learning committed in memory but "
+                                "could not be persisted: "
+                                f"{passive_result.get('persistence_error')}",
+                                operation="passive_learning",
+                            )
+                    else:
+                        emit_status(
+                            "Passive prompt-only LTM update was safely rejected "
+                            f"({passive_result.get('reason') or 'unknown reason'}); "
+                            "memory is unchanged."
+                        )
+                except Exception as exc:
+                    # Generation already completed successfully. Keep the answer
+                    # and report the opt-in memory update failure independently.
+                    emit_error(
+                        f"Passive prompt learning failed: {exc}",
+                        operation="passive_learning",
+                    )
+            if status == "completed" and response_ids:
+                _pending_feedback = {
+                    "prompt_ids": prompt_ids[0].detach().to("cpu").clone(),
+                    "response_ids": torch.tensor(response_ids, dtype=torch.long),
+                    "created_at": time.time(),
+                }
 
         except Exception as e:
             emit_error(
@@ -1408,6 +1727,7 @@ def handle_start_training(params: dict):
     _stop_training.clear()
 
     def _train():
+        global _ltm_token_clock
         status = "error"
         trainer_module = None
         original_trainer_tqdm = None
@@ -2160,6 +2480,7 @@ def handle_start_training(params: dict):
 
                     if _model is not None:
                         clear_ltm_working_memory(_model)
+                        _ltm_token_clock = 0
                         _model.eval()
                         _model.suppress_hebbian = True
                 except Exception as cleanup_exc:
@@ -2331,7 +2652,6 @@ def handle_get_ltm_snapshot(_params):
 @_exclusive_operation("ltm_save")
 def handle_save_ltm_updates(_params):
     """Persist runtime LTM state next to the loaded model without overwriting base weights."""
-    global _model
     if _model is None:
         emit_error("No model loaded.")
         return
@@ -2340,53 +2660,26 @@ def handle_save_ltm_updates(_params):
         return
 
     try:
-        import torch
-        from hierarchos.inference.chat import build_ltm_delta_overlay
+        from hierarchos.inference.chat import save_ltm_delta_overlay_atomic
 
-        ltm = _model.ltm
-        path = _ltm_updates_path()
-        temp_path = path + ".tmp"
-        payload = build_ltm_delta_overlay(_model, _ltm_state)
-        payload["saved_at"] = time.time()
-        payload["total_tokens_generated"] = int(_total_tokens_generated)
-        payload["base_model_identity"] = copy.deepcopy(_model_identity)
-
-        for key in ("timestamps", "wallclock_timestamps"):
-            value = payload.get(key)
-            if value is not None and (
-                not value.is_floating_point()
-                or not bool((torch.isfinite(value) & (value >= 0)).all().item())
-            ):
-                raise ValueError(f"Refusing to save invalid LTM {key}.")
-        sources = payload.get("sources")
-        if sources is not None:
-            if sources.dtype != torch.int64:
-                raise ValueError("Refusing to save non-int64 LTM sources.")
-            allowed_sources = {
-                int(getattr(ltm, "SRC_UNKNOWN", 0)),
-                int(getattr(ltm, "SRC_USER_INTERACTION", 1)),
-                int(getattr(ltm, "SRC_TRAINING_DATA", 2)),
-                int(getattr(ltm, "SRC_CORRECTION", 3)),
-            }
-            if sources.numel() and not set(
-                int(item) for item in sources.unique().tolist()
-            ) <= allowed_sources:
-                raise ValueError("Refusing to save unknown LTM source identifiers.")
-
-        try:
-            torch.save(payload, temp_path)
-            with open(temp_path, "r+b") as sidecar_file:
-                os.fsync(sidecar_file.fileno())
-            os.replace(temp_path, path)
-        except Exception:
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except OSError:
-                pass
-            raise
+        if _ltm_overlay_write_blocked_reason:
+            raise RuntimeError(
+                "Refusing to overwrite an LTM sidecar that failed validation: "
+                f"{_ltm_overlay_write_blocked_reason}"
+            )
+        path = save_ltm_delta_overlay_atomic(
+            _model,
+            _ltm_updates_path(),
+            _ltm_state,
+            tokenizer=_tokenizer,
+            extra_metadata={
+                "total_tokens_generated": int(_total_tokens_generated),
+                "base_model_identity": copy.deepcopy(_model_identity),
+                "bridge_runtime_identity": _bridge_runtime_identity(),
+            },
+        )
         emit("ltm_saved", {"path": path})
-        emit_status(f"LTM updates saved to {path}.")
+        emit_status(f"Identity-bound LTM overlay v3 saved to {path}.")
 
     except Exception as e:
         emit_error(f"Failed to save LTM updates: {e}\n{traceback.format_exc()}")
@@ -2430,19 +2723,144 @@ def handle_reset_chat_runtime_state(params: dict):
         emit_error(f"Failed to reset chat runtime state: {e}\n{traceback.format_exc()}")
 
 
+@_exclusive_operation("feedback")
 def handle_send_feedback(params: dict):
+    """Apply one explicit, bounded update to the last completed GUI exchange."""
+    global _pending_feedback, _ltm_state, _ltm_token_clock
+
+    if _model is None or _tokenizer is None:
+        emit_error("No model/tokenizer is loaded.", operation="feedback")
+        emit("feedback_complete", {"status": "rejected", "reason": "no-model"})
+        return
+
     positive = params.get("positive", True)
-    polarity = "Positive" if positive else "Negative"
-    emit_status(
-        f"{polarity} feedback recorded in the GUI transcript. "
-        "No LTM write was performed: this bridge request carries no validated "
-        "target text or gradient, so claiming reinforcement would be unsafe."
-    )
+    if not isinstance(positive, bool):
+        emit_error("Feedback polarity must be a boolean.", operation="feedback")
+        emit(
+            "feedback_complete",
+            {"status": "rejected", "reason": "invalid-polarity"},
+        )
+        return
+
+    try:
+        learning_rate = _validated_online_learning_rate(
+            params.get("learning_rate"),
+            default=float(_config.get("online_ltm_lr", 1e-3)),
+            maximum=0.1,
+            label="Explicit feedback LTM learning rate",
+        )
+    except ValueError as exc:
+        emit_error(str(exc), operation="feedback")
+        emit(
+            "feedback_complete",
+            {"status": "rejected", "reason": "invalid-learning-rate"},
+        )
+        return
+
+    pending = _pending_feedback
+    if not isinstance(pending, dict):
+        emit_status("No completed assistant response is pending feedback.")
+        emit(
+            "feedback_complete",
+            {"status": "rejected", "reason": "nothing-pending"},
+        )
+        return
+
+    # A completed exchange is single-use: two rapid button presses must not
+    # compound the same answer or apply contradictory updates.
+    _pending_feedback = None
+
+    try:
+        import torch
+        from hierarchos.models.ltm import LTMModule
+
+        prompt_ids = pending.get("prompt_ids")
+        response_ids = pending.get("response_ids")
+        if (
+            not torch.is_tensor(prompt_ids)
+            or prompt_ids.ndim != 1
+            or not torch.is_tensor(response_ids)
+            or response_ids.ndim != 1
+            or response_ids.numel() == 0
+        ):
+            raise ValueError("Pending GUI feedback tensors are malformed.")
+
+        source_id = (
+            LTMModule.SRC_USER_INTERACTION
+            if positive
+            else LTMModule.SRC_CORRECTION
+        )
+        result = _apply_bridge_online_ltm_transaction(
+            prompt_ids,
+            response_ids,
+            source_id=source_id,
+            penalty=not positive,
+            learning_rate=learning_rate,
+        )
+        if not bool(result.get("committed", False)):
+            reason = str(result.get("reason") or "rejected")
+            emit_status(
+                f"Explicit {'positive' if positive else 'negative'} feedback "
+                f"was safely rejected ({reason}); LTM memory is unchanged."
+            )
+            emit(
+                "feedback_complete",
+                {
+                    "status": "rejected",
+                    "reason": reason,
+                    "loss_before": result.get("loss_before"),
+                },
+            )
+            return
+
+        persisted = bool(result.get("persisted", False))
+        persisted_path = result.get("path")
+        persistence_error = result.get("persistence_error")
+
+        delta_norm = float(result.get("delta_norm", 0.0) or 0.0)
+        loss_before = result.get("loss_before")
+        loss_after = result.get("loss_after")
+        polarity = "Positive" if positive else "Negative"
+        emit_status(
+            f"{polarity} feedback committed to fast LTM memory "
+            f"(delta norm {delta_norm:.3e}, objective "
+            f"{float(loss_before):.6f} -> {float(loss_after):.6f})."
+        )
+        if persisted:
+            emit_status(f"Online LTM overlay autosaved to {persisted_path}.")
+        elif persistence_error:
+            emit_error(
+                "Feedback was committed in memory but could not be persisted: "
+                f"{persistence_error}",
+                operation="feedback",
+            )
+        emit(
+            "feedback_complete",
+            {
+                "status": "accepted",
+                "positive": positive,
+                "delta_norm": delta_norm,
+                "fast_norm": result.get("fast_norm"),
+                "loss_before": loss_before,
+                "loss_after": loss_after,
+                "persisted": persisted,
+                "path": persisted_path,
+            },
+        )
+    except Exception as exc:
+        emit_error(
+            f"Feedback update failed: {exc}\n{traceback.format_exc()}",
+            operation="feedback",
+        )
+        emit(
+            "feedback_complete",
+            {"status": "error", "reason": str(exc)},
+        )
 
 
 @_exclusive_operation("command")
 def handle_execute_command(params: dict):
-    global _model, _device, _ltm_state
+    global _model, _device, _ltm_state, _pending_feedback, _ltm_token_clock
     command = params.get("command", "").strip()
 
     if command == "/reset":
@@ -2455,6 +2873,8 @@ def handle_execute_command(params: dict):
             elif hasattr(_model.ltm, 'reset_memory'):
                 _model.ltm.reset_memory()
         _ltm_state = None
+        _pending_feedback = None
+        _ltm_token_clock = 0
         emit_status("LTM working memory cleared.")
     elif command == "/status":
         if _model is not None:

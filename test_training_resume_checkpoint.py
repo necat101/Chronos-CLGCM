@@ -25,6 +25,7 @@ from hierarchos.training.trainer import (
     compute_remaining_update_steps,
     get_current_ltm_lr,
     get_model_training_step,
+    mark_val_proj_trained,
     advance_ltm_lr_schedule,
     restore_dataloader_state,
     restore_rng_state,
@@ -51,6 +52,7 @@ from hierarchos.training.trainer import (
     validate_exact_resume_identity,
     validate_exact_running_states,
 )
+from hierarchos.models.revisions import architecture_contract_hash
 from hierarchos.utils.checkpoint import (
     load_checkpoint_payload_compatible,
     sanitize_model_state_dict,
@@ -342,6 +344,86 @@ def test_training_checkpoint_preserves_resume_only_state():
     assert "proj.weight" in checkpoint["grad_state_dict"]
     assert checkpoint["grad_state_keys"] == ("proj.weight",)
     assert checkpoint["running_states"][0].device.type == "cpu"
+
+
+def test_training_checkpoint_preserves_writer_alignment_readiness_progress():
+    model = _FakeTrainModel()
+    model.val_proj = nn.Linear(2, 2, bias=False)
+    writer_norm = float(model.val_proj.weight.detach().float().norm().item())
+    model.config.update(
+        {
+            "architecture_revision": "coherent-v9",
+            "ltm_value_alignment_weight": 0.01,
+            "ltm_value_alignment_stride": 8,
+            "ltm_value_alignment_min_updates": 3,
+            "ltm_value_alignment_ready_threshold": 0.2,
+            "ltm_value_alignment_ema_decay": 0.0,
+            "ltm_value_writer_max_norm": 64.0,
+            "val_proj_alignment_updates": 2,
+            "val_proj_alignment_last": 0.1,
+            "val_proj_alignment_ema": 0.1,
+            "val_proj_alignment_best": 0.08,
+            "val_proj_writer_norm": writer_norm,
+            "val_proj_trained": False,
+        }
+    )
+    args = SimpleNamespace(
+        ltm_value_alignment_weight=0.01,
+        ltm_value_alignment_stride=8,
+        ltm_value_alignment_min_updates=3,
+        ltm_value_alignment_ready_threshold=0.2,
+        ltm_value_alignment_ema_decay=0.0,
+        ltm_value_writer_max_norm=64.0,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    checkpoint = build_training_checkpoint(
+        model,
+        optimizer,
+        scheduler=None,
+        scaler=None,
+        args=args,
+        dataloader=None,
+        completed_epoch=1,
+    )
+
+    assert checkpoint["architecture_contract"][
+        "architecture_contract_schema_version"
+    ] == 3
+    for key, expected in (
+        ("val_proj_alignment_updates", 2),
+        ("val_proj_alignment_last", 0.1),
+        ("val_proj_alignment_ema", 0.1),
+        ("val_proj_alignment_best", 0.08),
+        ("val_proj_writer_norm", writer_norm),
+        ("val_proj_trained", False),
+    ):
+        assert checkpoint["config"][key] == expected
+        assert key not in checkpoint["architecture_contract"]
+    for key in (
+        "ltm_value_alignment_weight",
+        "ltm_value_alignment_stride",
+        "ltm_value_alignment_min_updates",
+        "ltm_value_alignment_ready_threshold",
+        "ltm_value_alignment_ema_decay",
+        "ltm_value_writer_max_norm",
+    ):
+        assert checkpoint["effective_training_config"][key] == getattr(args, key)
+
+    resumed = _FakeTrainModel()
+    resumed.val_proj = nn.Linear(2, 2, bias=False)
+    resumed.val_proj.load_state_dict(model.val_proj.state_dict())
+    resumed.config = dict(checkpoint["config"])
+    mark_val_proj_trained(resumed, alignment_cost=0.1)
+
+    assert resumed.config["val_proj_alignment_updates"] == 3
+    assert resumed.config["val_proj_trained"] is True
+    # Readiness progress is mutable checkpoint capability metadata; continuing
+    # it must not change the immutable learned-function contract identity.
+    assert (
+        architecture_contract_hash(resumed.config)
+        == checkpoint["architecture_contract_sha256"]
+    )
 
 
 def test_training_checkpoint_omits_terminal_state_for_independent_samples():
@@ -1142,6 +1224,10 @@ def test_ltm_training_mode_normalization():
     assert normalize_ltm_training_mode("inference-like") == "read-only"
     assert ltm_inner_updates_enabled(SimpleNamespace(ltm_training_mode="inner-update")) is True
     assert ltm_inner_updates_enabled(SimpleNamespace(ltm_training_mode="read-only")) is False
+    with pytest.raises(ValueError, match="ltm_training_mode"):
+        normalize_ltm_training_mode("inner-updtae")
+    with pytest.raises(ValueError, match="ltm_training_mode"):
+        ltm_inner_updates_enabled(SimpleNamespace(ltm_training_mode="inner-updtae"))
 
 
 def test_deepembed_weights_are_excluded_from_weight_decay():

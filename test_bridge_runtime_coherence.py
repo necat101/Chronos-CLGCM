@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -72,11 +73,17 @@ def _reset_bridge_operation_lane():
     bridge = importlib.import_module("hierarchos_bridge_server")
     bridge._stop_generation.clear()
     bridge._stop_training.clear()
+    bridge._pending_feedback = None
+    bridge._ltm_token_clock = 0
+    bridge._ltm_overlay_write_blocked_reason = None
     with bridge._operation_lock:
         bridge._active_operation = None
     yield
     bridge._stop_generation.clear()
     bridge._stop_training.clear()
+    bridge._pending_feedback = None
+    bridge._ltm_token_clock = 0
+    bridge._ltm_overlay_write_blocked_reason = None
     with bridge._operation_lock:
         bridge._active_operation = None
 
@@ -98,6 +105,7 @@ def test_bridge_uses_checkpoint_prompt_format_and_advances_terminal_eos(monkeypa
     monkeypatch.setattr(bridge, "_drift_state", None)
     monkeypatch.setattr(bridge, "_ltm_state", None)
     monkeypatch.setattr(bridge, "_total_tokens_generated", 0)
+    monkeypatch.setattr(bridge, "_pending_feedback", {"stale": True})
     monkeypatch.setattr(bridge, "emit", lambda event, data=None: emitted.append((event, data)))
     monkeypatch.setattr(bridge.threading, "Thread", _ImmediateThread)
 
@@ -113,7 +121,53 @@ def test_bridge_uses_checkpoint_prompt_format_and_advances_terminal_eos(monkeypa
     assert len(model.calls) == 2
     assert torch.equal(model.calls[-1], torch.tensor([[tokenizer.eos_token_id]]))
     assert bridge._total_tokens_generated == 3
+    assert bridge._pending_feedback is None
     assert not [event for event, _ in emitted if event == "token"]
+
+
+def test_bridge_caches_only_the_last_completed_prompt_response(monkeypatch):
+    bridge = importlib.import_module("hierarchos_bridge_server")
+    model = _EOSRecordingModel()
+    tokenizer = _PromptTokenizer()
+    emitted = []
+
+    monkeypatch.setattr(bridge, "_model", model)
+    monkeypatch.setattr(bridge, "_tokenizer", tokenizer)
+    monkeypatch.setattr(bridge, "_device", torch.device("cpu"))
+    monkeypatch.setattr(bridge, "_config", dict(model.config))
+    monkeypatch.setattr(bridge, "_h_state", None)
+    monkeypatch.setattr(bridge, "_l_state", None)
+    monkeypatch.setattr(bridge, "_prev_context", None)
+    monkeypatch.setattr(bridge, "_target_context", None)
+    monkeypatch.setattr(bridge, "_drift_state", None)
+    monkeypatch.setattr(bridge, "_ltm_state", None)
+    monkeypatch.setattr(bridge, "_total_tokens_generated", 0)
+    monkeypatch.setattr(bridge, "_pending_feedback", {"stale": True})
+    monkeypatch.setattr(bridge, "emit", lambda event, data=None: emitted.append((event, data)))
+    monkeypatch.setattr(bridge.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        bridge,
+        "_sample_next_token",
+        lambda *_args, **_kwargs: torch.tensor([[3]], dtype=torch.long),
+    )
+
+    bridge.handle_generate(
+        {
+            "message": "remember this exchange",
+            "sampling": {"max_new_tokens": 1, "temperature": 0.0},
+        }
+    )
+
+    assert ("generation_complete", {"status": "completed"}) in emitted
+    assert bridge._pending_feedback is not None
+    torch.testing.assert_close(
+        bridge._pending_feedback["prompt_ids"],
+        torch.tensor([1, 2], dtype=torch.long),
+    )
+    torch.testing.assert_close(
+        bridge._pending_feedback["response_ids"],
+        torch.tensor([3], dtype=torch.long),
+    )
 
 
 def test_bridge_chat_state_is_current_strict_and_round_trips(tmp_path, monkeypatch):
@@ -217,6 +271,348 @@ def test_bridge_rejects_nonfinite_ltm_sidecar_without_mutating_values(
     torch.testing.assert_close(model.ltm.vals, before)
 
 
+@pytest.mark.parametrize(
+    ("positive", "expected_source", "expected_penalty"),
+    ((True, 1, False), (False, 3, True)),
+)
+def test_bridge_feedback_routes_polarity_through_shared_transaction(
+    monkeypatch,
+    positive,
+    expected_source,
+    expected_penalty,
+):
+    bridge = importlib.import_module("hierarchos_bridge_server")
+    import hierarchos.inference.chat as chat_module
+
+    observed = {}
+    emitted = []
+    model = SimpleNamespace(
+        config=_tiny_config(),
+        ltm=SimpleNamespace(accumulate_deltas=False),
+    )
+
+    def fake_transaction(*_args, **kwargs):
+        observed.update(kwargs)
+        return {
+            "committed": False,
+            "reason": "test-routing",
+            "loss_before": 1.0,
+        }
+
+    monkeypatch.setattr(chat_module, "apply_online_feedback_transaction", fake_transaction)
+    monkeypatch.setattr(bridge, "_model", model)
+    monkeypatch.setattr(bridge, "_tokenizer", _PromptTokenizer())
+    monkeypatch.setattr(bridge, "_config", {})
+    monkeypatch.setattr(
+        bridge,
+        "_pending_feedback",
+        {
+            "prompt_ids": torch.tensor([1, 2]),
+            "response_ids": torch.tensor([3, 4]),
+        },
+    )
+    monkeypatch.setattr(bridge, "emit", lambda event, data=None: emitted.append((event, data)))
+
+    bridge.handle_send_feedback({"positive": positive, "learning_rate": 9.0})
+
+    assert observed["source_id"] == expected_source
+    assert observed["penalty"] is expected_penalty
+    assert observed["learning_rate"] == pytest.approx(0.1)
+    assert model.ltm.accumulate_deltas
+    assert bridge._pending_feedback is None
+    assert ("feedback_complete", {
+        "status": "rejected",
+        "reason": "test-routing",
+        "loss_before": 1.0,
+    }) in emitted
+    assert bridge._current_operation() is None
+
+
+def test_bridge_invalid_feedback_rate_does_not_consume_pending_exchange(monkeypatch):
+    bridge = importlib.import_module("hierarchos_bridge_server")
+    emitted = []
+    pending = {
+        "prompt_ids": torch.tensor([1, 2]),
+        "response_ids": torch.tensor([3, 4]),
+    }
+    monkeypatch.setattr(bridge, "_model", SimpleNamespace())
+    monkeypatch.setattr(bridge, "_tokenizer", _PromptTokenizer())
+    monkeypatch.setattr(bridge, "_config", {})
+    monkeypatch.setattr(bridge, "_pending_feedback", pending)
+    monkeypatch.setattr(bridge, "emit", lambda event, data=None: emitted.append((event, data)))
+
+    bridge.handle_send_feedback({"positive": True, "learning_rate": "nan"})
+
+    assert bridge._pending_feedback is pending
+    assert ("feedback_complete", {
+        "status": "rejected",
+        "reason": "invalid-learning-rate",
+    }) in emitted
+    assert any(
+        event == "error" and "finite positive" in (data or {}).get("message", "")
+        for event, data in emitted
+    )
+
+
+def test_bridge_opt_in_passive_learning_targets_prompt_only(monkeypatch):
+    bridge = importlib.import_module("hierarchos_bridge_server")
+    import hierarchos.inference.chat as chat_module
+
+    model = _EOSRecordingModel()
+    model.ltm = SimpleNamespace(accumulate_deltas=False)
+    tokenizer = _PromptTokenizer()
+    emitted = []
+    observed = {}
+
+    def fake_transaction(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return {
+            "committed": False,
+            "reason": "test-passive-routing",
+            "loss_before": 1.0,
+        }
+
+    monkeypatch.setattr(chat_module, "apply_online_feedback_transaction", fake_transaction)
+    monkeypatch.setattr(bridge, "_model", model)
+    monkeypatch.setattr(bridge, "_tokenizer", tokenizer)
+    monkeypatch.setattr(bridge, "_device", torch.device("cpu"))
+    monkeypatch.setattr(bridge, "_config", dict(model.config))
+    monkeypatch.setattr(bridge, "_h_state", None)
+    monkeypatch.setattr(bridge, "_l_state", None)
+    monkeypatch.setattr(bridge, "_prev_context", None)
+    monkeypatch.setattr(bridge, "_target_context", None)
+    monkeypatch.setattr(bridge, "_drift_state", None)
+    monkeypatch.setattr(bridge, "_ltm_state", None)
+    monkeypatch.setattr(bridge, "_total_tokens_generated", 0)
+    monkeypatch.setattr(bridge, "emit", lambda event, data=None: emitted.append((event, data)))
+    monkeypatch.setattr(bridge.threading, "Thread", _ImmediateThread)
+
+    bridge.handle_generate(
+        {
+            "message": "learn this user prompt",
+            "sampling": {"max_new_tokens": 1, "temperature": 0.0},
+            "online_learning": {
+                "passive_learning": True,
+                "passive_lr": 1.0,
+            },
+        }
+    )
+
+    assert ("generation_complete", {"status": "completed"}) in emitted
+    assert len(observed["args"]) == 3
+    assert observed["args"][0] is model
+    torch.testing.assert_close(
+        observed["args"][1],
+        torch.tensor([1, 2], dtype=torch.long),
+    )
+    assert observed["args"][2] is None
+    assert observed["kwargs"]["learn_input_tokens"] is True
+    assert observed["kwargs"]["penalty"] is False
+    assert observed["kwargs"]["source_id"] == 1
+    assert observed["kwargs"]["learning_rate"] == pytest.approx(1e-3)
+    assert model.ltm.accumulate_deltas
+    assert any(
+        event == "status" and "prompt-only" in (data or {}).get("message", "")
+        for event, data in emitted
+    )
+
+
+def test_bridge_positive_feedback_commits_persists_and_reloads_v3(
+    tmp_path,
+    monkeypatch,
+):
+    bridge = importlib.import_module("hierarchos_bridge_server")
+    from hierarchos.inference.chat_state import clear_ltm_working_memory
+    from hierarchos.utils.tokenizer import tokenizer_identity
+
+    torch.manual_seed(123)
+    config = _tiny_config()
+    model = HierarchosCore(config).eval()
+    tokenizer = _PromptTokenizer()
+    tokenizer_id = tokenizer_identity(tokenizer)
+    model_identity = {"checkpoint_sha256": "a" * 64}
+    emitted = []
+
+    monkeypatch.setattr(bridge, "_model", model)
+    monkeypatch.setattr(bridge, "_tokenizer", tokenizer)
+    monkeypatch.setattr(bridge, "_tokenizer_identity", tokenizer_id)
+    monkeypatch.setattr(bridge, "_model_identity", model_identity)
+    monkeypatch.setattr(bridge, "_device", torch.device("cpu"))
+    monkeypatch.setattr(
+        bridge,
+        "_config",
+        {**dict(config), "online_ltm_lr": 0.1},
+    )
+    monkeypatch.setattr(bridge, "_model_dir", str(tmp_path))
+    monkeypatch.setattr(bridge, "_ltm_state", None)
+    monkeypatch.setattr(bridge, "_ltm_token_clock", 0)
+    monkeypatch.setattr(bridge, "_ltm_overlay_write_blocked_reason", None)
+    monkeypatch.setattr(bridge, "_total_tokens_generated", 7)
+    monkeypatch.setattr(
+        bridge,
+        "_pending_feedback",
+        {
+            "prompt_ids": torch.tensor([1, 2, 3, 4]),
+            "response_ids": torch.tensor([5, 6, 7]),
+        },
+    )
+    monkeypatch.setattr(bridge, "emit", lambda event, data=None: emitted.append((event, data)))
+
+    bridge.handle_send_feedback({"positive": True})
+
+    completion = [data for event, data in emitted if event == "feedback_complete"][-1]
+    assert completion["status"] == "accepted"
+    assert completion["persisted"] is True
+    assert completion["delta_norm"] > 0
+    assert bridge._pending_feedback is None
+    assert bridge._ltm_state is not None
+    assert bridge._ltm_token_clock == 7
+    assert not torch.count_nonzero(bridge._ltm_state[1])
+    assert float(model.ltm.ltm_deltas.norm()) > 0
+    assert model.ltm.accumulate_deltas
+    assert bridge._current_operation() is None
+
+    overlay_path = tmp_path / "hierarchos_ltm_updates.pt"
+    assert overlay_path.is_file()
+    assert not (tmp_path / "hierarchos_ltm_updates.pt.tmp").exists()
+    payload = load_checkpoint_payload_compatible(str(overlay_path), map_location="cpu")
+    assert payload["version"] == 3
+    assert payload["bridge_runtime_identity"]["model"] == model_identity
+    assert payload["runtime_identity"]["tokenizer_sha256"] == tokenizer_id["sha256"]
+    assert float(payload["delta"].norm()) > 0
+
+    torch.manual_seed(123)
+    restored = HierarchosCore(_tiny_config()).eval()
+    clear_ltm_working_memory(restored)
+    restored.ltm.ltm_deltas.zero_()
+    restored_before = restored.ltm.vals.detach().clone()
+    monkeypatch.setattr(bridge, "_model", restored)
+    monkeypatch.setattr(bridge, "_config", dict(restored.config))
+    monkeypatch.setattr(bridge, "_model_identity", model_identity)
+    monkeypatch.setattr(bridge, "_ltm_state", None)
+
+    bridge._apply_saved_ltm_updates()
+
+    torch.testing.assert_close(
+        restored.ltm.vals,
+        restored_before + payload["delta"].to(restored.ltm.vals),
+    )
+    torch.testing.assert_close(
+        restored.ltm.ltm_deltas,
+        payload["delta"].to(restored.ltm.ltm_deltas),
+    )
+    assert bridge._ltm_token_clock == 7
+
+    torch.manual_seed(123)
+    wrong_runtime = HierarchosCore(_tiny_config()).eval()
+    wrong_before = wrong_runtime.ltm.vals.detach().clone()
+    monkeypatch.setattr(bridge, "_model", wrong_runtime)
+    monkeypatch.setattr(
+        bridge,
+        "_model_identity",
+        {"checkpoint_sha256": "b" * 64},
+    )
+    with pytest.raises(RuntimeError, match="different model weights or tokenizer"):
+        bridge._apply_saved_ltm_updates()
+    torch.testing.assert_close(wrong_runtime.ltm.vals, wrong_before)
+
+
+def test_bridge_persistence_failure_rolls_back_accepted_memory_write(
+    tmp_path,
+    monkeypatch,
+):
+    bridge = importlib.import_module("hierarchos_bridge_server")
+    import hierarchos.inference.chat as chat_module
+
+    model = HierarchosCore(_tiny_config()).eval()
+    model.ltm.accumulate_deltas = True
+    tokenizer = _PromptTokenizer()
+    prior_ltm_state = (torch.tensor([123.0]),)
+    prior_token_clock = 11
+    mutable_attrs = (
+        "fast_vals",
+        "_mom_vals",
+        "timestamps",
+        "sources",
+        "wallclock_timestamps",
+        "ltm_deltas",
+    )
+    before = {
+        attr: getattr(model.ltm, attr).detach().clone()
+        for attr in mutable_attrs
+    }
+
+    def fake_transaction(*_args, **_kwargs):
+        with torch.no_grad():
+            for attr in mutable_attrs:
+                getattr(model.ltm, attr).add_(1)
+        return {
+            "committed": True,
+            "reason": "accepted",
+            "loss_before": 2.0,
+            "loss_after": 1.0,
+            "delta_norm": 1.0,
+            "ltm_state": (torch.tensor([456.0]),),
+            "token_clock": prior_token_clock + 7,
+        }
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("forced atomic overlay failure")
+
+    monkeypatch.setattr(chat_module, "apply_online_feedback_transaction", fake_transaction)
+    monkeypatch.setattr(chat_module, "save_ltm_delta_overlay_atomic", fail_save)
+    monkeypatch.setattr(bridge, "_model", model)
+    monkeypatch.setattr(bridge, "_tokenizer", tokenizer)
+    monkeypatch.setattr(bridge, "_tokenizer_identity", {})
+    monkeypatch.setattr(bridge, "_model_identity", {"checkpoint_sha256": "a" * 64})
+    monkeypatch.setattr(bridge, "_config", dict(model.config))
+    monkeypatch.setattr(bridge, "_model_dir", str(tmp_path))
+    monkeypatch.setattr(bridge, "_ltm_state", prior_ltm_state)
+    monkeypatch.setattr(bridge, "_ltm_token_clock", prior_token_clock)
+    monkeypatch.setattr(bridge, "_ltm_overlay_write_blocked_reason", None)
+    monkeypatch.setattr(bridge, "_total_tokens_generated", 7)
+
+    result = bridge._apply_bridge_online_ltm_transaction(
+        torch.tensor([1, 2, 3]),
+        torch.tensor([4, 5]),
+        source_id=1,
+        penalty=False,
+        learning_rate=0.1,
+    )
+
+    assert result["committed"] is False
+    assert result["reason"] == "persistence-failed"
+    assert result["persisted"] is False
+    assert result["rolled_back"] is True
+    assert "forced atomic overlay failure" in result["persistence_error"]
+    assert result["ltm_state"] is prior_ltm_state
+    assert result["token_clock"] == prior_token_clock
+    assert bridge._ltm_state is prior_ltm_state
+    assert bridge._ltm_token_clock == prior_token_clock
+    for attr, expected in before.items():
+        torch.testing.assert_close(getattr(model.ltm, attr), expected)
+
+
+def test_bridge_runtime_reset_and_release_discard_pending_feedback(monkeypatch):
+    bridge = importlib.import_module("hierarchos_bridge_server")
+    emitted = []
+    monkeypatch.setattr(bridge, "emit", lambda event, data=None: emitted.append((event, data)))
+    monkeypatch.setattr(bridge, "_pending_feedback", {"response_ids": torch.tensor([1])})
+
+    bridge._reset_runtime_state()
+    assert bridge._pending_feedback is None
+
+    monkeypatch.setattr(bridge, "_model", _EOSRecordingModel())
+    monkeypatch.setattr(bridge, "_tokenizer", _PromptTokenizer())
+    monkeypatch.setattr(bridge, "_pending_feedback", {"response_ids": torch.tensor([2])})
+    monkeypatch.setattr(bridge, "_ltm_token_clock", 9)
+    bridge._release_loaded_model()
+    assert bridge._pending_feedback is None
+    assert bridge._ltm_token_clock == 0
+    assert ("model_unloaded", {}) in emitted
+
+
 def test_bridge_rejects_generation_while_training_lane_is_active(monkeypatch):
     bridge = importlib.import_module("hierarchos_bridge_server")
     emitted = []
@@ -286,6 +682,7 @@ def test_every_shared_state_handler_uses_the_operation_lane():
         "save_chat_runtime_state",
         "load_chat_runtime_state",
         "reset_chat_runtime_state",
+        "send_feedback",
         "execute_command",
         "set_threads",
     }
@@ -319,9 +716,10 @@ def test_busy_lane_rejects_resets_and_thread_changes_but_allows_stop_and_ping(
 
     bridge.handle_execute_command({"command": "/reset"})
     bridge.handle_set_threads({"threads": 1})
+    bridge.handle_send_feedback({"positive": True})
     assert bridge._total_tokens_generated == 11
     assert bridge._current_operation() == "training"
-    assert len([event for event, _ in emitted if event == "error"]) == 2
+    assert len([event for event, _ in emitted if event == "error"]) == 3
 
     bridge.handle_stop_generation({})
     bridge.handle_stop_training({})

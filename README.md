@@ -5,9 +5,10 @@
 > **Current release: Hierarchos Alpha v0.30.** New training runs use the
 > RWKV-v9 core with corrected manager/worker recurrence, hard per-row ACT,
 > bounded ROSA, shared factorized token adapters, persisted memory-gate schedule
-> state, full-precision train/chat parity controls, and fail-closed
-> checkpoint/resume boundaries. A reference `448/448/448` Alpha v0.30 model
-> with the GPT-2 vocabulary has `30,227,653` unique parameters and `102`
+> state, a causally trained transactional fast-memory writer, full-precision
+> train/chat parity controls, and fail-closed checkpoint/resume boundaries. A
+> reference `448/448/448` Alpha v0.30 model with the GPT-2 vocabulary has
+> `30,227,653` unique parameters and `102`
 > state-dict entries. The historical RWKV-v8 design has `232,516,229`
 > parameters and `95` state-dict entries.
 >
@@ -65,11 +66,13 @@ right-hand side is the core used by **Hierarchos Alpha v0.30**.
                   |                                    +------------+------------+
                   v                                                     |
      +-------------------------+                                        v
-     | LTM retrieval with      |                       +-------------------------+
-     | legacy clock/filter     |                       | Valid-slot-masked LTM   |
-     | semantics; supervised   |                       | with token/wall clocks, |
-     | inner updates by default |                      | source metadata, and    |
-     +------------+------------+                       | read-only parity default |
+     | Legacy absolute-time    |                       +-------------------------+
+     | LTM feature injection   |                       | Valid-slot-masked LTM   |
+     | and clock filtering;    |                       | metadata-only token and |
+     | target-gradient inner   |                       | wall timestamps;        |
+     | updates by default      |                       | trained value writer;   |
+     |                         |                       | transactional fast      |
+     +------------+------------+                       | memory policies         |
                   |                                    +------------+------------+
                   v                                                     |
      +-------------------------+                                        v
@@ -103,6 +106,59 @@ feature tables with shared low-rank adapters. The output embedding remains tied,
 so Alpha v0.30 keeps the normal full-vocabulary language-model objective without
 adding a second output matrix.
 
+## Safe online adaptation in Alpha v0.30
+
+Online adaptation remains an intended part of Hierarchos. The safe RWKV-v9
+contract separates *learning a writer* from *allowing that writer to mutate a
+live conversation*:
+
+- `--ltm-training-mode read-only` disables supervised target-gradient writes to
+  fast LTM slots during training. It does not disable the learned LTM reader or
+  the causal `val_proj` writer auxiliary, and it does not remove the runtime
+  transaction path.
+- `--no-persist-state` resets H/L/context/LTM carriers between unrelated,
+  shuffled dataset rows. State still flows forward across every 256-token TBPTT
+  chunk within one sample. This flag does not disable post-training chat
+  adaptation.
+- Fresh RWKV-v9 runs train the value writer with an energy-normalized causal
+  alignment objective at weight `0.01`, sampled every eighth token. A checkpoint
+  needs at least `100` successful writer updates and must pass finite-loss,
+  alignment-EMA, and writer-norm readiness gates before any `val_proj`/Hebbian
+  writer path is permitted. The default explicit feedback transaction is
+  gradient-derived and remains separately bounded by replay and norm checks.
+- Normal chat prefill and token generation are read-only. At an allowed action
+  boundary, Hierarchos clones the candidate fast state, applies a bounded update
+  with learning-rate backoff, checks finite and norm budgets, replays the local
+  objective, and commits only a non-worsening candidate. A rejection leaves the
+  live state unchanged.
+
+The chat policy is explicit:
+
+| `--online-adaptation-policy` | Allowed writes |
+| --- | --- |
+| `off` | No writes, including explicit actions. Use for static evaluation and logit parity. |
+| `validated` (default) | Only explicit `/learn`, `/reject`, and `/correct <target>` actions. This is the safe interactive default. |
+| `prompt` | `validated` plus conservative passive writes from observed user prompts; generated answers remain read-only. Legacy `--passive-learning` maps here. |
+| `prompt+response` | `prompt` plus quality/surprise-gated writes from model responses. This is the highest-risk, opt-in policy. Legacy `--passive-response-learning` maps here and requires prompt-passive learning. |
+
+`/learn` reinforces the last completed response, `/reject` applies an
+unlikelihood update to it, and `/correct <target>` rejects that response before
+learning the supplied correction. Natural-language feedback interpretation is
+off by default; enable `--natural-feedback-detection` only when that heuristic
+behavior is desired. Exact slash actions are the auditable path.
+
+For the measured Colab profile, this is the literal one-line Alpha v0.30
+fresh-run command (batch `64`, accumulation `1`, no legacy checkpoint resume):
+
+```bash
+!cd ./Hierarchos && python hierarchos_cli.py train --architecture-revision coherent-v9 --hf_dataset "netcat420/Experiment_0.1" --hf_dataset_split "train" --hf-dataset-revision "4ef25be0ca46e7da7c70121b0b6d8e99cc232a51" --out-dir "./chatHRM_alpha_v030" --tokenizer-path "openai-community/gpt2" --epochs 15 --batch_size 64 --accumulation-steps 1 --accumulation-normalization weighted-token --max_length 8880 --training-chunk-size 256 --no-full-sample-bptt --no-full-sample-activation-checkpointing --detach-every-n-steps 0 --no-persist-state --context_dim 448 --h_hidden 448 --l_hidden 448 --rwkv-head-size 64 --max_h_steps 5 --max_l_steps 5 --alpaca --assistant-recovery --ltm-training-mode read-only --ltm-value-alignment-weight 0.01 --ltm-value-alignment-stride 8 --ltm-value-alignment-min-updates 100 --train-prompt-tokens --prompt-loss-weight 0.10 --response-loss-weight 1.0 --response-boundary-loss-weight 2.0 --response-boundary-tokens 64 --min-response-tokens 16 --starting-lr 2e-5 --min-lr 1e-7 --warmup-ratio 0.01 --ltm-lr 3e-4 --min-ltm-lr 1e-5 --adaptive-ponder --ponder-target-scale 0.65 --ponder-loss-weight 0.003 --commitment-loss-weight 0.5 --max-commitment-cost-for-backward 4.0 --max-ce-loss-for-backward 0 --max-ponder-cost-for-backward 0 --startup-weight-max-abs 0 --halt-logit-clamp 30.0 --recurrent-state-clamp 50.0 --context-state-clamp 50.0 --activation-clamp 100.0 --drift-state-clamp 2.0 --drift-norm-clamp 4.0 --rwkv-channel-mix-key-clamp 12.0 --rwkv-channel-mix-deepembed-clamp 4.0 --drift-delta-scale 0.35 --memory-gate-warmup-steps 5000 --memory-gate-warmup-floor 0.10 --grad-clip 0.75 --device cuda --amp --force-compile --compile-mode max-autotune-no-cudagraphs --compile-static-worker-loop --hf-token-cache --hf-token-cache-dir "/content/hierarchos_token_cache/experiment_0_1_alpha_v030" --token-cache-build-batch-size 256 --length-bucket-auto-sample-size 1000000 --cuda-prefetch --cuda-loss-chunk-rows 0 --num_workers -1 --padding-metric-steps 0 --save-steps 600
+```
+
+The Markdown renderer may visually wrap the command, but it is one physical
+line for Colab/autoclicker use. The nonzero LTM LR range and enabled schedule
+belong to the Alpha v0.30 memory-training contract; runtime feedback uses the
+separate `--online-ltm-lr` transaction setting.
+
 **Historical Alpha v0.21 / RWKV-v8 focus**: the v0.21 material immediately below
 describes the checkpoint-compatible RWKV-v8 full-sample-BPTT and input
 pipeline work. Its `232,516,229` parameter, `95` tensor, and historical test
@@ -124,7 +180,7 @@ figures are not claims about Hierarchos Alpha v0.30.
 
 **Real checkpoint compatibility**: all `95` tensors in the re-downloaded epoch-13 checkpoint strict-load finitely, tied embeddings remain tied, and the exact local tokenizer matches the `50,257`-token vocabulary. Chunked epoch-13 recurrence and one-token chat streaming match across a real `256`-token TBPTT boundary with maximum logit delta `1.144409e-05` over `270` tokens. A single nested download directory now resolves safely for both weights and tokenizer assets.
 
-**Safe online memory**: the historical language objective never trained `val_proj`, the projection used for Hebbian validation writes. Legacy checkpoints now block that random writer at the model boundary while retaining gradient-derived feedback learning. Future runs can opt into `--ltm-value-alignment-weight`; the energy-normalized auxiliary affects only the existing writer tensor, excludes it from AdamW decay, and requires `100` successful updates by default before enabling Hebbian writes. The default weight is `0.0`, preserving the legacy objective.
+**Safe online memory**: the historical RWKV-v8 language objective never trained `val_proj`, the projection used for Hebbian validation writes. Legacy checkpoints block that random writer at the model boundary while retaining gradient-derived transactional feedback learning. RWKV-v8 runs can opt into `--ltm-value-alignment-weight`; its default remains `0.0` to preserve the legacy objective. Fresh Alpha v0.30 RWKV-v9 runs instead train the same existing writer causally at weight `0.01` and stride `8`, exclude it from AdamW decay, and require at least `100` successful updates plus readiness checks before a `val_proj`/Hebbian write can run.
 
 **Epoch-13 weight findings**: the checkpoint is coherent and usable as a budget-saving v2 warm start, but it is specialized rather than optimal. ROSA routing is strong, LTM routing is nearly closed, and the two DeepEmbed tables average about `0.355` after historical weight decay from their `1.0` identity initialization. Do not reset these learned compensations; rehabilitate them gradually with diverse data and the corrected no-decay optimizer.
 
@@ -1116,7 +1172,7 @@ For models trained with `--alpaca`, the training formatter uses this prompt stri
 
 Adjust generation quality with:
 ```bash
-python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-k 40 --top-p 0.9 --repetition-penalty 1.15 --no-passive-learning --chat-input-history-turns 0
+python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-k 40 --top-p 0.9 --repetition-penalty 1.15 --online-adaptation-policy off --no-passive-learning --chat-input-history-turns 0
 ```
 
 | Parameter | Effect | Recommended |
@@ -1125,7 +1181,8 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--top-k` | Limit vocab to top K tokens | 40 |
 | `--top-p` | Nucleus sampling threshold | 0.9 |
 | `--repetition-penalty` | Penalize repeated tokens (1.0=off, >1.0=stronger) | 1.15 for KortexHOS release checks; 1.2 if repetition appears |
-| `--no-passive-learning` | Disables passive chat LTM writes | Recommended for baseline coherence/benchmark parity |
+| `--online-adaptation-policy` | Selects `off`, explicit-only `validated`, passive-user `prompt`, or passive-user-and-response `prompt+response` writes | `validated` for chat; `off` for static parity |
+| `--no-passive-learning` | Compatibility switch that disables passive prompt writes; explicit actions remain governed by the policy | Keep for legacy scripts; use the policy directly in new scripts |
 | `--chat-input-history-turns 0` | Disables previous-turn injection into Alpaca `### Input:` | Recommended for first-turn and release-quality checks |
 
 -----
@@ -1187,11 +1244,15 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--warmup-steps`               | `train`, `finetune`                 | Optimizer update steps spent linearly warming from `--min-lr` to `--starting-lr`; overrides `--warmup-ratio` when set.                  | `0`                     |
 | `--warmup-ratio`               | `train`, `finetune`                 | Fraction of optimizer updates used for LR warmup before cosine decay.                                                                    | `0.0`                   |
 | `--disable-lr-schedule`        | `train`, `finetune`                 | Use a fixed Learning Rate (`--starting-lr`) instead of cosine annealing.                                                                 | `False`                 |
-| `--ltm_lr`                     | `train`, `finetune`, `chat`         | Learning Rate for LTM "surprise" updates (or max LR for LTM schedule in chat).                                                         | `1e-3`                  |
-| `--ltm-training-mode`          | `train`                             | LTM fast-memory training mode. `inner-update` keeps supervised gradient fast-memory writes; `read-only` carries ROSA/history state only and better matches normal chat inference. | `read-only` for Alpha v0.30 |
+| `--ltm-lr`                     | `train`, `finetune`                 | Maximum LTM inner-update LR used by the saved training schedule. This is distinct from transactional chat feedback.                     | `1e-3`                  |
+| `--ltm-training-mode`          | `train`                             | `read-only` disables supervised target-gradient fast-slot writes while retaining the learned LTM reader and leakage-free writer auxiliary. It does not disable transactional runtime adaptation. `inner-update` is a legacy/Titans ablation. | `read-only` for Alpha v0.30 |
 | `--inference-like-ltm-training` | `train`                            | Shortcut for `--ltm-training-mode read-only`; recommended for assistant rescue/coherence runs.                                         | `False`                 |
-| `--ltm-value-alignment-weight` | `train`, `finetune`                 | Opt-in energy-normalized auxiliary for training the Hebbian `val_proj` writer. It affects only that existing tensor; `0` preserves the legacy objective. | `0.0`                   |
-| `--ltm-value-alignment-min-updates` | `train`, `finetune`             | Successful writer-training optimizer updates required before a checkpoint enables Hebbian validation writes.                           | `100`                   |
+| `--ltm-value-alignment-weight` | `train`, `finetune`                 | Energy-normalized causal auxiliary for training the existing `val_proj` fast-memory writer. `0` preserves the historical RWKV-v8 objective. | `0.01` for fresh RWKV-v9; `0.0` for RWKV-v8 |
+| `--ltm-value-alignment-stride` | `train`, `finetune`                 | Computes the writer auxiliary on one causal token in every N to limit training cost without adding parameters.                          | `8` for fresh RWKV-v9; `1` for RWKV-v8 |
+| `--ltm-value-alignment-min-updates` | `train`, `finetune`             | Successful writer-training optimizer updates required before a checkpoint can enable transactional fast-memory writes.                 | `100`                   |
+| `--ltm-value-alignment-ready-threshold` | `train`, `finetune`          | Maximum finite alignment-loss EMA accepted by the writer-readiness gate.                                                                | `0.95` for fresh RWKV-v9 |
+| `--ltm-value-alignment-ema-decay` | `train`, `finetune`              | Decay used to track the writer alignment-loss EMA saved with the checkpoint.                                                            | `0.95`                  |
+| `--ltm-value-writer-max-norm` | `train`, `finetune`                  | Maximum finite `val_proj` weight norm accepted by the writer-readiness gate.                                                            | `64.0`                  |
 | `--assistant-recovery`         | `train`                             | Apply the v0.20.4 large-assistant SFT preset: Alpaca formatting, 4 epochs unless overridden, warmup+cosine LR, inference-like LTM training, prompt/response weights `0.10/1.0`, `2.0x` first `32` response tokens, `16` reserved response tokens, `0.003` ponder weight, and `5000` memory-gate warmup steps. | `False`                 |
 | `--mask-prompt-tokens`         | `train`, `finetune`                 | Legacy SFT behavior: exclude prompt/instruction/input tokens from CE. By default, prompt tokens are trained and can be downweighted.      | `False`                 |
 | `--allow-masked-active-labels` | `train`, `finetune`                 | Disable the fail-fast audit that rejects masked labels on real prompt/completion tokens when prompt-token training is active.             | `False`                 |
@@ -1234,6 +1295,11 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 | `--device`                     | `chat`, `train`                     | Device for inference/training (`cpu`, `cuda`, or `dml`). **Note:** `dml` requires `torch-directml` and Windows. DirectML requires explicit opt-in. | `auto`                   |
 | `--h-halt-thresh`              | `chat`                              | Probability threshold for early exiting the HRM reasoning loop during inference.                                                         | `0.9`                   |
 | `--max-new-tokens`             | `chat`                              | Maximum number of tokens to generate in chat mode.                                                                                       | `512`                   |
+| `--online-adaptation-policy`   | `chat`                              | Controls fast-memory transactions: `off`, explicit-action-only `validated`, passive-user `prompt`, or passive-user-and-response `prompt+response`. Ordinary prefill/generation remains read-only in every mode. | `validated`             |
+| `--natural-feedback-detection` | `chat`                             | Opt into heuristic natural-language praise/rejection/correction detection. Exact slash actions do not require this heuristic.            | `False`                 |
+| `--passive-learning`           | `chat`                              | Legacy compatibility switch that maps to at least the `prompt` policy and permits conservative observed-prompt writes.                  | `False`                 |
+| `--passive-response-learning`  | `chat`                              | Legacy compatibility switch that maps to `prompt+response`; requires prompt-passive learning and enables quality/surprise-gated response writes. | `False`           |
+| `--online-ltm-lr`              | `chat`                              | Explicit-feedback transactional fast-memory LR, separate from the training inner-update LR.                                             | `1e-3`                  |
 | `--ltm-lora-path`              | `chat`                              | Optional: Path to save/load LTM updates as a separate delta file in chat mode.                                                           | `None`                  |
 | `--static-ltm-lr`              | `chat`                              | Disable cosine annealing for chat LTM updates, use fixed `--ltm_lr`; pass `--dynamic-ltm-lr` to opt into cosine annealing.               | `True`                  |
 | `--ltm-schedule-steps`         | `chat`                              | Number of chat updates per LTM LR cosine cycle.                                                                                          | `100`                   |
@@ -1328,6 +1394,8 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
   * **Product and Core Naming**: The public release is **Hierarchos Alpha v0.30**. RWKV-v8 and RWKV-v9 identify core architecture generations only; `legacy-v8` and `coherent-v9` remain compatibility-stable internal checkpoint/config identifiers.
   * **RWKV-v9 Core**: Introduces the corrected matrix-state recurrence, per-row hard ACT, bounded deterministic ROSA, isolated metadata-safe LTM, and shared factorized token adapters.
   * **Affordable Reference Architecture**: The `448/448/448` reference has `30,227,653` parameters and `102` state-dict entries, versus `232,516,229` parameters and `95` entries for the historical RWKV-v8 reference—an `86.9998%` parameter reduction.
+  * **Leakage-Free Writer Training**: Fresh RWKV-v9 runs train the existing `val_proj` writer causally at weight `0.01` and stride `8`, with a 100-update minimum plus finite alignment-EMA and writer-norm readiness gates.
+  * **Transactional Online Adaptation**: Restores intended fast-memory learning behind `off`, `validated`, `prompt`, and `prompt+response` policies. Explicit feedback is the safe default; passive prompt and self-response writes remain opt-in, bounded, replay-validated transactions.
   * **End-to-End Coherence**: Hardens checkpoint/resume, cache/tokenizer, CLI/GUI, packaging, and inference boundaries, with an ASCII RWKV-v8-to-v9 architecture flowchart near the top of this README.
 
 ### v0.21 (alpha)

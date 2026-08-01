@@ -42,3 +42,26 @@ def test_gui_bridge_tracks_training_terminal_events_and_auto_fallback():
         encoding="utf-8"
     )
     assert "state.config.full_sample_activation_checkpointing = true;" in training_panel
+
+
+def test_gui_passive_online_learning_is_opt_in():
+    settings = (
+        ROOT / "hierarchos-gui" / "src" / "panels" / "settings.rs"
+    ).read_text(encoding="utf-8")
+    assert "passive_learning: false," in settings
+    assert "Generated responses are never self-trained." in settings
+    assert "Surprise Threshold" not in settings
+
+    bridge = (ROOT / "hierarchos-gui" / "src" / "bridge.rs").read_text(
+        encoding="utf-8"
+    )
+    assert '"passive_learning": passive_learning' in bridge
+    assert '"passive_lr": passive_lr' in bridge
+    assert '"learning_rate": learning_rate' in bridge
+
+    chat = (ROOT / "hierarchos-gui" / "src" / "panels" / "chat.rs").read_text(
+        encoding="utf-8"
+    )
+    assert "settings.passive_learning" in chat
+    assert "settings.passive_lr" in chat
+    assert "settings.ltm_lr" in chat

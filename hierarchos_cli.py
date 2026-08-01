@@ -62,6 +62,7 @@ from hierarchos.utils.tokenizer import (
 from hierarchos.utils.lora_merge import merge_lora_adapter
 from hierarchos.utils.safe_loading import load_tensor_payload_safely
 from hierarchos.models.revisions import (
+    COHERENT_REVISION,
     COHERENT_TRAINING_CHUNK_SIZE,
     apply_architecture_revision_defaults,
     architecture_contract,
@@ -2572,7 +2573,11 @@ _CONTINUATION_SUMMARY_KEYS = (
     "min_ltm_lr",
     "ltm_training_mode",
     "ltm_value_alignment_weight",
+    "ltm_value_alignment_stride",
     "ltm_value_alignment_min_updates",
+    "ltm_value_alignment_ready_threshold",
+    "ltm_value_alignment_ema_decay",
+    "ltm_value_writer_max_norm",
     "compile",
     "force_compile",
     "amp",
@@ -2833,6 +2838,19 @@ def _apply_assistant_recovery_defaults(args, explicit_dests):
     _set_default_if_not_explicit(args, explicit_dests, "ltm_lr", 3e-4, applied)
     _set_default_if_not_explicit(args, explicit_dests, "min_ltm_lr", 1e-5, applied)
     _set_default_if_not_explicit(args, explicit_dests, "ltm_training_mode", "read-only", applied)
+    if str(getattr(args, "architecture_revision", "") or "").strip().lower().replace("_", "-") in {
+        COHERENT_REVISION,
+        "coherent",
+        "v9",
+        "v9-coherent",
+    }:
+        _set_default_if_not_explicit(
+            args,
+            explicit_dests,
+            "ltm_value_alignment_weight",
+            0.01,
+            applied,
+        )
     _set_default_if_not_explicit(args, explicit_dests, "prompt_loss_weight", 0.10, applied)
     _set_default_if_not_explicit(args, explicit_dests, "response_loss_weight", 1.0, applied)
     _set_default_if_not_explicit(args, explicit_dests, "response_boundary_loss_weight", 2.0, applied)
@@ -3046,11 +3064,19 @@ def main():
         "--ltm_value_alignment_weight",
         dest="ltm_value_alignment_weight",
         type=float,
-        default=0.0,
+        default=None,
         help=(
-            "Experimental auxiliary weight that trains val_proj for safe Hebbian "
-            "validation writes. Default 0 preserves the legacy language-model objective."
+            "Leakage-free auxiliary weight that trains val_proj for bounded online "
+            "writes. Fresh coherent-v9 runs default to 0.01; legacy-v8 defaults to 0."
         ),
+    )
+    train_group.add_argument(
+        "--ltm-value-alignment-stride",
+        "--ltm_value_alignment_stride",
+        dest="ltm_value_alignment_stride",
+        type=int,
+        default=None,
+        help="Train the value writer on every Nth causal token (coherent-v9 default: 8).",
     )
     train_group.add_argument(
         "--ltm-value-alignment-min-updates",
@@ -3059,6 +3085,30 @@ def main():
         type=int,
         default=100,
         help="Successful writer-training optimizer updates required before Hebbian writes are enabled (default: 100).",
+    )
+    train_group.add_argument(
+        "--ltm-value-alignment-ready-threshold",
+        "--ltm_value_alignment_ready_threshold",
+        dest="ltm_value_alignment_ready_threshold",
+        type=float,
+        default=None,
+        help="Maximum finite alignment-loss EMA for declaring the writer ready (v9 default: 0.95).",
+    )
+    train_group.add_argument(
+        "--ltm-value-alignment-ema-decay",
+        "--ltm_value_alignment_ema_decay",
+        dest="ltm_value_alignment_ema_decay",
+        type=float,
+        default=None,
+        help="EMA decay used by the writer quality gate (v9 default: 0.95).",
+    )
+    train_group.add_argument(
+        "--ltm-value-writer-max-norm",
+        "--ltm_value_writer_max_norm",
+        dest="ltm_value_writer_max_norm",
+        type=float,
+        default=None,
+        help="Maximum finite val_proj weight norm allowed by the writer readiness gate.",
     )
     format_group = train_group.add_mutually_exclusive_group()
     format_group.add_argument("--kayla", action="store_true")
@@ -3429,18 +3479,38 @@ def main():
     # --- Chat-specific (Online Learning) ---
     chat_group = parser.add_argument_group('Chat Online Learning')
     chat_group.add_argument("--enable-quantized-learning", action="store_true", help="Reserved legacy flag; quantized online learning is unsupported by the active matrix-state architecture.")
-    chat_group.add_argument("--ltm-lora-path", type=str, default=None, help="Path to save/load LTM updates as delta file.")
-    chat_group.add_argument("--static-ltm-lr", action="store_true", default=True, help="Use a fixed LR for LTM updates (default).")
-    chat_group.add_argument("--dynamic-ltm-lr", dest="static_ltm_lr", action="store_false", help="Enable cosine annealing for LTM updates.")
-    chat_group.add_argument("--ltm-schedule-steps", type=int, default=100, help="Cosine cycle steps for LTM learning.")
+    chat_group.add_argument("--ltm-lora-path", type=str, default=None, help="Legacy name for the cumulative, identity-bound online-memory overlay path. Defaults beside the model.")
+    chat_group.add_argument("--static-ltm-lr", action="store_true", default=True, help="Use a fixed LR for transactional online-memory updates (default).")
+    chat_group.add_argument("--dynamic-ltm-lr", dest="static_ltm_lr", action="store_false", help="Cosine-decay the LR across accepted online-memory transactions.")
+    chat_group.add_argument("--ltm-schedule-steps", type=int, default=100, help="Accepted online updates over which dynamic LTM LR decays.")
     chat_group.add_argument("--ltm-schedule-min-lr", type=float, default=1e-5, help="Min LR for LTM cosine annealing.")
     chat_group.add_argument("--finetune-unlock-percent", type=float, default=None, help="Target %% of params to train (overrides lora_r).")
     chat_group.add_argument("--gradient-checkpointing", action="store_true", help="Enable gradient checkpointing.")
     chat_group.add_argument("--passive-learning", action="store_true", default=False, help="Enable passive LTM learning from user prompts/observed context. Default OFF for checkpoint-stable inference.")
     chat_group.add_argument("--no-passive-learning", dest="passive_learning", action="store_false", help="Disable passive LTM learning.")
     chat_group.add_argument("--passive-response-learning", action="store_true", default=False, help="Also allow passive learning from self-generated responses after confidence/quality gates. Default: OFF.")
+    chat_group.add_argument(
+        "--online-adaptation-policy",
+        choices=("off", "validated", "prompt", "prompt+response"),
+        default="validated",
+        help=(
+            "Online-memory policy. validated permits only explicit /learn, /reject, "
+            "and /correct actions and is the safe default; passive response learning "
+            "requires prompt+response."
+        ),
+    )
+    chat_group.add_argument(
+        "--natural-feedback-detection",
+        action="store_true",
+        default=False,
+        help="Opt in to heuristic natural-language praise/correction detection. Default OFF.",
+    )
     chat_group.add_argument("--passive-lr", type=float, default=5e-6, help="Learning rate for passive LTM updates (default: 5e-6, very conservative).")
     chat_group.add_argument("--online-ltm-grad-clip", type=float, default=0.75, help="Value/global-norm clip for finite online LTM gradients; non-finite gradients are always rejected.")
+    chat_group.add_argument("--online-ltm-lr", type=float, default=1e-3, help="Explicit-feedback fast-memory LR, separate from training inner-update LR.")
+    chat_group.add_argument("--online-ltm-max-delta-norm", type=float, default=1.0, help="Transactional fast-state delta norm budget per accepted online update.")
+    chat_group.add_argument("--online-ltm-max-fast-norm", type=float, default=64.0, help="Total fast-memory norm budget after an online update.")
+    chat_group.add_argument("--online-ltm-max-slot-norm", type=float, default=4.0, help="Per-slot fast-memory norm budget after an online update.")
     chat_group.add_argument("--surprise-threshold", type=float, default=1.0, help="Passive learning only writes when loss <= this threshold (default: 1.0; lower is stricter).")
     chat_group.add_argument("--chat-state-file", type=str, nargs="?", const="auto", default=None, help="Autosave a new tiny model/tokenizer-bound hierarchical chat state .pt file. Pass no value for an auto path.")
     chat_group.add_argument("--resume-chat-from-state-file", type=str, default=None, help="Resume and autosave a model/tokenizer-bound hierarchical chat state .pt file.")

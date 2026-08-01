@@ -84,7 +84,7 @@ def test_versioned_ltm_overlay_load_is_cumulative_and_restores_metadata(tmp_path
     )
     initial_vals = target.ltm.vals.detach().clone()
     version = load_ltm_delta_overlay(target, overlay_path)
-    assert version == 2
+    assert version == 3
     torch.testing.assert_close(target.ltm.vals, initial_vals + delta)
     torch.testing.assert_close(target.ltm.ltm_deltas, delta)
     torch.testing.assert_close(target.ltm.timestamps, source.ltm.timestamps)
@@ -338,35 +338,98 @@ def test_online_feedback_replay_matches_manual_tbptt_recurrence():
 def test_ltm_value_alignment_trains_existing_writer_without_layout_or_logit_drift():
     torch.manual_seed(123)
     config = _tiny_config()
+    config.architecture_revision = "coherent-v9"
     config.use_rosa = False
     config.use_deepembed = False
+    config.ltm_value_alignment_stride = 3
     model = HierarchosCore(config)
     before_layout = {
         name: tuple(tensor.shape) for name, tensor in model.state_dict().items()
     }
-    ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    ids = torch.tensor(
+        [
+            [1, 2, 3, 4, 5, 6, 7],
+            [8, 9, 10, 11, 12, 0, 0],
+        ],
+        dtype=torch.long,
+    )
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 0, 0],
+        ],
+        dtype=torch.long,
+    )
     labels = ids.clone()
+    labels[attention_mask == 0] = -100
 
     model.eval()
     with torch.no_grad():
-        baseline = model(ids, labels=labels)["logits"]
+        baseline = model(
+            ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            global_pos_offset=1,
+        )["logits"]
         aligned = model(
             ids,
             labels=labels,
+            attention_mask=attention_mask,
             compute_ltm_value_alignment=True,
+            global_pos_offset=1,
         )
     assert torch.equal(baseline, aligned["logits"])
     assert torch.isfinite(aligned["ltm_value_alignment_cost"])
 
     model.train()
     model.zero_grad(set_to_none=True)
-    outputs = model(
-        ids,
-        labels=labels,
-        compute_ltm_value_alignment=True,
-        return_topk_values=False,
-        return_raw_topk_values=False,
-        return_topk_indices=False,
+    writer_inputs = []
+    writer_hook = model.val_proj.register_forward_pre_hook(
+        lambda _module, inputs: writer_inputs.append(inputs[0].detach())
+    )
+    try:
+        outputs = model(
+            ids,
+            labels=labels,
+            attention_mask=attention_mask,
+            compute_ltm_value_alignment=True,
+            global_pos_offset=1,
+            return_topk_values=False,
+            return_raw_topk_values=False,
+            return_topk_indices=False,
+        )
+    finally:
+        writer_hook.remove()
+
+    # Global positions 3 and 6 are the only positions sampled by stride 3 when
+    # this chunk begins at offset 1. The projection must be one batched call,
+    # including a masked sample from the padded row rather than a Python token loop.
+    assert len(writer_inputs) == 1
+    assert writer_inputs[0].shape == (2, 2, config.context_dim)
+
+    alignment_targets = writer_inputs[0]
+    memory_offset = config.context_dim + config.persistent_dim
+    memory_width = config.ltm_topk * config.ltm_val_dim
+    memory_readout = model.in_proj.weight[
+        :, memory_offset:memory_offset + memory_width
+    ].reshape(
+        config.context_dim,
+        config.ltm_topk,
+        config.ltm_val_dim,
+    ).sum(dim=1).detach()
+    value_to_store = model.val_proj(alignment_targets)
+    memory_readback = torch.nn.functional.linear(value_to_store, memory_readout)
+    per_sample_cost = (
+        (memory_readback.float() - alignment_targets.float()).square().mean(dim=-1)
+        / alignment_targets.float().square().mean(dim=-1).clamp_min(1e-4)
+    )
+    sampled_weights = attention_mask[:, 2::3].float()
+    expected_cost = (
+        per_sample_cost * sampled_weights
+    ).sum() / sampled_weights.sum()
+    torch.testing.assert_close(
+        outputs["ltm_value_alignment_cost"],
+        expected_cost,
     )
     outputs["ltm_value_alignment_cost"].backward()
 
@@ -385,16 +448,54 @@ def test_ltm_value_alignment_trains_existing_writer_without_layout_or_logit_drif
 
 
 def test_hebbian_writer_readiness_requires_sustained_alignment_updates():
-    config = {"ltm_value_alignment_min_updates": 3}
+    config = {
+        "ltm_value_alignment_min_updates": 3,
+        "ltm_value_alignment_ready_threshold": 0.2,
+        "ltm_value_alignment_ema_decay": 0.5,
+    }
     model = SimpleNamespace(config=config)
 
-    mark_val_proj_trained(model)
-    mark_val_proj_trained(model)
-    assert config["val_proj_alignment_updates"] == 2
-    assert not config.get("val_proj_trained", False)
-
-    mark_val_proj_trained(model)
+    for _ in range(3):
+        mark_val_proj_trained(model, alignment_cost=1.0)
     assert config["val_proj_alignment_updates"] == 3
+    assert not config.get("val_proj_trained", False)
+    assert config["val_proj_alignment_ema"] == pytest.approx(1.0)
+
+    mark_val_proj_trained(model, alignment_cost=0.0)
+    mark_val_proj_trained(model, alignment_cost=0.0)
+    assert config["val_proj_alignment_ema"] == pytest.approx(0.25)
+    assert config["val_proj_trained"] is False
+
+    mark_val_proj_trained(model, alignment_cost=0.0)
+    assert config["val_proj_alignment_updates"] == 6
+    assert config["val_proj_alignment_ema"] == pytest.approx(0.125)
+    assert config["val_proj_trained"] is True
+
+
+def test_hebbian_writer_readiness_rejects_nonfinite_quality_or_writer_norm():
+    config = {
+        "ltm_value_alignment_min_updates": 1,
+        "ltm_value_alignment_ready_threshold": 0.2,
+        "ltm_value_alignment_ema_decay": 0.0,
+        "ltm_value_writer_max_norm": 1.0,
+    }
+    model = SimpleNamespace(
+        config=config,
+        val_proj=nn.Linear(2, 2, bias=False),
+    )
+    with torch.no_grad():
+        model.val_proj.weight.fill_(2.0)
+
+    mark_val_proj_trained(model, alignment_cost=0.1)
+    assert config["val_proj_trained"] is False
+    assert config["val_proj_writer_norm"] > 1.0
+
+    with torch.no_grad():
+        model.val_proj.weight.zero_()
+    mark_val_proj_trained(model, alignment_cost=float("nan"))
+    assert config["val_proj_trained"] is False
+
+    mark_val_proj_trained(model, alignment_cost=0.1)
     assert config["val_proj_trained"] is True
 
 
@@ -863,6 +964,71 @@ def test_timestamp_encoding_supports_one_and_two_value_dimensions():
             outputs = model(torch.tensor([[1, 2]], dtype=torch.long), suppress_hebbian=True)
         assert outputs["logits"].shape == (1, 2, config.vocab_size)
         assert torch.isfinite(outputs["logits"]).all()
+
+
+@pytest.mark.parametrize(
+    ("revision", "expected_mode", "timestamps_affect_logits"),
+    (
+        ("coherent-v9", "metadata-only", False),
+        ("legacy-v8", "absolute-sinusoidal", True),
+    ),
+)
+def test_revision_controls_whether_ltm_timestamps_are_model_features(
+    revision,
+    expected_mode,
+    timestamps_affect_logits,
+):
+    torch.manual_seed(321)
+    config = _tiny_config()
+    config.architecture_revision = revision
+    config.use_rosa = False
+    config.use_deepembed = False
+    config.memory_token_routers = False
+    model = HierarchosCore(config).eval()
+    with torch.no_grad():
+        model.ltm_gate_logit.fill_(10.0)
+
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+    def memory_state(timestamp):
+        return (
+            model.ltm.fast_vals.clone(),
+            model.ltm._mom_vals.clone(),
+            None,
+            None,
+            torch.full_like(model.ltm.timestamps, float(timestamp)),
+            model.ltm.sources.clone(),
+            model.ltm.wallclock_timestamps.clone(),
+        )
+
+    with torch.no_grad():
+        at_zero = model(
+            input_ids,
+            ltm_memory_state=memory_state(0.0),
+            suppress_hebbian=True,
+        )
+        at_seventeen = model(
+            input_ids,
+            ltm_memory_state=memory_state(17.0),
+            suppress_hebbian=True,
+        )
+
+    assert model.config.ltm_time_feature_mode == expected_mode
+    torch.testing.assert_close(
+        at_seventeen["ltm_memory_state"][4],
+        torch.full_like(model.ltm.timestamps, 17.0),
+    )
+    if timestamps_affect_logits:
+        assert not torch.equal(at_zero["logits"], at_seventeen["logits"])
+    else:
+        # Coherent-v9 still transports timestamps for filtering/provenance, but
+        # stamping a slot is not itself an input to the learned language path.
+        torch.testing.assert_close(
+            at_zero["logits"],
+            at_seventeen["logits"],
+            rtol=0,
+            atol=0,
+        )
 
 
 def test_architecture_geometry_fails_fast_and_zero_detach_is_supported():
