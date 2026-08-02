@@ -13,6 +13,8 @@ COHERENT_REVISION = "coherent-v9"
 ARCHITECTURE_CONTRACT_SCHEMA_VERSION = 3
 LEGACY_TRAINING_CHUNK_SIZE = 128
 COHERENT_TRAINING_CHUNK_SIZE = 256
+LEGACY_COMMITMENT_SUM_SQUARE_BUDGET = 0.1
+COHERENT_COMMITMENT_REFERENCE_WIDTH = 448
 
 
 # These fields alter tensor geometry, the learned function, recurrent/memory
@@ -490,6 +492,57 @@ def normalize_ltm_training_mode(value) -> str:
     return normalized
 
 
+def architecture_default_commitment_threshold(config_or_revision=None) -> float:
+    """Return the revision-correct commitment hinge threshold.
+
+    Legacy-v8 measures total drift energy with ``sum(drift**2)`` and used a
+    free-energy budget of 0.1. Coherent-v9 measures width-invariant mean-square
+    drift, so retaining the same total L2 budget requires dividing by the drift
+    width. Bare revision-only configs use the reference training width so their
+    serialized contract remains deterministic until geometry is supplied.
+    """
+
+    if isinstance(config_or_revision, str) or config_or_revision is None:
+        revision_value = config_or_revision
+        context_dim = None
+    else:
+        revision_value = _get(
+            config_or_revision,
+            "architecture_revision",
+            None,
+        )
+        context_dim = _get(config_or_revision, "context_dim", None)
+
+    revision = normalize_architecture_revision(revision_value)
+    if revision != COHERENT_REVISION:
+        return LEGACY_COMMITMENT_SUM_SQUARE_BUDGET
+
+    if context_dim in (None, "", "auto"):
+        width = COHERENT_COMMITMENT_REFERENCE_WIDTH
+    else:
+        if isinstance(context_dim, bool):
+            raise ValueError(
+                f"context_dim must be a positive integer, got {context_dim!r}"
+            )
+        try:
+            numeric_width = float(context_dim)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"context_dim must be a positive integer, got {context_dim!r}"
+            ) from exc
+        if not math.isfinite(numeric_width) or not numeric_width.is_integer():
+            raise ValueError(
+                f"context_dim must be a positive integer, got {context_dim!r}"
+            )
+        width = int(numeric_width)
+        if width <= 0:
+            raise ValueError(
+                f"context_dim must be a positive integer, got {context_dim!r}"
+            )
+
+    return LEGACY_COMMITMENT_SUM_SQUARE_BUDGET / float(width)
+
+
 def architecture_default_training_chunk_size(config_or_revision=None) -> int:
     """Return the compatibility-safe TBPTT/LTM geometry for a revision.
 
@@ -575,7 +628,6 @@ def apply_architecture_revision_defaults(config) -> str:
             "inference_logit_clamp": 0.0,
             "inference_logit_parity": True,
             "l_conv_atol": 1e-4,
-            "commitment_threshold": 0.05,
             "training_chunk_size": COHERENT_TRAINING_CHUNK_SIZE,
         }
     else:
@@ -601,11 +653,15 @@ def apply_architecture_revision_defaults(config) -> str:
             "inference_logit_clamp": 30.0,
             "inference_logit_parity": False,
             "l_conv_atol": 0.01,
-            "commitment_threshold": 0.1,
             "training_chunk_size": LEGACY_TRAINING_CHUNK_SIZE,
         }
     for name, value in defaults.items():
         _setdefault(config, name, value)
+    _setdefault(
+        config,
+        "commitment_threshold",
+        architecture_default_commitment_threshold(config),
+    )
 
     # Canonicalize defaults that were historically scattered across the core,
     # WorkerLoop, LTM, trainer, and CLI. A serialized contract must contain the

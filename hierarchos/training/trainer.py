@@ -35,6 +35,7 @@ from ..models.core import HierarchosCore, _validate_sequence_mask_contract
 from ..models.revisions import (
     architecture_contract,
     architecture_contract_hash,
+    architecture_default_commitment_threshold,
     architecture_default_training_chunk_size,
     normalize_ltm_training_mode as _normalize_ltm_training_mode_contract,
 )
@@ -383,6 +384,50 @@ _RUNTIME_MODEL_CONFIG_KEYS = (
     "cpu_loss_chunk_rows",
 )
 
+
+# Keep the LoRA surface in one place so rank estimation, adapter construction,
+# tests, and future architecture additions cannot silently diverge. Exact
+# hierarchical names are used for the coherent-v9 shared token adapters to
+# avoid matching unrelated modules named ``up`` or ``down``.
+HIERARCHOS_PEFT_TARGET_MODULES = (
+    # RWKV time-mixing.
+    "key",
+    "value",
+    "receptance",
+    "output",
+    # RWKV channel-mixing.
+    "key_cm",
+    "receptance_cm",
+    "value_cm",
+    # Core Hierarchos projections.
+    "qproj",
+    "in_proj",
+    "h_to_context",
+    "l_input_proj",
+    "l_to_out",
+    "h_halt_proj",
+    "context_drift_proj",
+    "l_feedback_proj",
+    "val_proj",
+    # Coherent-v9 token-conditioning paths.
+    "h_deepembed_adapter.down",
+    "h_deepembed_adapter.up",
+    "l_deepembed_adapter.down",
+    "l_deepembed_adapter.up",
+    "rosa_adapter.down",
+    "rosa_adapter.up",
+    # Coherent-v9 token-local memory gates.
+    "rosa_router",
+    "ltm_router",
+)
+
+
+def _module_name_matches_peft_target(name: str, target_modules) -> bool:
+    return any(
+        name == target or name.endswith(f".{target}")
+        for target in target_modules
+    )
+
 def _normalize_detach_every_n_steps(value):
     """Normalize the documented 0/negative sentinel without changing checkpoints."""
     if value is None:
@@ -402,6 +447,19 @@ def _apply_runtime_model_config_overrides(model_config, args):
             value = getattr(args, key)
             if key == "detach_every_n_steps":
                 value = _normalize_detach_every_n_steps(value)
+            elif key == "commitment_threshold" and value in (None, "", "auto"):
+                # CLI parsing normally resolves this revision default before
+                # training starts, but direct Python callers and older GUI/API
+                # surfaces can still pass None. Preserve an explicit threshold
+                # already serialized by the base checkpoint (including an
+                # ablation); otherwise resolve the same width-calibrated default
+                # used by full training.
+                current = model_config.get(key, None)
+                if current in (None, "", "auto"):
+                    model_config[key] = architecture_default_commitment_threshold(
+                        model_config
+                    )
+                continue
             model_config[key] = value
     if hasattr(args, "compile_static_worker_loop") and getattr(args, "compile_static_worker_loop") is not None:
         model_config.compile_static_worker_loop = getattr(args, "compile_static_worker_loop")
@@ -684,8 +742,26 @@ def _print_runtime_stability_config(model):
     config = getattr(model, "config", None)
     if config is None:
         return
-    threshold = _nonnegative_float(getattr(config, "commitment_threshold", 0.05), 0.05)
+    default_threshold = architecture_default_commitment_threshold(config)
+    threshold = _nonnegative_float(
+        getattr(config, "commitment_threshold", default_threshold),
+        default_threshold,
+    )
     norm_clamp = _nonnegative_float(getattr(config, "drift_norm_clamp", 0.0), 0.0)
+    commitment_mode = str(
+        getattr(config, "commitment_cost_mode", "sum-square")
+    )
+    context_dim = max(1, int(getattr(config, "context_dim", 1) or 1))
+    free_rms = (
+        math.sqrt(threshold)
+        if commitment_mode == "mean-square"
+        else math.sqrt(threshold / context_dim)
+    )
+    free_l2 = (
+        math.sqrt(threshold * context_dim)
+        if commitment_mode == "mean-square"
+        else math.sqrt(threshold)
+    )
     print(
         "INFO: Runtime stability config: "
         f"drift_state_clamp={getattr(config, 'drift_state_clamp', 5.0)}, "
@@ -693,11 +769,19 @@ def _print_runtime_stability_config(model):
         f"drift_delta_scale={getattr(config, 'drift_delta_scale', 1.0)}, "
         f"rwkv_channel_mix_key_clamp={getattr(config, 'rwkv_channel_mix_key_clamp', 12.0)}, "
         f"rwkv_channel_mix_deepembed_clamp={getattr(config, 'rwkv_channel_mix_deepembed_clamp', 4.0)}, "
+        f"commitment_cost_mode={commitment_mode}, "
         f"commitment_threshold={threshold:g}, "
         f"max_commitment_cost_for_backward={getattr(config, 'max_commitment_cost_for_backward', 'trainer-only')}"
     )
+    print(
+        "INFO: Commitment hinge free radius: "
+        f"drift_rms<={free_rms:.6g}, drift_l2<={free_l2:.6g}."
+    )
     if norm_clamp > 0.0:
-        max_commit = max(0.0, norm_clamp * norm_clamp - threshold)
+        max_drift_energy = norm_clamp * norm_clamp
+        if commitment_mode == "mean-square":
+            max_drift_energy /= context_dim
+        max_commit = max(0.0, max_drift_energy - threshold)
         print(f"INFO: Drift norm clamp invariant: raw/displayed commit should stay <= {max_commit:.4g}.")
 
 def _clamp_running_states_for_resume(running_states, args):
@@ -5435,10 +5519,15 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             print(f"Warning: Both --lora_r ({lora_r}) and --finetune-unlock-percent were specified. Prioritizing --lora_r.")
         else:
             total_params = sum(p.numel() for p in model.parameters())
-            target_modules = ["qproj", "in_proj", "val_proj", "h_to_context", "l_to_out", "h_halt_proj", "W_ir", "W_hr", "W_iz", "W_hz", "W_in", "W_hn"]
             lora_param_sum_per_r = 0
             for name, module in model.named_modules():
-                if isinstance(module, nn.Linear) and any(tm in name for tm in target_modules):
+                if (
+                    isinstance(module, nn.Linear)
+                    and _module_name_matches_peft_target(
+                        name,
+                        HIERARCHOS_PEFT_TARGET_MODULES,
+                    )
+                ):
                     lora_param_sum_per_r += module.in_features + module.out_features
 
             target_trainable_count = total_params * (finetune_unlock_percent / 100.0)
@@ -5460,16 +5549,7 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
-        target_modules=[
-            # RWKV time-mixing
-            "key", "value", "receptance", "output",
-            # RWKV channel-mixing
-            "key_cm", "receptance_cm", "value_cm",
-            # Hierarchos-specific layers
-            "qproj", "in_proj", "h_to_context",
-            "l_input_proj", "l_to_out", "h_halt_proj",
-            "context_drift_proj", "l_feedback_proj", "val_proj",
-        ],
+        target_modules=list(HIERARCHOS_PEFT_TARGET_MODULES),
         lora_dropout=lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
