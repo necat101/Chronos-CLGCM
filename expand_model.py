@@ -64,7 +64,9 @@ LATEST_CONFIG_DEFAULTS = {
     "max_l_steps": 5,
     "h_stride": 4,
     "l_conv_atol": 1e-4,
-    "commitment_threshold": 0.05,
+    # Revision defaults resolve this after context_dim is known. A concrete
+    # 0.05 here would pin coherent-v9 back to the pre-calibration free region.
+    "commitment_threshold": None,
     "detach_every_n_steps": 32,
     "h_halt_thresh": 0.9,
     "memory_token_routers": True,

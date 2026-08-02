@@ -1745,6 +1745,9 @@ def handle_start_training(params: dict):
                 process_text_sample,
                 process_tokenized_sample,
             )
+            from hierarchos.models.revisions import (
+                architecture_default_commitment_threshold,
+            )
 
             data_path = params.get("data_path", "")
             if not data_path or not os.path.exists(data_path):
@@ -2128,7 +2131,10 @@ def handle_start_training(params: dict):
                 ),
                 commitment_threshold=_float_param(
                     "commitment_threshold",
-                    _config.get("commitment_threshold", 0.05),
+                    _config.get(
+                        "commitment_threshold",
+                        architecture_default_commitment_threshold(_config),
+                    ),
                 ),
                 l_conv_atol=_float_param(
                     "l_conv_atol",

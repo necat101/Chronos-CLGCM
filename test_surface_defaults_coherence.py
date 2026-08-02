@@ -8,6 +8,7 @@ import hierarchos_cli
 from hierarchos.inference.chat import sample_next_token
 from hierarchos.models.revisions import (
     apply_architecture_revision_defaults,
+    architecture_default_commitment_threshold,
 )
 from hierarchos.training.trainer import _resolved_training_chunk_size
 
@@ -49,6 +50,25 @@ def test_revision_cli_gui_and_trainer_share_chunk_geometry_defaults():
         encoding="utf-8"
     )
     assert "architecture_default_training_chunk_size(config)" in salvage_source
+
+
+def test_coherent_commitment_default_is_width_calibrated_across_surfaces():
+    coherent = {
+        "architecture_revision": "coherent-v9",
+        "context_dim": 448,
+    }
+    apply_architecture_revision_defaults(coherent)
+
+    expected = 0.1 / 448
+    assert coherent["commitment_threshold"] == expected
+    assert architecture_default_commitment_threshold(coherent) == expected
+
+    cli_source = (ROOT / "hierarchos_cli.py").read_text(encoding="utf-8")
+    bridge_source = (ROOT / "hierarchos_bridge_server.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"--commitment-threshold",\n        type=float,\n        default=None' in cli_source
+    assert "architecture_default_commitment_threshold(_config)" in bridge_source
 
 
 def test_all_user_facing_sampling_surfaces_default_to_temperature_point_seven():

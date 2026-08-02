@@ -9,6 +9,7 @@ from hierarchos.models.revisions import (
     LEGACY_TRAINING_CHUNK_SIZE,
     LEGACY_REVISION,
     apply_architecture_revision_defaults,
+    architecture_default_commitment_threshold,
     architecture_default_training_chunk_size,
     architecture_contract,
     architecture_contract_hash,
@@ -32,6 +33,7 @@ def test_absent_revision_is_strictly_legacy():
     assert config["ltm_value_alignment_weight"] == 0.0
     assert config["ltm_value_alignment_stride"] == 1
     assert config["adaptive_ponder"] is False
+    assert config["commitment_threshold"] == pytest.approx(0.1)
     assert config["training_chunk_size"] == LEGACY_TRAINING_CHUNK_SIZE
     assert config["reference_chunk_len"] == LEGACY_TRAINING_CHUNK_SIZE
 
@@ -58,6 +60,7 @@ def test_coherent_revision_resolves_corrected_contract():
     assert config.ltm_value_writer_max_norm == 64.0
     assert config.adaptive_ponder is True
     assert config.ponder_objective == "symmetric-huber"
+    assert config.commitment_threshold == pytest.approx(0.1 / 448)
     assert config.training_chunk_size == COHERENT_TRAINING_CHUNK_SIZE
     assert config.reference_chunk_len == COHERENT_TRAINING_CHUNK_SIZE
 
@@ -74,6 +77,29 @@ def test_revisioned_chunk_defaults_preserve_explicit_checkpoint_geometry():
     assert architecture_default_training_chunk_size("legacy-v8") == 128
     assert coherent["training_chunk_size"] == 128
     assert coherent["reference_chunk_len"] == 128
+
+
+def test_coherent_commitment_threshold_preserves_legacy_l2_budget():
+    config = {
+        "architecture_revision": "coherent-v9",
+        "context_dim": 8,
+    }
+    apply_architecture_revision_defaults(config)
+
+    assert config["commitment_threshold"] == pytest.approx(0.1 / 8)
+    assert architecture_default_commitment_threshold(config) == pytest.approx(0.1 / 8)
+    assert (config["commitment_threshold"] * config["context_dim"]) == pytest.approx(0.1)
+
+
+def test_explicit_commitment_threshold_ablation_is_preserved():
+    config = {
+        "architecture_revision": "coherent-v9",
+        "context_dim": 448,
+        "commitment_threshold": 0.002,
+    }
+    apply_architecture_revision_defaults(config)
+
+    assert config["commitment_threshold"] == pytest.approx(0.002)
 
 
 def test_explicit_ablation_is_preserved_and_changes_contract_hash():

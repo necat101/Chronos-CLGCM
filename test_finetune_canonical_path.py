@@ -7,6 +7,8 @@ import torch.nn as nn
 
 from hierarchos import AttrDict, HierarchosCore
 from hierarchos.training.trainer import (
+    HIERARCHOS_PEFT_TARGET_MODULES,
+    _apply_runtime_model_config_overrides,
     account_skipped_training_batch,
     build_exact_resume_identity,
     build_training_checkpoint,
@@ -414,7 +416,6 @@ def _tiny_core_config():
         max_l_steps=1,
         h_stride=2,
         l_conv_atol=1e-4,
-        commitment_threshold=0.05,
         use_deepembed=True,
         use_rosa=False,
         rosa_max_context=16,
@@ -438,17 +439,7 @@ def _real_peft_model(*, dropout=0.0):
     lora_config = peft.LoraConfig(
         r=2,
         lora_alpha=4,
-        target_modules=[
-            "qproj",
-            "in_proj",
-            "h_to_context",
-            "l_input_proj",
-            "l_to_out",
-            "h_halt_proj",
-            "context_drift_proj",
-            "l_feedback_proj",
-            "val_proj",
-        ],
+        target_modules=list(HIERARCHOS_PEFT_TARGET_MODULES),
         lora_dropout=dropout,
         bias="none",
         task_type="CAUSAL_LM",
@@ -460,6 +451,8 @@ def _real_peft_model(*, dropout=0.0):
 def test_real_peft_wrapper_runs_canonical_step_and_resumes_exact_state():
     model = ensure_finetune_training_mode(_real_peft_model().eval())
     assert model.config.model_type == "hierarchos"
+    assert model.config.commitment_cost_mode == "mean-square"
+    assert model.config.commitment_threshold == pytest.approx(0.1 / 8)
     trainable_names = {
         name for name, parameter in model.named_parameters()
         if parameter.requires_grad
@@ -547,3 +540,76 @@ def test_real_lora_dropout_enables_checkpoint_rng_replay():
     )
     assert configure_checkpoint_rng_policy(model) is True
     assert model._hierarchos_checkpoint_preserve_rng_state is True
+
+
+def test_runtime_finetune_threshold_preserves_checkpoint_or_resolves_default():
+    calibrated = AttrDict(
+        architecture_revision="coherent-v9",
+        context_dim=448,
+        commitment_threshold=0.1 / 448,
+    )
+    _apply_runtime_model_config_overrides(
+        calibrated,
+        SimpleNamespace(commitment_threshold=None),
+    )
+    assert calibrated.commitment_threshold == pytest.approx(0.1 / 448)
+
+    unresolved = AttrDict(
+        architecture_revision="coherent-v9",
+        context_dim=448,
+    )
+    _apply_runtime_model_config_overrides(
+        unresolved,
+        SimpleNamespace(commitment_threshold=None),
+    )
+    assert unresolved.commitment_threshold == pytest.approx(0.1 / 448)
+
+    explicit_ablation = AttrDict(
+        architecture_revision="coherent-v9",
+        context_dim=448,
+        commitment_threshold=0.1 / 448,
+    )
+    _apply_runtime_model_config_overrides(
+        explicit_ablation,
+        SimpleNamespace(commitment_threshold=0.002),
+    )
+    assert explicit_ablation.commitment_threshold == pytest.approx(0.002)
+
+
+def test_peft_targets_cover_coherent_shared_adapters_and_memory_routers():
+    peft = pytest.importorskip("peft")
+    config = _tiny_core_config()
+    config.use_rosa = True
+    base = HierarchosCore(config)
+    wrapped = peft.get_peft_model(
+        base,
+        peft.LoraConfig(
+            r=2,
+            lora_alpha=4,
+            target_modules=list(HIERARCHOS_PEFT_TARGET_MODULES),
+            lora_dropout=0.0,
+            bias="none",
+            task_type="CAUSAL_LM",
+            modules_to_save=["ltm"],
+        ),
+    )
+    trainable_names = {
+        name
+        for name, parameter in wrapped.named_parameters()
+        if parameter.requires_grad
+    }
+    expected_targets = (
+        "h_deepembed_adapter.down",
+        "h_deepembed_adapter.up",
+        "l_deepembed_adapter.down",
+        "l_deepembed_adapter.up",
+        "rosa_adapter.down",
+        "rosa_adapter.up",
+        "rosa_router",
+        "ltm_router",
+    )
+    for target in expected_targets:
+        assert any(
+            target in name and ".lora_A." in name
+            for name in trainable_names
+        ), target

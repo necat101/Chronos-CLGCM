@@ -3223,7 +3223,16 @@ def main():
     train_group.add_argument("--activation-clamp", type=float, default=100.0, help="Clamp finite manager/worker activations; NaN/Inf trajectories are rejected.")
     train_group.add_argument("--ponder-loss-weight", type=float, default=0.01)
     train_group.add_argument("--commitment-loss-weight", type=float, default=0.5)
-    train_group.add_argument("--commitment-threshold", type=float, default=0.05)
+    train_group.add_argument(
+        "--commitment-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Commitment hinge threshold. Defaults by architecture revision: "
+            "legacy-v8 uses total drift energy 0.1; coherent-v9 uses the "
+            "width-calibrated mean-square equivalent 0.1/context_dim."
+        ),
+    )
     train_group.add_argument("--l_conv_atol", "--l-conv-atol", type=float, default=1e-4, help="Converge tolerance for WorkerLoop. Default: 1e-4.")
     train_group.add_argument("--detach_every_n_steps", "--detach-every-n-steps", type=int, default=32, help="RWKV state detachment frequency. Use 0 to disable; default: 32.")
     train_group.add_argument("--h_halt_thresh", "--h-halt-thresh", type=float, default=0.9, help="H-RNN halt probability threshold. Default: 0.9.")
