@@ -1,0 +1,83 @@
+{
+  "schema": "hierarchos-cross-backend-training-benchmark-v1",
+  "fixture": {
+    "width": 128,
+    "vocab_size": 1024,
+    "batch": 2,
+    "tokens_per_sequence": 8,
+    "rosa_max_context": 8,
+    "scalable_geometry_fixture": true,
+    "model_token_positions_per_step": 16,
+    "supervised_target_positions_per_step": 13,
+    "warmup_updates": 0,
+    "measured_updates": 1
+  },
+  "training_contract": {
+    "precision": "fp16-storage-fp16-lm-backward",
+    "gradient_accumulation_steps": 1,
+    "dynamic_loss_scale": 1024.0,
+    "grad_clip": 1.0,
+    "optimizer": {
+      "lr": 0.0003,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "eps": 1e-08,
+      "weight_decay": 0.07
+    },
+    "pytorch_inside_vulkan_trainer": false,
+    "portable_checkpoint": "SafeTensors FP32 canonical masters",
+    "pytorch_precision_oracle": "fp16-rounded-execution-with-fp32-adamw-masters",
+    "projection_parameter_gradient_policy": "fp32-cancellation-safe-source-scaled",
+    "optimizer_boundary_submissions_per_step": 1
+  },
+  "parity": {
+    "worst_parameter_name": "tok_emb.weight",
+    "max_abs_parameter_diff": 6.168708205223083e-05,
+    "threshold": 0.0005,
+    "status": "passed",
+    "qualification_class": "mixed-precision-training"
+  },
+  "inference_reload": null,
+  "vulkan_execution": {
+    "device_index": 0,
+    "device_name": "AMD Radeon Graphics",
+    "queue_submissions": 2,
+    "training_precision_policy": "fp16-storage-fp16-lm-backward",
+    "dynamic_loss_scale": 1024.0,
+    "dynamic_loss_scale_after": 1024.0,
+    "dynamic_loss_scale_overflow_count": 0,
+    "h_low_rank_native_fp16_parameter_grad_compute_active": false,
+    "l_low_rank_native_fp16_parameter_grad_compute_active": false,
+    "h_low_rank_parameter_grad_arithmetic": "fp32",
+    "l_low_rank_parameter_grad_arithmetic": "fp32",
+    "memory_live_buffer_count": 2007,
+    "memory_live_buffer_bytes": 69942340,
+    "memory_driver_allocation_count": 6,
+    "memory_reserved_bytes": 100663296,
+    "memory_max_driver_allocation_count": 4294967295,
+    "memory_budget_extension_supported": true,
+    "device_local_heap_size_bytes": 7500070912,
+    "device_local_budget_bytes": 7125067056,
+    "device_local_usage_bytes": 67108864,
+    "device_local_available_bytes": 7057958192,
+    "budgeted_plans": [],
+    "kernel_profile": null
+  },
+  "backends": [
+    {
+      "backend": "vulkan-native",
+      "device": "AMD Radeon Graphics",
+      "median_optimizer_step_ms": 127.804,
+      "model_token_positions_per_second": 125.1916997903039,
+      "supervised_target_positions_per_second": 101.71825607962192,
+      "memory_bytes": 100663296,
+      "memory_metric": "vulkan-suballocator-reserved-after-training",
+      "hourly_cost_usd": null,
+      "cost_per_billion_model_tokens_usd": null,
+      "samples_ms": [
+        127.804
+      ],
+      "throughput_vs_vulkan": 1.0
+    }
+  ]
+}

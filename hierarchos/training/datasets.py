@@ -18,6 +18,59 @@ from hierarchos.utils.rosa import (
 from hierarchos.utils.safe_loading import load_tensor_payload_safely
 
 
+PORTABLE_SAMPLER_RNG_ALGORITHM = "splitmix64-fisher-yates-v1"
+LEGACY_TORCH_SAMPLER_RNG_ALGORITHM = "torch-generator-randperm-v1"
+_U64_MASK = (1 << 64) - 1
+_SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
+
+
+class _PortableSplitMix64:
+    """Tiny backend-neutral RNG used only for deterministic data ordering.
+
+    SplitMix64 is intentionally used as a cursorable integer generator rather
+    than as a numerical-training RNG. Its complete state is one u64 counter,
+    which is trivial to reproduce in Rust/Vulkan hosts without importing a
+    Python, NumPy, or PyTorch RNG representation.
+    """
+
+    def __init__(self, state: int):
+        self.state = int(state) & _U64_MASK
+
+    def next_u64(self) -> int:
+        self.state = (self.state + _SPLITMIX_GAMMA) & _U64_MASK
+        value = self.state
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _U64_MASK
+        return (value ^ (value >> 31)) & _U64_MASK
+
+
+def _portable_sampler_rng(seed: int, epoch: int) -> _PortableSplitMix64:
+    # Give each epoch a disjoint deterministic starting state while keeping the
+    # recipe representable as two ordinary unsigned integers in checkpoints.
+    state = (int(seed) + (int(epoch) * _SPLITMIX_GAMMA)) & _U64_MASK
+    return _PortableSplitMix64(state)
+
+
+def portable_fisher_yates_permutation(length: int, seed: int, epoch: int = 0):
+    """Return the canonical Hierarchos portable permutation for one epoch."""
+
+    length = max(0, int(length))
+    values = list(range(length))
+    rng = _portable_sampler_rng(seed, epoch)
+    for upper in range(length - 1, 0, -1):
+        swap_index = rng.next_u64() % (upper + 1)
+        values[upper], values[swap_index] = values[swap_index], values[upper]
+    return values
+
+
+def _portable_randperm_tensor(length: int, rng: _PortableSplitMix64):
+    values = list(range(max(0, int(length))))
+    for upper in range(len(values) - 1, 0, -1):
+        swap_index = rng.next_u64() % (upper + 1)
+        values[upper], values[swap_index] = values[swap_index], values[upper]
+    return torch.tensor(values, dtype=torch.long)
+
+
 def _shared_epoch_counter():
     """Create an epoch value that persistent DataLoader workers can observe."""
     epoch = torch.zeros((), dtype=torch.int64)
@@ -54,7 +107,8 @@ class LengthGroupedBatchSampler(Sampler):
     """
     def __init__(self, lengths, batch_size: int, shuffle: bool = True,
                  drop_last: bool = False, bucket_size: Optional[int] = None,
-                 seed: Optional[int] = None, preserve_order: bool = False):
+                 seed: Optional[int] = None, preserve_order: bool = False,
+                 rng_algorithm: str = PORTABLE_SAMPLER_RNG_ALGORITHM):
         if batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         self.lengths = _lengths_to_cpu_tensor(lengths)
@@ -71,6 +125,12 @@ class LengthGroupedBatchSampler(Sampler):
             (self.bucket_size // self.batch_size) * self.batch_size,
         )
         self.seed = int(seed if seed is not None else torch.initial_seed()) % (2**63 - 1)
+        self.rng_algorithm = str(rng_algorithm)
+        if self.rng_algorithm not in {
+            PORTABLE_SAMPLER_RNG_ALGORITHM,
+            LEGACY_TORCH_SAMPLER_RNG_ALGORITHM,
+        }:
+            raise ValueError(f"unsupported sampler RNG algorithm {self.rng_algorithm!r}")
         self.epoch = 0
         # A resume cursor is deliberately separate from epoch/seed state. It
         # changes only where iteration begins, never the deterministic epoch
@@ -91,12 +151,21 @@ class LengthGroupedBatchSampler(Sampler):
         return (len(self.lengths) + self.batch_size - 1) // self.batch_size
 
     def __iter__(self):
-        generator = torch.Generator()
-        generator.manual_seed((self.seed + self.epoch) % (2**63 - 1))
+        generator = None
+        portable_rng = None
+        if self.rng_algorithm == PORTABLE_SAMPLER_RNG_ALGORITHM:
+            portable_rng = _portable_sampler_rng(self.seed, self.epoch)
+        else:
+            generator = torch.Generator()
+            generator.manual_seed((self.seed + self.epoch) % (2**63 - 1))
         sample_count = len(self.lengths)
 
         if self.shuffle and not self.preserve_order and sample_count > 1:
-            indices = torch.randperm(sample_count, generator=generator)
+            indices = (
+                _portable_randperm_tensor(sample_count, portable_rng)
+                if portable_rng is not None
+                else torch.randperm(sample_count, generator=generator)
+            )
         else:
             indices = torch.arange(sample_count, dtype=torch.long)
 
@@ -128,7 +197,11 @@ class LengthGroupedBatchSampler(Sampler):
                 else:
                     batch_count = (bucket_count + self.batch_size - 1) // self.batch_size
                 if batch_count > 1:
-                    batch_order = torch.randperm(batch_count, generator=generator)
+                    batch_order = (
+                        _portable_randperm_tensor(batch_count, portable_rng)
+                        if portable_rng is not None
+                        else torch.randperm(batch_count, generator=generator)
+                    )
                 else:
                     batch_order = range(batch_count)
                 for local_output_idx, local_batch_idx in enumerate(batch_order):
@@ -145,7 +218,11 @@ class LengthGroupedBatchSampler(Sampler):
 
         batch_count = len(self)
         if self.shuffle and not self.preserve_order and batch_count > 1:
-            batch_order = torch.randperm(batch_count, generator=generator)
+            batch_order = (
+                _portable_randperm_tensor(batch_count, portable_rng)
+                if portable_rng is not None
+                else torch.randperm(batch_count, generator=generator)
+            )
         else:
             batch_order = range(batch_count)
         for output_batch_idx, batch_idx in enumerate(batch_order):
@@ -158,10 +235,17 @@ class LengthGroupedBatchSampler(Sampler):
 
 class EpochShuffleSampler(Sampler):
     """Deterministic map-style sampler with an epoch hook for resume parity."""
-    def __init__(self, data_source, shuffle: bool = True, seed: Optional[int] = None):
+    def __init__(self, data_source, shuffle: bool = True, seed: Optional[int] = None,
+                 rng_algorithm: str = PORTABLE_SAMPLER_RNG_ALGORITHM):
         self.data_source = data_source
         self.shuffle = bool(shuffle)
         self.seed = int(seed if seed is not None else torch.initial_seed()) % (2**63 - 1)
+        self.rng_algorithm = str(rng_algorithm)
+        if self.rng_algorithm not in {
+            PORTABLE_SAMPLER_RNG_ALGORITHM,
+            LEGACY_TORCH_SAMPLER_RNG_ALGORITHM,
+        }:
+            raise ValueError(f"unsupported sampler RNG algorithm {self.rng_algorithm!r}")
         self.epoch = 0
         self.start_index = 0
 
@@ -177,10 +261,14 @@ class EpochShuffleSampler(Sampler):
     def __iter__(self):
         length = len(self.data_source)
         if self.shuffle and length > 1:
-            generator = torch.Generator()
-            generator.manual_seed((self.seed + self.epoch) % (2**63 - 1))
-            indices = torch.randperm(length, generator=generator)
-            yield from indices[self.start_index:].tolist()
+            if self.rng_algorithm == PORTABLE_SAMPLER_RNG_ALGORITHM:
+                indices = portable_fisher_yates_permutation(length, self.seed, self.epoch)
+                yield from indices[self.start_index:]
+            else:
+                generator = torch.Generator()
+                generator.manual_seed((self.seed + self.epoch) % (2**63 - 1))
+                indices = torch.randperm(length, generator=generator)
+                yield from indices[self.start_index:].tolist()
         else:
             yield from range(self.start_index, length)
 

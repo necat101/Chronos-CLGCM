@@ -19,6 +19,9 @@ directories = "6"
 sha2 = "0.10"
 bytes = "1"
 urlencoding = "2"
+hierarchos-inference = { path = "../hierarchos-inference" }
+hierarchos-native-cli = { path = "../hierarchos-native-cli" }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 
 [profile.release]
 opt-level = 3

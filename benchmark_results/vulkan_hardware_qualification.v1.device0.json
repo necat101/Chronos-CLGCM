@@ -1,0 +1,172 @@
+{
+  "contract": {
+    "locked_profile_replay_flag": "--lock-joint-runtime-profile",
+    "microprofile_device_env": "HIERARCHOS_VULKAN_MICROPROFILE_DEVICE_INDEX",
+    "model_checkpoint_abi": "canonical-safetensors-pytorch-row-major",
+    "runtime_profile_scope": "scheduler-only-no-model-tensor-layout-change"
+  },
+  "created_utc": "2026-08-25T02:26:06.944857+00:00",
+  "cross_backend_trajectory": {
+    "cuda_required": false,
+    "cycles": 1,
+    "mode": "cpu-fallback-when-needed",
+    "status": "passed"
+  },
+  "logs": "C:\\Users\\User\\Downloads\\Hierarchos-main GUI experiment\\Hierarchos-main\\benchmark_results\\vulkan_hardware_qualification.v1.device0.logs",
+  "microprofiles": {
+    "rows16_forward_stats_seam": {
+      "device_index": 0,
+      "device_name": "AMD Radeon Graphics",
+      "dot4_host_pair_ms": 1.200638,
+      "dot4_speedup": 2.2581219318395718,
+      "logit_max_abs": 2.980232239e-07,
+      "repetitions": 8,
+      "rows": 16,
+      "serial_host_pair_ms": 2.711187,
+      "stats_max_abs": 4.768371582e-07,
+      "tile_partials_bytes": 24576,
+      "vocab_size": 2048
+    },
+    "width448_backward": {
+      "device_index": 0,
+      "device_name": "AMD Radeon Graphics",
+      "fastest_measured_arm": "fp16-ce-tape-rows16-cluster4-fused-adjoints+dw-vocab8+fused-private-hidden-tile256-wg256",
+      "fastest_measured_ms": 0.3083,
+      "measured_ms": {
+        "fp16-ce-tape+dw-vocab16": 1.7288,
+        "fp16-ce-tape+dw-vocab4": 1.7121,
+        "fp16-ce-tape+dw-vocab8": 1.7397,
+        "fp16-ce-tape-rows16+dw-vocab16": 0.9794,
+        "fp16-ce-tape-rows16+dw-vocab4": 0.9587,
+        "fp16-ce-tape-rows16+dw-vocab8": 0.9465,
+        "fp16-ce-tape-rows16-cluster4-fused-adjoints+dw-vocab8+fused-private-hidden": 0.3405,
+        "fp16-ce-tape-rows16-cluster4-fused-adjoints+dw-vocab8+fused-private-hidden-tile256-wg256": 0.3083,
+        "fp16-ce-tape-rows16-cluster4-fused-adjoints+dw-vocab8+fused-shared-hidden": 0.3185,
+        "fp16-ce-tape-rows16-dot4+dw-vocab16": 0.8977,
+        "fp16-ce-tape-rows16-dot4+dw-vocab4": 0.9035,
+        "fp16-ce-tape-rows16-dot4+dw-vocab8": 0.9068,
+        "fp16-ce-tape-rows16-dot4-fused-adjoints+dw-vocab8+fused-private-hidden": 0.3374,
+        "fp16-ce-tape-rows16-dot4-fused-adjoints+dw-vocab8+fused-private-hidden-tile256-wg256": 0.3199,
+        "fp16-ce-tape-rows16-dot4-fused-adjoints+dw-vocab8+fused-shared-hidden": 0.3301,
+        "fp16-ce-tape-rows16-fused-adjoints+dw-vocab8+fused-private-hidden": 0.3987,
+        "fp16-ce-tape-rows16-fused-adjoints+dw-vocab8+fused-private-hidden-tile256-wg256": 0.3913,
+        "fp16-ce-tape-rows16-fused-adjoints+dw-vocab8+fused-shared-hidden": 0.3936,
+        "fp16-ce-tape-rows8+dw-vocab16": 1.0418,
+        "fp16-ce-tape-rows8+dw-vocab4": 1.0263,
+        "fp16-ce-tape-rows8+dw-vocab8": 1.0351,
+        "fp16-native+dw-vocab16": 2.9328,
+        "fp16-native+dw-vocab4": 2.902,
+        "fp16-native+dw-vocab8": 2.9044,
+        "fp16-native-reuse64+dw-vocab16": 2.7849,
+        "fp16-native-reuse64+dw-vocab4": 2.7761,
+        "fp16-native-reuse64+dw-vocab8": 2.79,
+        "fp16-packed+dw-vocab16": 2.7876,
+        "fp16-packed+dw-vocab4": 5.2135,
+        "fp16-packed+dw-vocab8": 3.0299
+      },
+      "rows": 2,
+      "selector": "fp16-ce-tape-rows16-dot4-fused-adjoints+dw-vocab8+fused-shared-hidden",
+      "shared_memory_bytes": 32768,
+      "subgroup_size": 64,
+      "vocab_size": 2048
+    }
+  },
+  "portable_checkpoint_parity": {
+    "architecture": {
+      "contract_sha256": "36f1d5fad6726b845789b7f745abb1d4c5b9b239e9d7d045104802bbd9ca19a1",
+      "revision": "coherent-v9"
+    },
+    "checkpoint_dtype": "fp32",
+    "parity": {
+      "cuda_inference_max_abs_diff": null,
+      "cuda_status": "skipped-no-cuda-device",
+      "native_rust_inference_max_abs_diff": 3.5762786865234375e-07,
+      "pytorch_vulkan_parameter_max_abs_diff": 2.9416405595839024e-06,
+      "pytorch_vulkan_parameter_max_abs_diff_tensor": "h_rnn.x_k_cm",
+      "pytorch_vulkan_recurrent_state_max_abs_diff": 1.3113021850585938e-06,
+      "pytorch_vulkan_recurrent_state_max_abs_diff_tensor": "update2.l_state",
+      "runtime_profile_vs_budgeted_control_loss_max_abs_diff": null,
+      "runtime_profile_vs_budgeted_control_parameter_max_abs_diff": null
+    },
+    "runtime_profile": {
+      "gradient_stream_chunk_values": null,
+      "optimizer_broadcast_overlap": null,
+      "path": null,
+      "selected_device_member_match": null,
+      "topology_device_count": null
+    },
+    "schema_version": 1,
+    "status": "passed",
+    "tape_geometry": null,
+    "training_precision": "fp32",
+    "vulkan_device": {
+      "compute_queue_family_index": 0,
+      "device_group": {
+        "group_index": 0,
+        "physical_device_count": 1,
+        "subset_allocation": false
+      },
+      "device_type": "INTEGRATED_GPU",
+      "device_uuid": "00000000090000000000000000000000",
+      "driver_uuid": "414d442d57494e2d4452560000000000",
+      "external_buffer": {
+        "opaque_fd_exportable": false,
+        "opaque_fd_extension_exposed": false,
+        "opaque_fd_importable": false,
+        "opaque_win32_exportable": true,
+        "opaque_win32_extension_exposed": true,
+        "opaque_win32_importable": true,
+        "platform_bidirectional_candidate": true,
+        "platform_handle": "opaque-win32"
+      },
+      "external_semaphore": {
+        "opaque_fd_exportable": false,
+        "opaque_fd_extension_exposed": false,
+        "opaque_fd_importable": false,
+        "opaque_win32_exportable": true,
+        "opaque_win32_extension_exposed": true,
+        "opaque_win32_importable": true,
+        "platform_bidirectional_candidate": true,
+        "platform_handle": "opaque-win32"
+      },
+      "index": 0,
+      "name": "AMD Radeon Graphics"
+    }
+  },
+  "runtime_profile": null,
+  "schema_version": 1,
+  "status": "passed",
+  "vulkan_device": {
+    "compute_queue_family_index": 0,
+    "device_group": {
+      "group_index": 0,
+      "physical_device_count": 1,
+      "subset_allocation": false
+    },
+    "device_type": "INTEGRATED_GPU",
+    "device_uuid": "00000000090000000000000000000000",
+    "driver_uuid": "414d442d57494e2d4452560000000000",
+    "external_buffer": {
+      "opaque_fd_exportable": false,
+      "opaque_fd_extension_exposed": false,
+      "opaque_fd_importable": false,
+      "opaque_win32_exportable": true,
+      "opaque_win32_extension_exposed": true,
+      "opaque_win32_importable": true,
+      "platform_bidirectional_candidate": true,
+      "platform_handle": "opaque-win32"
+    },
+    "external_semaphore": {
+      "opaque_fd_exportable": false,
+      "opaque_fd_extension_exposed": false,
+      "opaque_fd_importable": false,
+      "opaque_win32_exportable": true,
+      "opaque_win32_extension_exposed": true,
+      "opaque_win32_importable": true,
+      "platform_bidirectional_candidate": true,
+      "platform_handle": "opaque-win32"
+    },
+    "index": 0,
+    "name": "AMD Radeon Graphics"
+  }
+}

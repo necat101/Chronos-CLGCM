@@ -1,0 +1,294 @@
+# Building Hierarchos: What We Learned From Training a 232M Recurrent Memory-Augmented Assistant Model
+
+*A practical field report from building a non-Transformer language model with hierarchy, memory, recurrent state, and more debugging than any sane person would volunteer for twice.*
+
+---
+
+For the last stretch of development, we have been training and debugging **Hierarchos**, an experimental language model architecture that does not follow the standard Transformer recipe.
+
+The first coherent public checkpoint is a **232M-parameter assistant model** trained on our in-house Alpaca-style dataset, [netcat420/Experiment_0.1](https://huggingface.co/datasets/netcat420/Experiment_0.1). The architecture code lives here:
+
+[necat101/Hierarchos](https://github.com/necat101/Hierarchos)
+
+This article is not a victory lap claiming we beat GPT-3. We did not. The model is small, brittle, and still limited. But it is also coherent, measurable, and genuinely interesting for its size. More importantly, the process exposed several lessons that matter for anyone experimenting with recurrent memory-augmented language models.
+
+The short version:
+
+> Hierarchos is a recurrent, memory-augmented assistant architecture combining RWKV-style recurrence, a hierarchical manager/worker loop, differentiable long-term memory, DeepEmbed channel modulation, and a deterministic suffix-automaton feature path called ROSA.
+
+At 232M parameters, it is not a GPT-3.5-class model. But it is a working research checkpoint that demonstrates a promising direction: small language models with explicit recurrence, memory, and bounded internal refinement.
+
+## Why Build Another Architecture?
+
+Transformers are incredibly effective, but they are also expensive. Their strength comes from attention, scale, and huge pretraining corpora. That works beautifully if you have the budget to train and serve large models.
+
+We wanted to explore a different question:
+
+> Can a smaller model use architectural structure to make better use of its parameters?
+
+Hierarchos is built around that question. Instead of relying only on Transformer self-attention, it uses recurrent state, explicit memory retrieval, and a hierarchical reasoning loop.
+
+The goal is not to replace Transformers overnight. The goal is to explore whether alternative architectures can become competitive at local, small, or mid-scale model sizes.
+
+## The Core Ideas Behind Hierarchos
+
+Hierarchos combines several components into one language model.
+
+### 1. RWKV-Style Recurrent Backbone
+
+At the center is an RWKV-style recurrent sequence model. RWKV-like models are attractive because they offer a path toward efficient recurrent inference while retaining some of the training advantages of modern language models.
+
+Instead of attending over the whole context the way a Transformer does, Hierarchos carries recurrent state forward. This gives the model a compact notion of continuity across tokens.
+
+That statefulness is powerful, but it also creates a new class of bugs: training and inference must agree exactly about how state is carried.
+
+More on that later.
+
+### 2. Hierarchical Manager/Worker Processing
+
+Hierarchos has two recurrent levels:
+
+- a high-level **manager**
+- a low-level **worker**
+
+The manager maintains broader context and periodically forms a target context plan. The worker then refines local token-level state against that plan through a learned drift vector.
+
+This is inspired by hierarchical reasoning: instead of every token being processed in a flat pass, the model has a coarse-to-fine structure. The manager gives direction. The worker does local refinement.
+
+In theory, this gives the model a way to spend internal computation where it matters. In practice, it also means drift and commitment have to be carefully controlled, or the internal state can wander into instability.
+
+### 3. Long-Term Memory
+
+Hierarchos includes a differentiable slot-based long-term memory system.
+
+The model can retrieve top-k memory slots based on the current token representation and context. This is meant to give the model an explicit memory substrate rather than forcing everything into recurrent activations alone.
+
+During early training experiments, this memory system became one of the most important discoveries of the whole project.
+
+We found that if training uses supervised gradient-driven memory updates that chat inference cannot reproduce, the model can learn to rely on a hidden helper signal that does not exist at generation time.
+
+That mismatch can produce an awful situation:
+
+- training loss looks good
+- the checkpoint seems promising
+- chat output is incoherent
+
+The fix was to introduce **inference-like LTM training**: carry the relevant memory and recurrent state, but avoid supervised fast-memory writes that normal chat cannot perform.
+
+### 4. ROSA: A Suffix-Automaton Feature Path
+
+ROSA stands for Rapid Online Suffix Automaton.
+
+It is not magic symbolic reasoning. It is a deterministic exact-pattern feature generator.
+
+Given token history, ROSA can detect repeated suffix patterns and suggest likely continuation tokens. The model embeds those suggestions and learns how much to use them.
+
+This gives the model a lightweight pattern-continuation signal. It is especially interesting because it adds a non-neural exact-pattern pathway without replacing the learned model.
+
+### 5. DeepEmbed Channel Modulation
+
+DeepEmbed is a token-conditioned modulation path for RWKV channel mixing.
+
+The idea is simple: let token identity influence the channel-mix feed-forward pathway more directly.
+
+The tricky part is numerical stability. In long runs, we found that channel-mix activations could spike, especially through ReLU-squared paths and multiplicative DeepEmbed modulation.
+
+That led to one of the major stability patches:
+
+- clamp channel-mix key activations
+- clamp DeepEmbed modulation
+- exclude DeepEmbed identity gates from AdamW weight decay
+
+These fixes did not make the model magically smarter. They made the training dynamics less chaotic.
+
+## The Training Run
+
+The 232M checkpoint was trained for 13 epochs on an RTX 6000 Blackwell-generation 96GB card rented through Colab.
+
+It was not cheap.
+
+It was also not clean.
+
+We had to discard or supersede earlier runs after finding architecture and inference mismatches. That is painful when every long run costs real money, but it is also the reality of developing a custom architecture. Bugs that would be small in a feed-forward model can become catastrophic in a stateful recurrent memory model.
+
+Even the final 13-epoch path was not perfectly clean. The original 9 epochs were run before we had the full ROSA and DeepEmbed stability clamps in place. That means the release checkpoint carries some history from a bugged early training phase where those auxiliary signals could drift or spike more than they should have. The later epochs and inference fixes helped recover usable coherence, but this is one reason we describe the model as a research milestone rather than a clean scaling result.
+
+The final checkpoint is a research milestone, not a controlled scaling result.
+
+## The Biggest Lesson: Low Loss Is Not Enough
+
+One of the most frustrating parts of this project was seeing low training loss while chat output still looked broken.
+
+At first, it was tempting to assume the weights were bad. But the deeper issue was more subtle:
+
+> The model was not always being run at inference the same way it had been trained.
+
+For a stateless feed-forward model, this class of bug is less likely. For Hierarchos, it was central.
+
+The worst mismatch involved hierarchical drift state.
+
+During chat generation, the loop was feeding the previous drift state back into the model on every generated token. During training, drift state was effectively used at TBPTT chunk boundaries, not reseeded every token.
+
+That small implementation difference created massive logit drift.
+
+Before the fix, streamed generation and full/chunked forward passes could differ by several logit points. After the fix, they matched to micro-logit scale in local parity tests.
+
+The takeaway:
+
+> In recurrent memory-augmented models, train/inference parity is not a detail. It is the whole game.
+
+## Stability Lessons
+
+We also learned that Hierarchos needed explicit numerical guardrails.
+
+The most important ones were:
+
+- drift norm clamping
+- drift delta scaling
+- straight-through commitment-cost capping
+- ROSA signal clamping
+- RWKV channel-mix key clamping
+- DeepEmbed modulation clamping
+- non-finite gradient rejection
+- static evaluation with passive memory writes disabled
+
+None of these are glamorous. They are not the kind of thing people put in a flashy architecture diagram.
+
+But without them, long training runs could become unstable in ways that were hard to detect until money had already been spent.
+
+## How Good Is the 232M Model?
+
+The honest answer: promising, not revolutionary.
+
+We evaluated the current checkpoint with a bounded local benchmark preset designed to run on consumer hardware:
+
+```bash
+python hierarchos_cli.py benchmark \
+    --model-path "./chatHRM" \
+    --benchmark-preset rog-ally \
+    --eval-limit 100
+```
+
+Results:
+
+| Benchmark | Metric | Score |
+| --- | ---: | ---: |
+| ARC Easy | acc | 0.3600 |
+| ARC Easy | acc_norm | 0.3200 |
+| HellaSwag | acc | 0.3400 |
+| HellaSwag | acc_norm | 0.3700 |
+| TruthfulQA MC1 | acc | 0.2200 |
+
+These are not leaderboard claims. They are local smoke-test metrics.
+
+But they do show that the model is not collapsed. It has learned measurable commonsense and question-answering signal. HellaSwag normalized accuracy in particular is encouraging for a rescued 232M experimental checkpoint.
+
+In chat, the model is best described as:
+
+- coherent on some short instruction prompts
+- assistant-shaped
+- brittle on long-form answers
+- weak at arithmetic
+- limited in broad factual knowledge
+- closer to GPT-2-era general coherence than GPT-3-era general capability
+
+That may sound modest, but for a custom non-Transformer architecture trained under self-funded constraints, it is a meaningful first coherent release.
+
+## Recommended Inference Settings
+
+For the current checkpoint, we recommend static full-precision inference:
+
+```bash
+python hierarchos_cli.py chat \
+    --model-path "./chatHRM" \
+    --temperature 0.4 \
+    --top-k 40 \
+    --top-p 0.9 \
+    --repetition-penalty 1.15 \
+    --max-new-tokens 256 \
+    --no-passive-learning \
+    --chat-input-history-turns 0
+```
+
+Passive learning and chat history are interesting, but they should not be the first thing used to judge core model quality. Static inference gives the cleanest view of what the weights can actually do.
+
+The model is released in full precision. Quantization is not currently recommended because our experiments showed that hierarchical drift/state dynamics were sensitive to accumulated quantization error.
+
+## What We Are Not Claiming
+
+To keep this grounded, here are the claims we are not making:
+
+- We are not claiming GPT-3.5-level coding or math.
+- We are not claiming GPT-3-level general language ability.
+- We are not claiming superiority over same-size Transformers yet.
+- We are not claiming AGI.
+- We are not claiming production-ready quantized inference.
+
+What we are claiming is narrower and more defensible:
+
+> Hierarchos 232M is a coherent experimental recurrent memory-augmented assistant model with measurable benchmark signal, and it exposed several important engineering lessons for training stateful language models.
+
+That is enough to justify the next stage.
+
+## What Comes Next?
+
+The current model was trained mostly as an assistant model. That is not enough to produce broad general intelligence, even with a clever architecture.
+
+The next serious Hierarchos run should be trained as a foundation model first and an assistant second.
+
+A funded scaling path would look something like:
+
+1. Train a 300M-500M scout model on 20B-50B broad tokens.
+2. Train a 1B-1.5B model on 100B-300B tokens if the scout scales cleanly.
+3. Use multiple licensed datasets, not only in-house assistant data.
+4. Add math, code, reference, and high-quality web midtraining.
+5. Finish with assistant SFT and teacher distillation.
+6. Run matched baselines against same-size Transformers and RWKV-only models.
+7. Ablate LTM, ROSA, DeepEmbed, and the hierarchical worker loop.
+
+The most important question is not whether the 232M checkpoint is impressive in isolation. It is whether Hierarchos can show better sample efficiency, local inference behavior, or long-context continuity than comparable baselines.
+
+That is the experiment we want to run next.
+
+## Why This Matters
+
+Most language-model progress today comes from scaling the same basic ingredients: more parameters, more tokens, more compute.
+
+That path works. But it is not the only path worth exploring.
+
+Hierarchos is an attempt to revisit architectural structure:
+
+- recurrence instead of full attention everywhere
+- explicit memory instead of hoping everything fits in activations
+- hierarchy instead of flat token processing
+- exact pattern features alongside learned neural state
+- bounded internal refinement instead of pure feed-forward depth
+
+Maybe this will scale. Maybe parts of it will fail. Maybe the final answer is that only one component matters and the rest should be cut away.
+
+That is what research is for.
+
+For now, the result is simple: a 232M custom recurrent memory-augmented model crossed the line from token soup into coherent assistant behavior. It is small, imperfect, and early.
+
+But it is alive enough to study.
+
+## Links
+
+- Architecture and inference code: [necat101/Hierarchos](https://github.com/necat101/Hierarchos)
+- Training dataset: [netcat420/Experiment_0.1](https://huggingface.co/datasets/netcat420/Experiment_0.1)
+- Support future scaling runs: [Patreon](https://patreon.com/MakhiBurroughs?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink) or [Buy Me a Coffee](https://buymeacoffee.com/netcat420)
+
+## Acknowledgements
+
+A huge thanks to Lost Time for donating the lion's share of the funds needed for the training run. This project was self-funded, and that support made the first coherent release possible.
+
+Discords:
+
+- Lost Time: `losttime10`
+- netcat: `netcat7`
+
+---
+
+Suggested Medium tags:
+
+`Machine Learning`, `Artificial Intelligence`, `Language Models`, `Open Source`, `Deep Learning`

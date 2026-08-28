@@ -1,0 +1,471 @@
+{
+  "schema": "hierarchos-cross-backend-training-benchmark-v1",
+  "fixture": {
+    "width": 32,
+    "vocab_size": 64,
+    "batch": 2,
+    "tokens_per_sequence": 6,
+    "model_token_positions_per_step": 12,
+    "supervised_target_positions_per_step": 6,
+    "warmup_updates": 1,
+    "measured_updates": 3
+  },
+  "training_contract": {
+    "precision": "fp16-storage-fp16-lm-backward",
+    "gradient_accumulation_steps": 1,
+    "dynamic_loss_scale": 1024.0,
+    "grad_clip": 1.0,
+    "optimizer": {
+      "lr": 0.0003,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "eps": 1e-08,
+      "weight_decay": 0.07
+    },
+    "pytorch_inside_vulkan_trainer": false,
+    "portable_checkpoint": "SafeTensors FP32 canonical masters",
+    "pytorch_precision_oracle": "fp16-rounded-execution-with-fp32-adamw-masters",
+    "projection_parameter_gradient_policy": "fp32-cancellation-safe-source-scaled",
+    "optimizer_boundary_submissions_per_step": 1
+  },
+  "parity": {
+    "worst_parameter_name": "tok_emb.weight",
+    "max_abs_parameter_diff": 4.172325134277344e-06,
+    "threshold": 0.0005,
+    "status": "passed",
+    "qualification_class": "mixed-precision-training"
+  },
+  "inference_reload": null,
+  "vulkan_execution": {
+    "device_index": 0,
+    "device_name": "AMD Radeon Graphics",
+    "queue_submissions": 8,
+    "training_precision_policy": "fp16-storage-fp16-lm-backward",
+    "dynamic_loss_scale": 1024.0,
+    "dynamic_loss_scale_after": 1024.0,
+    "dynamic_loss_scale_overflow_count": 0,
+    "h_low_rank_native_fp16_parameter_grad_compute_active": false,
+    "l_low_rank_native_fp16_parameter_grad_compute_active": false,
+    "h_low_rank_parameter_grad_arithmetic": "fp32",
+    "l_low_rank_parameter_grad_arithmetic": "fp32",
+    "memory_live_buffer_count": 2006,
+    "memory_live_buffer_bytes": 28445764,
+    "memory_driver_allocation_count": 3,
+    "memory_reserved_bytes": 50331648,
+    "memory_max_driver_allocation_count": 4294967295,
+    "memory_budget_extension_supported": true,
+    "device_local_heap_size_bytes": 7500070912,
+    "device_local_budget_bytes": 7125067056,
+    "device_local_usage_bytes": 33554432,
+    "device_local_available_bytes": 7091512624,
+    "budgeted_plans": [],
+    "kernel_profile": {
+      "sample_count": 2247,
+      "dispatches": 20312,
+      "gpu_ms": 106.841,
+      "categories": [
+        {
+          "category": "rwkv.recurrent",
+          "dispatches": 2936,
+          "gpu_ms": 36.40276,
+          "pct_of_profiled_gpu_time": 34.07190123641673
+        },
+        {
+          "category": "normalization.layer-norm",
+          "dispatches": 1481,
+          "gpu_ms": 28.394119999999997,
+          "pct_of_profiled_gpu_time": 26.576052264580078
+        },
+        {
+          "category": "projection.linear",
+          "dispatches": 4996,
+          "gpu_ms": 23.48992,
+          "pct_of_profiled_gpu_time": 21.985866848868884
+        },
+        {
+          "category": "control",
+          "dispatches": 1488,
+          "gpu_ms": 6.744,
+          "pct_of_profiled_gpu_time": 6.312183525051244
+        },
+        {
+          "category": "elementwise-reduction",
+          "dispatches": 3372,
+          "gpu_ms": 4.12844,
+          "pct_of_profiled_gpu_time": 3.864097116275588
+        },
+        {
+          "category": "other",
+          "dispatches": 1648,
+          "gpu_ms": 3.3154800000000004,
+          "pct_of_profiled_gpu_time": 3.103190722662649
+        },
+        {
+          "category": "optimizer.gradient-bookkeeping",
+          "dispatches": 3652,
+          "gpu_ms": 1.6133200000000003,
+          "pct_of_profiled_gpu_time": 1.5100195617787182
+        },
+        {
+          "category": "token.embedding",
+          "dispatches": 504,
+          "gpu_ms": 1.4432399999999999,
+          "pct_of_profiled_gpu_time": 1.3508297376475322
+        },
+        {
+          "category": "loss.lm-projection",
+          "dispatches": 72,
+          "gpu_ms": 0.92004,
+          "pct_of_profiled_gpu_time": 0.8611300905083255
+        },
+        {
+          "category": "memory.rosa",
+          "dispatches": 120,
+          "gpu_ms": 0.35224,
+          "pct_of_profiled_gpu_time": 0.32968616916726723
+        },
+        {
+          "category": "loss.cross-entropy",
+          "dispatches": 24,
+          "gpu_ms": 0.031080000000000003,
+          "pct_of_profiled_gpu_time": 0.029089956102994176
+        },
+        {
+          "category": "mixed-precision.mirror-pack",
+          "dispatches": 19,
+          "gpu_ms": 0.00636,
+          "pct_of_profiled_gpu_time": 0.005952770939994946
+        }
+      ],
+      "reported_hot_shaders": [
+        {
+          "shader": "layer_norm_low_rank_producer_forward_fused_fp16_packed_two_rows",
+          "category": "normalization.layer-norm",
+          "dispatches": 424,
+          "gpu_ms": 13.616,
+          "pct_of_profiled_gpu_time": 12.744171245121255
+        },
+        {
+          "shader": "rwkv_group_norm_bonus_gate_linear_residual_forward_fused",
+          "category": "rwkv.recurrent",
+          "dispatches": 360,
+          "gpu_ms": 7.85128,
+          "pct_of_profiled_gpu_time": 7.3485646895854595
+        },
+        {
+          "shader": "layer_norm_adapter_forward_fused_256",
+          "category": "normalization.layer-norm",
+          "dispatches": 408,
+          "gpu_ms": 6.319640000000001,
+          "pct_of_profiled_gpu_time": 5.914995179753092
+        },
+        {
+          "shader": "packed_cell_channel_mix_state_forward_fused",
+          "category": "rwkv.recurrent",
+          "dispatches": 360,
+          "gpu_ms": 6.1692,
+          "pct_of_profiled_gpu_time": 5.774187811795097
+        },
+        {
+          "shader": "rwkv_time_mix3_linear3_key_state_forward_packed_fast",
+          "category": "rwkv.recurrent",
+          "dispatches": 240,
+          "gpu_ms": 5.46508,
+          "pct_of_profiled_gpu_time": 5.115152422759054
+        },
+        {
+          "shader": "linear_bias_forward_fp16_packed",
+          "category": "projection.linear",
+          "dispatches": 384,
+          "gpu_ms": 5.28988,
+          "pct_of_profiled_gpu_time": 4.951170430827117
+        },
+        {
+          "shader": "linear_input_grad",
+          "category": "projection.linear",
+          "dispatches": 748,
+          "gpu_ms": 4.18796,
+          "pct_of_profiled_gpu_time": 3.919806066959314
+        },
+        {
+          "shader": "rwkv_matrix_state_backward_fused_rkv_add3",
+          "category": "rwkv.recurrent",
+          "dispatches": 152,
+          "gpu_ms": 4.02776,
+          "pct_of_profiled_gpu_time": 3.7698636291311387
+        },
+        {
+          "shader": "rwkv_time_mix3_linear3_key_state_forward_fused",
+          "category": "rwkv.recurrent",
+          "dispatches": 120,
+          "gpu_ms": 2.6946,
+          "pct_of_profiled_gpu_time": 2.5220654991997455
+        },
+        {
+          "shader": "parameter_matmul_input_grad_fp16_packed",
+          "category": "projection.linear",
+          "dispatches": 360,
+          "gpu_ms": 2.6736000000000004,
+          "pct_of_profiled_gpu_time": 2.5024101234544793
+        },
+        {
+          "shader": "linear3_time_mix_backward_fused",
+          "category": "projection.linear",
+          "dispatches": 120,
+          "gpu_ms": 2.5708,
+          "pct_of_profiled_gpu_time": 2.406192379330033
+        },
+        {
+          "shader": "rwkv_key_transform_backward",
+          "category": "rwkv.recurrent",
+          "dispatches": 152,
+          "gpu_ms": 2.5696399999999997,
+          "pct_of_profiled_gpu_time": 2.4051066538126746
+        },
+        {
+          "shader": "layer_norm_input_grad",
+          "category": "normalization.layer-norm",
+          "dispatches": 168,
+          "gpu_ms": 2.5366799999999996,
+          "pct_of_profiled_gpu_time": 2.3742570735953423
+        },
+        {
+          "shader": "linear_forward_fp16_packed",
+          "category": "projection.linear",
+          "dispatches": 264,
+          "gpu_ms": 2.4422800000000002,
+          "pct_of_profiled_gpu_time": 2.2859014797690027
+        },
+        {
+          "shader": "drift_update_forward",
+          "category": "control",
+          "dispatches": 144,
+          "gpu_ms": 2.3742400000000004,
+          "pct_of_profiled_gpu_time": 2.22221806235434
+        },
+        {
+          "shader": "layer_norm_low_rank_producer_forward_fused_fp16_packed",
+          "category": "normalization.layer-norm",
+          "dispatches": 48,
+          "gpu_ms": 2.0972,
+          "pct_of_profiled_gpu_time": 1.9629168577605975
+        },
+        {
+          "shader": "layer_norm_input_grad_residual_fused",
+          "category": "normalization.layer-norm",
+          "dispatches": 120,
+          "gpu_ms": 1.8271600000000001,
+          "pct_of_profiled_gpu_time": 1.7101674450819444
+        },
+        {
+          "shader": "rwkv_bonus_gate_backward",
+          "category": "rwkv.recurrent",
+          "dispatches": 120,
+          "gpu_ms": 1.80572,
+          "pct_of_profiled_gpu_time": 1.690100242416301
+        },
+        {
+          "shader": "drift_update_backward",
+          "category": "control",
+          "dispatches": 72,
+          "gpu_ms": 1.77,
+          "pct_of_profiled_gpu_time": 1.6566673842438766
+        },
+        {
+          "shader": "layer_norm_backward_fused_add_residual",
+          "category": "normalization.layer-norm",
+          "dispatches": 120,
+          "gpu_ms": 1.7354,
+          "pct_of_profiled_gpu_time": 1.6242828127778661
+        },
+        {
+          "shader": "linear_weight_grad",
+          "category": "projection.linear",
+          "dispatches": 1012,
+          "gpu_ms": 1.6067200000000001,
+          "pct_of_profiled_gpu_time": 1.5038421579730632
+        },
+        {
+          "shader": "gradient_lassq_partials",
+          "category": "other",
+          "dispatches": 384,
+          "gpu_ms": 1.6048,
+          "pct_of_profiled_gpu_time": 1.5020450950477813
+        },
+        {
+          "shader": "rwkv_group_norm_input_grad",
+          "category": "rwkv.recurrent",
+          "dispatches": 120,
+          "gpu_ms": 1.5358800000000001,
+          "pct_of_profiled_gpu_time": 1.4375380237923647
+        },
+        {
+          "shader": "rwkv_matrix_state_backward_fused_rkv_add3_key_transform",
+          "category": "rwkv.recurrent",
+          "dispatches": 32,
+          "gpu_ms": 1.53032,
+          "pct_of_profiled_gpu_time": 1.4323340290712365
+        },
+        {
+          "shader": "parameter_matmul_weight_grad",
+          "category": "projection.linear",
+          "dispatches": 720,
+          "gpu_ms": 1.35848,
+          "pct_of_profiled_gpu_time": 1.271496897258543
+        },
+        {
+          "shader": "gradient_accumulate4",
+          "category": "optimizer.gradient-bookkeeping",
+          "dispatches": 1920,
+          "gpu_ms": 1.04552,
+          "pct_of_profiled_gpu_time": 0.9785756404376598
+        },
+        {
+          "shader": "sigmoid_backward",
+          "category": "elementwise-reduction",
+          "dispatches": 60,
+          "gpu_ms": 0.80972,
+          "pct_of_profiled_gpu_time": 0.7578738499265263
+        },
+        {
+          "shader": "rwkv_matrix_state_backward_fused_rkv_add3_key_transform_reduce",
+          "category": "rwkv.recurrent",
+          "dispatches": 16,
+          "gpu_ms": 0.79308,
+          "pct_of_profiled_gpu_time": 0.7422993045740869
+        },
+        {
+          "shader": "linear3_weight_grad",
+          "category": "projection.linear",
+          "dispatches": 256,
+          "gpu_ms": 0.54352,
+          "pct_of_profiled_gpu_time": 0.5087185630984361
+        },
+        {
+          "shader": "embedding_grad_accumulate",
+          "category": "token.embedding",
+          "dispatches": 42,
+          "gpu_ms": 0.50936,
+          "pct_of_profiled_gpu_time": 0.47674581855280285
+        },
+        {
+          "shader": "linear3_weight_grad_tiled",
+          "category": "projection.linear",
+          "dispatches": 192,
+          "gpu_ms": 0.35708,
+          "pct_of_profiled_gpu_time": 0.33421626529141435
+        },
+        {
+          "shader": "rwkv_state_unpack_vectors",
+          "category": "rwkv.recurrent",
+          "dispatches": 60,
+          "gpu_ms": 0.31004,
+          "pct_of_profiled_gpu_time": 0.29018822362201774
+        },
+        {
+          "shader": "linear_input_grad_fp16_packed",
+          "category": "projection.linear",
+          "dispatches": 66,
+          "gpu_ms": 0.2028,
+          "pct_of_profiled_gpu_time": 0.18981477148285772
+        },
+        {
+          "shader": "gradient_scale",
+          "category": "optimizer.gradient-bookkeeping",
+          "dispatches": 384,
+          "gpu_ms": 0.10528,
+          "pct_of_profiled_gpu_time": 0.09853895040293521
+        },
+        {
+          "shader": "gradient_scale_from_buffer",
+          "category": "other",
+          "dispatches": 380,
+          "gpu_ms": 0.10099999999999999,
+          "pct_of_profiled_gpu_time": 0.09453299763199521
+        },
+        {
+          "shader": "rwkv_key_transform_param_reduce",
+          "category": "rwkv.recurrent",
+          "dispatches": 64,
+          "gpu_ms": 0.09856,
+          "pct_of_profiled_gpu_time": 0.09224923016444998
+        },
+        {
+          "shader": "adamw_fp16_mirror_controlled",
+          "category": "other",
+          "dispatches": 76,
+          "gpu_ms": 0.08199999999999999,
+          "pct_of_profiled_gpu_time": 0.07674956243389709
+        },
+        {
+          "shader": "adamw_controlled",
+          "category": "other",
+          "dispatches": 304,
+          "gpu_ms": 0.05204,
+          "pct_of_profiled_gpu_time": 0.048707893037317145
+        },
+        {
+          "shader": "gradient_lassq_reduce",
+          "category": "other",
+          "dispatches": 4,
+          "gpu_ms": 0.02368,
+          "pct_of_profiled_gpu_time": 0.02216377607847175
+        },
+        {
+          "shader": "layer_norm_stats",
+          "category": "normalization.layer-norm",
+          "dispatches": 1,
+          "gpu_ms": 0.01296,
+          "pct_of_profiled_gpu_time": 0.012130174745650077
+        },
+        {
+          "shader": "gradient_clip_coefficient",
+          "category": "other",
+          "dispatches": 4,
+          "gpu_ms": 0.00724,
+          "pct_of_profiled_gpu_time": 0.006776424780748963
+        },
+        {
+          "shader": "fp32_to_fp16_packed",
+          "category": "mixed-precision.mirror-pack",
+          "dispatches": 19,
+          "gpu_ms": 0.00636,
+          "pct_of_profiled_gpu_time": 0.005952770939994946
+        },
+        {
+          "shader": "dynamic_loss_scale_control",
+          "category": "other",
+          "dispatches": 4,
+          "gpu_ms": 0.0022400000000000002,
+          "pct_of_profiled_gpu_time": 0.002096573412828409
+        },
+        {
+          "shader": "buffer_zero_on_optimizer_skip",
+          "category": "other",
+          "dispatches": 4,
+          "gpu_ms": 0.0,
+          "pct_of_profiled_gpu_time": 0.0
+        }
+      ]
+    }
+  },
+  "backends": [
+    {
+      "backend": "vulkan-native",
+      "device": "AMD Radeon Graphics",
+      "median_optimizer_step_ms": 82.6218,
+      "model_token_positions_per_second": 145.24011822545626,
+      "supervised_target_positions_per_second": 72.62005911272813,
+      "memory_bytes": 50331648,
+      "memory_metric": "vulkan-suballocator-reserved-after-training",
+      "hourly_cost_usd": null,
+      "cost_per_billion_model_tokens_usd": null,
+      "samples_ms": [
+        81.06099999999999,
+        82.6218,
+        89.9439
+      ],
+      "throughput_vs_vulkan": 1.0
+    }
+  ]
+}

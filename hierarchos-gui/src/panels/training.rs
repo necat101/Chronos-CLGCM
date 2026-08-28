@@ -3,7 +3,7 @@
 // Real-time training monitoring with live loss curves, metric cards,
 // progress tracking, and configuration controls.
 
-use crate::bridge::{PythonBridge, TrainingConfig};
+use crate::bridge::{PythonBridge, TrainingBackend, TrainingConfig, VulkanTrainingPrecision};
 use crate::theme::{get_accent, HierarchosColors};
 use crate::widgets::metric_card::{progress_bar_labeled, MetricCard};
 use egui::{self, CornerRadius as Rounding, RichText, ScrollArea, Stroke};
@@ -55,6 +55,7 @@ impl TrainingState {
         &mut self,
         epoch: u32,
         step: u32,
+        total_steps: Option<u32>,
         loss: f64,
         lr: f64,
         ponder: Option<f64>,
@@ -63,6 +64,9 @@ impl TrainingState {
     ) {
         self.current_epoch = epoch;
         self.current_step = step;
+        if let Some(total_steps) = total_steps.filter(|steps| *steps > 0) {
+            self.total_steps = total_steps;
+        }
         self.current_loss = loss;
         self.current_lr = lr;
         self.loss_history.push(loss);
@@ -89,7 +93,12 @@ impl TrainingState {
 }
 
 /// Draw the training dashboard.
-pub fn draw_training_panel(ui: &mut egui::Ui, state: &mut TrainingState, bridge: &PythonBridge) {
+pub fn draw_training_panel(
+    ui: &mut egui::Ui,
+    state: &mut TrainingState,
+    bridge: &PythonBridge,
+    model_path: &str,
+) {
     // Wrap entire panel in a scroll area to prevent overflow crashes
     ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -149,7 +158,7 @@ pub fn draw_training_panel(ui: &mut egui::Ui, state: &mut TrainingState, bridge:
                             state.commitment_history.clear();
                             state.tps_history.clear();
                             state.log_messages.clear();
-                            bridge.start_training(state.config.clone());
+                            bridge.start_training(state.config.clone(), model_path.to_string());
                         }
                     }
 
@@ -369,6 +378,104 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
         );
         ui.add_space(8.0);
 
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("Training Backend")
+                    .color(HierarchosColors::TEXT_SECONDARY)
+                    .size(12.0),
+            );
+            egui::ComboBox::from_id_salt("training_backend_selector")
+                .selected_text(state.config.backend.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut state.config.backend,
+                        TrainingBackend::Pytorch,
+                        TrainingBackend::Pytorch.label(),
+                    );
+                    ui.selectable_value(
+                        &mut state.config.backend,
+                        TrainingBackend::Vulkan,
+                        TrainingBackend::Vulkan.label(),
+                    );
+                });
+            if state.config.backend == TrainingBackend::Vulkan {
+                ui.separator();
+                ui.label(
+                    RichText::new("Vulkan devices")
+                        .color(HierarchosColors::TEXT_SECONDARY)
+                        .size(12.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.config.vulkan_device_indices)
+                        .desired_width(90.0)
+                        .hint_text("0 or 0,1"),
+                )
+                .on_hover_text(
+                    "Physical Vulkan adapter indices. A comma-separated list enables native synchronous data parallel training.",
+                );
+            }
+        });
+        if state.config.backend == TrainingBackend::Vulkan {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Native Vulkan uses the loaded local model.safetensors package directly and writes PyTorch/CUDA/native-Rust compatible SafeTensors checkpoints. For backend-parity training, select a Hierarchos token-cache directory (index.safetensors + tokens.bin); legacy tokenized JSONL remains supported.",
+                )
+                .color(HierarchosColors::ACCENT_CYAN)
+                .size(11.0),
+            );
+            ui.horizontal(|ui| {
+                ui.checkbox(
+                    &mut state.config.vulkan_exact_resume,
+                    "Exact-resume loaded checkpoint",
+                )
+                .on_hover_text(
+                    "Restore the Vulkan/PyTorch-portable optimizer, scheduler/scaler, data cursor, pending gradients, and recurrent replay state from the loaded package. Disable this to start a fresh optimizer/session from the same model weights.",
+                );
+                if state.config.vulkan_exact_resume {
+                    ui.label(
+                        RichText::new("requires training_state.json + portable replay state")
+                            .color(HierarchosColors::WARNING)
+                            .size(11.0),
+                    );
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("Training precision")
+                        .color(HierarchosColors::TEXT_SECONDARY)
+                        .size(12.0),
+                );
+                ui.add_enabled_ui(!state.config.vulkan_exact_resume, |ui| {
+                    egui::ComboBox::from_id_salt("vulkan_training_precision")
+                        .selected_text(state.config.vulkan_precision.label())
+                        .show_ui(ui, |ui| {
+                            for precision in VulkanTrainingPrecision::ALL {
+                                ui.selectable_value(
+                                    &mut state.config.vulkan_precision,
+                                    precision,
+                                    precision.label(),
+                                );
+                            }
+                        });
+                });
+                ui.label(
+                    RichText::new(if state.config.vulkan_exact_resume {
+                        "checkpoint-locked on launch"
+                    } else {
+                        "FP32 master weights stay portable"
+                    })
+                    .color(if state.config.vulkan_exact_resume {
+                        HierarchosColors::WARNING
+                    } else {
+                        HierarchosColors::TEXT_MUTED
+                    })
+                    .size(11.0),
+                );
+            });
+        }
+        ui.add_space(8.0);
+
         // Use a grid instead of columns to avoid the height assertion
         egui::Grid::new("training_config_grid")
             .num_columns(4)
@@ -442,7 +549,15 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .color(HierarchosColors::TEXT_SECONDARY)
                         .size(12.0),
                 );
-                ui.checkbox(&mut state.config.amp, "AMP");
+                ui.add_enabled(
+                    state.config.backend == TrainingBackend::Pytorch,
+                    egui::Checkbox::new(&mut state.config.amp, "AMP"),
+                )
+                .on_hover_text(if state.config.backend == TrainingBackend::Vulkan {
+                    "Native Vulkan precision is checkpoint/policy driven so PyTorch/CUDA interchange never changes the authoritative FP32 master weights."
+                } else {
+                    "Use PyTorch automatic mixed precision when supported."
+                });
                 ui.end_row();
 
                 // Row 5
@@ -452,11 +567,18 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .size(12.0),
                 );
                 if ui
-                    .checkbox(&mut state.config.full_sample_bptt, "Exact coherence")
+                    .add_enabled(
+                        state.config.backend == TrainingBackend::Pytorch,
+                        egui::Checkbox::new(&mut state.config.full_sample_bptt, "Exact coherence"),
+                    )
                     .on_hover_text(
-                        "Use one attached gradient graph per trimmed sample. This disables "
-                            .to_owned()
-                            + "cross-sample recurrent persistence and token-level detachment.",
+                        if state.config.backend == TrainingBackend::Vulkan {
+                            "The native backend owns its recurrent Vulkan tape and TBPTT/checkpoint planner directly; this PyTorch autograd option does not apply."
+                                .to_string()
+                        } else {
+                            "Use one attached gradient graph per trimmed sample. This disables cross-sample recurrent persistence and token-level detachment."
+                                .to_string()
+                        },
                     )
                     .changed()
                     && state.config.full_sample_bptt
@@ -473,7 +595,7 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .size(12.0),
                 );
                 ui.add_enabled(
-                    state.config.full_sample_bptt,
+                    state.config.backend == TrainingBackend::Pytorch && state.config.full_sample_bptt,
                     egui::Checkbox::new(
                         &mut state.config.full_sample_activation_checkpointing,
                         "Checkpoint",
@@ -488,7 +610,8 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                         .size(12.0),
                 );
                 ui.add_enabled(
-                    state.config.full_sample_bptt
+                    state.config.backend == TrainingBackend::Pytorch
+                        && state.config.full_sample_bptt
                         && state.config.full_sample_activation_checkpointing,
                     egui::DragValue::new(
                         &mut state.config.full_sample_checkpoint_segment_size,
@@ -500,6 +623,141 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
                 ui.label("");
                 ui.end_row();
             });
+
+        if state.config.backend == TrainingBackend::Vulkan {
+            ui.add_space(8.0);
+            egui::CollapsingHeader::new("Vulkan PyTorch-parity controls")
+                .id_salt("vulkan_pytorch_parity_controls")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "These values map directly to the Rust trainer's portable optimizer, scheduler, objective, and deterministic data-order policy. Exact resume reconstructs trajectory-defining values from training_state.json before launch.",
+                        )
+                        .color(HierarchosColors::TEXT_MUTED)
+                        .size(11.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.add_enabled_ui(!state.config.vulkan_exact_resume, |ui| {
+                        egui::Grid::new("vulkan_parity_config_grid")
+                            .num_columns(4)
+                            .spacing([16.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("Warmup steps");
+                                ui.add(egui::DragValue::new(&mut state.config.warmup_steps).range(0..=1_000_000));
+                                ui.label("Warmup ratio");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.warmup_ratio)
+                                        .speed(0.001)
+                                        .range(0.0..=1.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Adam β1");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.beta1)
+                                        .speed(0.001)
+                                        .range(0.0..=0.99999),
+                                );
+                                ui.label("Adam β2");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.beta2)
+                                        .speed(0.001)
+                                        .range(0.0..=0.999999),
+                                );
+                                ui.end_row();
+
+                                ui.label("Adam ε");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.eps)
+                                        .speed(1.0e-9)
+                                        .range(1.0e-12..=1.0e-2),
+                                );
+                                ui.label("Weight decay");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.weight_decay)
+                                        .speed(0.001)
+                                        .range(0.0..=10.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Z-loss weight");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.z_loss_weight)
+                                        .speed(1.0e-5)
+                                        .range(0.0..=10.0),
+                                );
+                                ui.label("Ponder weight");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.ponder_loss_weight)
+                                        .speed(1.0e-4)
+                                        .range(0.0..=10.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Commitment weight");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.commitment_loss_weight)
+                                        .speed(0.01)
+                                        .range(0.0..=10.0),
+                                );
+                                ui.label("Max skipped batches");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.max_skipped_train_batches)
+                                        .range(0..=1_000_000),
+                                );
+                                ui.end_row();
+
+                                ui.label("CE backward cap");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.max_ce_loss_for_backward)
+                                        .speed(0.1)
+                                        .range(0.0..=1_000.0),
+                                );
+                                ui.label("Ponder backward cap");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.max_ponder_cost_for_backward)
+                                        .speed(0.1)
+                                        .range(0.0..=1_000.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Commitment cap");
+                                ui.add(
+                                    egui::DragValue::new(&mut state.config.max_commitment_cost_for_backward)
+                                        .speed(0.1)
+                                        .range(0.0..=1_000.0),
+                                );
+                                ui.label("Seed");
+                                ui.add(egui::DragValue::new(&mut state.config.seed));
+                                ui.end_row();
+                            });
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(
+                                &mut state.config.disable_lr_schedule,
+                                "Fixed learning rate",
+                            );
+                            ui.checkbox(&mut state.config.vulkan_tbptt_enabled, "TBPTT");
+                            if ui
+                                .checkbox(&mut state.config.persist_state, "Carry recurrent state")
+                                .changed()
+                                && state.config.persist_state
+                            {
+                                state.config.shuffle = false;
+                            }
+                            ui.add_enabled(
+                                !state.config.persist_state,
+                                egui::Checkbox::new(&mut state.config.shuffle, "Shuffle each epoch"),
+                            );
+                        });
+                    });
+                    if state.config.vulkan_exact_resume {
+                        ui.small(
+                            "Trajectory controls are locked here because the bridge rehydrates them from the checkpoint. Target epochs, output path, save cadence, and Vulkan device topology remain runtime choices.",
+                        );
+                    }
+                });
+        }
 
         ui.add_space(8.0);
 
@@ -654,14 +912,26 @@ fn draw_config_section(ui: &mut egui::Ui, state: &mut TrainingState) {
             );
             ui.add(
                 egui::TextEdit::singleline(&mut state.config.data_path)
-                    .desired_width(ui.available_width() - 80.0)
-                    .hint_text("Path to training data (.jsonl)"),
+                    .desired_width(
+                        ui.available_width()
+                            - if state.config.backend == TrainingBackend::Vulkan { 150.0 } else { 80.0 },
+                    )
+                    .hint_text(if state.config.backend == TrainingBackend::Vulkan {
+                        "Token cache directory or training JSONL"
+                    } else {
+                        "Path to training data (.jsonl)"
+                    }),
             );
             if ui.button("Browse").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("Training Data", &["jsonl", "json", "pt"])
                     .pick_file()
                 {
+                    state.config.data_path = path.display().to_string();
+                }
+            }
+            if state.config.backend == TrainingBackend::Vulkan && ui.button("Cache").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     state.config.data_path = path.display().to_string();
                 }
             }

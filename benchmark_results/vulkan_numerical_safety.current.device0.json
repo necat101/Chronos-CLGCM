@@ -1,0 +1,82 @@
+{
+  "contract": {
+    "locked_profile_replay_flag": "--lock-joint-runtime-profile",
+    "microprofile_device_env": "HIERARCHOS_VULKAN_MICROPROFILE_DEVICE_INDEX",
+    "model_checkpoint_abi": "canonical-safetensors-pytorch-row-major",
+    "qualification_device_env": "HIERARCHOS_VULKAN_QUALIFICATION_DEVICE_INDEX",
+    "runtime_profile_scope": "scheduler-only-no-model-tensor-layout-change"
+  },
+  "created_utc": "2026-08-25T07:25:10.293523+00:00",
+  "cross_backend_trajectory": null,
+  "logs": "C:\\Users\\User\\Downloads\\Hierarchos-main GUI experiment\\Hierarchos-main\\benchmark_results\\vulkan_numerical_safety.current.device0.logs",
+  "microprofiles": null,
+  "numerical_safety": {
+    "active_gradient_clip": {
+      "pytorch_window_global_l2_norms": [
+        11.934918403625488
+      ],
+      "report": "C:\\Users\\User\\Downloads\\Hierarchos-main GUI experiment\\Hierarchos-main\\benchmark_results\\vulkan_numerical_safety.current.device0.logs\\safety-full-graph-active-gradient-clip.json",
+      "threshold": 0.01,
+      "vulkan_window_clip_coefficients": [
+        0.0008378774
+      ],
+      "vulkan_window_global_l2_norms": [
+        11.93491918104397
+      ]
+    },
+    "checks": [
+      "finite_clamp_boundary_and_nonfinite",
+      "optimizer_gradient_numerics",
+      "labeled_objective_backward_cap_policy",
+      "native_resume_numerical_policy",
+      "rwkv_decay_clamp_parity",
+      "rwkv_channel_mix_clamp_parity",
+      "rwkv_packed_state_clamp_parity",
+      "token_frontend_activation_clamp_parity",
+      "token_memory_frontend_clamp_parity",
+      "manager_control_clamp_parity",
+      "worker_refinement_clamp_parity",
+      "full_graph_rwkv_active_gradient_clip_parity"
+    ],
+    "device_index": 0,
+    "device_selection_env": "HIERARCHOS_VULKAN_QUALIFICATION_DEVICE_INDEX",
+    "status": "passed"
+  },
+  "portable_checkpoint_parity": null,
+  "runtime_profile": null,
+  "schema_version": 1,
+  "status": "passed",
+  "vulkan_device": {
+    "compute_queue_family_index": 0,
+    "device_group": {
+      "group_index": 0,
+      "physical_device_count": 1,
+      "subset_allocation": false
+    },
+    "device_type": "INTEGRATED_GPU",
+    "device_uuid": "00000000090000000000000000000000",
+    "driver_uuid": "414d442d57494e2d4452560000000000",
+    "external_buffer": {
+      "opaque_fd_exportable": false,
+      "opaque_fd_extension_exposed": false,
+      "opaque_fd_importable": false,
+      "opaque_win32_exportable": true,
+      "opaque_win32_extension_exposed": true,
+      "opaque_win32_importable": true,
+      "platform_bidirectional_candidate": true,
+      "platform_handle": "opaque-win32"
+    },
+    "external_semaphore": {
+      "opaque_fd_exportable": false,
+      "opaque_fd_extension_exposed": false,
+      "opaque_fd_importable": false,
+      "opaque_win32_exportable": true,
+      "opaque_win32_extension_exposed": true,
+      "opaque_win32_importable": true,
+      "platform_bidirectional_candidate": true,
+      "platform_handle": "opaque-win32"
+    },
+    "index": 0,
+    "name": "AMD Radeon Graphics"
+  }
+}

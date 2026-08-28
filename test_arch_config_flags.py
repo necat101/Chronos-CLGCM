@@ -1,8 +1,10 @@
 import unittest
+import hashlib
 import os
 import tempfile
 
 import torch
+from safetensors.torch import save_file
 
 from hierarchos.models.quantized import (
     detect_quantized_rwkv_format,
@@ -11,6 +13,7 @@ from hierarchos.models.quantized import (
 )
 from hierarchos.utils.checkpoint import (
     _infer_arch_flags_from_state_dict,
+    load_checkpoint_payload_compatible,
     _reject_unsupported_rwkv_state_dict,
     _resolve_weights_path,
 )
@@ -109,6 +112,33 @@ class ArchitectureConfigFlagTests(unittest.TestCase):
 
         self.assertEqual(os.path.normcase(resolved), os.path.normcase(new_path))
         self.assertEqual(os.path.normcase(model_dir), os.path.normcase(tmp))
+
+    def test_resolve_weights_accepts_native_model_safetensors_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, "model.safetensors")
+            save_file({"weight": torch.ones(1)}, model_path)
+
+            resolved, model_dir = _resolve_weights_path(tmp)
+
+        self.assertEqual(os.path.normcase(resolved), os.path.normcase(model_path))
+        self.assertEqual(os.path.normcase(model_dir), os.path.normcase(tmp))
+
+    def test_safetensors_loader_honors_sha256_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = os.path.join(tmp, "model.safetensors")
+            save_file({"weight": torch.tensor([1.25])}, model_path)
+            with open(model_path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()
+            with open(model_path + ".sha256", "w", encoding="utf-8") as handle:
+                handle.write(digest + "\n")
+
+            loaded = load_checkpoint_payload_compatible(model_path)
+            self.assertTrue(torch.equal(loaded["weight"], torch.tensor([1.25])))
+
+            with open(model_path + ".sha256", "w", encoding="utf-8") as handle:
+                handle.write("0" * 64 + "\n")
+            with self.assertRaisesRegex(RuntimeError, "SHA-256 verification failed"):
+                load_checkpoint_payload_compatible(model_path)
 
     def test_quantized_loader_rejects_every_legacy_npz_architecture(self):
         legacy_q = {"h_rnn.time_decay": object(), "h_rnn.time_mix_k": object()}

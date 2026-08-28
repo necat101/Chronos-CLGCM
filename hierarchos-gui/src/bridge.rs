@@ -5,7 +5,7 @@
 // back to the UI thread through tokio channels.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const NATIVE_VULKAN_EVENT_PREFIX: &str = "HIERARCHOS_EVENT ";
 
 /// Events flowing from the Python backend to the GUI.
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub enum BridgeEvent {
     TrainingMetrics {
         epoch: u32,
         step: u32,
+        total_steps: Option<u32>,
         loss: f64,
         lr: f64,
         ponder_cost: Option<f64>,
@@ -174,15 +176,112 @@ fn default_checkpoint_segment_size() -> u32 {
     128
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingBackend {
+    Pytorch,
+    Vulkan,
+}
+
+impl Default for TrainingBackend {
+    fn default() -> Self {
+        Self::Pytorch
+    }
+}
+
+impl TrainingBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pytorch => "PyTorch",
+            Self::Vulkan => "Vulkan (native)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VulkanTrainingPrecision {
+    Fp32,
+    Fp16StorageFp32Compute,
+    Fp16Parity,
+    Fp16LmBackward,
+}
+
+impl Default for VulkanTrainingPrecision {
+    fn default() -> Self {
+        Self::Fp32
+    }
+}
+
+impl VulkanTrainingPrecision {
+    pub const ALL: [Self; 4] = [
+        Self::Fp32,
+        Self::Fp16StorageFp32Compute,
+        Self::Fp16Parity,
+        Self::Fp16LmBackward,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fp32 => "FP32 parity",
+            Self::Fp16StorageFp32Compute => "FP16 storage / FP32 compute",
+            Self::Fp16Parity => "FP16 parity + GradScaler",
+            Self::Fp16LmBackward => "FP16 LM backward + GradScaler",
+        }
+    }
+
+    fn env_value(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Fp16StorageFp32Compute => "fp16-storage-fp32-compute",
+            Self::Fp16Parity => "fp16-storage-parity",
+            Self::Fp16LmBackward => "fp16-storage-fp16-lm-backward",
+        }
+    }
+
+    fn from_manifest_label(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fp32" => Ok(Self::Fp32),
+            "fp16" | "fp16-storage-fp32-compute" => Ok(Self::Fp16StorageFp32Compute),
+            "fp16-parity" | "fp16-storage-parity" => Ok(Self::Fp16Parity),
+            "fp16-lm-backward" | "fp16-storage-fp16-lm-backward" => Ok(Self::Fp16LmBackward),
+            other => Err(format!(
+                "Checkpoint requests unsupported Vulkan training precision {other:?}."
+            )),
+        }
+    }
+}
+
 /// Training configuration sent to the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrainingConfig {
+    pub backend: TrainingBackend,
+    pub vulkan_device_indices: String,
+    pub vulkan_exact_resume: bool,
+    pub vulkan_precision: VulkanTrainingPrecision,
+    pub vulkan_tbptt_enabled: bool,
     pub data_path: String,
     pub epochs: u32,
     pub batch_size: u32,
     pub learning_rate: f64,
     pub min_lr: f64,
+    pub warmup_steps: u64,
+    pub warmup_ratio: f64,
+    pub disable_lr_schedule: bool,
+    pub beta1: f32,
+    pub beta2: f32,
+    pub eps: f32,
+    pub weight_decay: f32,
+    pub z_loss_weight: f32,
+    pub ponder_loss_weight: f32,
+    pub commitment_loss_weight: f32,
+    pub max_ce_loss_for_backward: f32,
+    pub max_ponder_cost_for_backward: f32,
+    pub max_commitment_cost_for_backward: f32,
+    pub max_skipped_train_batches: u64,
+    pub seed: u64,
+    pub shuffle: bool,
     pub training_chunk_size: u32,
     pub full_sample_bptt: bool,
     pub full_sample_activation_checkpointing: bool,
@@ -211,11 +310,32 @@ pub struct TrainingConfig {
 impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
+            backend: TrainingBackend::Pytorch,
+            vulkan_device_indices: "0".to_string(),
+            vulkan_exact_resume: false,
+            vulkan_precision: VulkanTrainingPrecision::Fp32,
+            vulkan_tbptt_enabled: true,
             data_path: String::new(),
             epochs: 3,
             batch_size: 64,
             learning_rate: 1e-4,
             min_lr: 1e-6,
+            warmup_steps: 0,
+            warmup_ratio: 0.0,
+            disable_lr_schedule: false,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1.0e-8,
+            weight_decay: 0.1,
+            z_loss_weight: 1.0e-4,
+            ponder_loss_weight: 0.003,
+            commitment_loss_weight: 0.5,
+            max_ce_loss_for_backward: 0.0,
+            max_ponder_cost_for_backward: 0.0,
+            max_commitment_cost_for_backward: 2.0,
+            max_skipped_train_batches: 0,
+            seed: 0,
+            shuffle: true,
             training_chunk_size: default_training_chunk_size(),
             full_sample_bptt: false,
             full_sample_activation_checkpointing: true,
@@ -286,6 +406,10 @@ pub struct PythonBridge {
     child_stdin: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
     /// Handle to the child process for cleanup.
     child_handle: Arc<tokio::sync::Mutex<Option<Child>>>,
+    /// Direct native Vulkan trainer process, separate from the Python inference bridge.
+    native_training_handle: Arc<tokio::sync::Mutex<Option<Child>>>,
+    native_training_active: Arc<AtomicBool>,
+    native_training_stop_requested: Arc<AtomicBool>,
 }
 
 enum BackendLaunch {
@@ -311,6 +435,308 @@ fn find_bundled_backend() -> Option<PathBuf> {
     ];
 
     candidates.into_iter().find(|path| path.exists())
+}
+
+fn platform_executable(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+fn find_vulkan_trainer() -> Option<PathBuf> {
+    let name = platform_executable("hierarchos-vulkan-train");
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join("vulkan").join(&name));
+            candidates.push(exe_dir.join(&name));
+        }
+    }
+    let gui_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(repo_root) = gui_manifest_dir.parent() {
+        candidates.push(
+            repo_root
+                .join("hierarchos-vulkan")
+                .join("target")
+                .join("release")
+                .join(&name),
+        );
+        candidates.push(
+            repo_root
+                .join("hierarchos-vulkan")
+                .join("target")
+                .join("debug")
+                .join(&name),
+        );
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn resolve_vulkan_model_dir(model_path: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(model_path.trim());
+    if model_path.trim().is_empty() {
+        return Err(
+            "Load a local Hierarchos SafeTensors model package before Vulkan training.".to_string(),
+        );
+    }
+    let model_dir = if requested.is_file() {
+        let is_safetensors = requested
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("model.safetensors"));
+        if !is_safetensors {
+            return Err(format!(
+                "Native Vulkan training requires a local package directory containing model.safetensors; the loaded model is {}.",
+                requested.display()
+            ));
+        }
+        requested.parent().map(Path::to_path_buf).ok_or_else(|| {
+            "Could not resolve the loaded SafeTensors package directory.".to_string()
+        })?
+    } else {
+        requested
+    };
+    if !model_dir.is_dir() || !model_dir.join("model.safetensors").is_file() {
+        return Err(format!(
+            "Native Vulkan training requires a local Hierarchos package with model.safetensors; not found under {}.",
+            model_dir.display()
+        ));
+    }
+    Ok(model_dir)
+}
+
+fn config_json_f64(config: &serde_json::Value, key: &str) -> Result<Option<f64>, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| format!("Checkpoint training field {key:?} must be numeric.")),
+    }
+}
+
+fn config_json_u64(config: &serde_json::Value, key: &str) -> Result<Option<u64>, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(|| {
+            format!("Checkpoint training field {key:?} must be an unsigned integer.")
+        }),
+    }
+}
+
+fn config_json_bool(config: &serde_json::Value, key: &str) -> Result<Option<bool>, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("Checkpoint training field {key:?} must be boolean.")),
+    }
+}
+
+fn resolve_vulkan_exact_resume_config_from_manifest(
+    manifest: &serde_json::Value,
+    requested: &TrainingConfig,
+) -> Result<TrainingConfig, String> {
+    let session = manifest
+        .get("training_session")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            "Exact resume requires backend-neutral training_session metadata in training_state.json."
+                .to_string()
+        })?;
+    let config = session
+        .get("effective_training_config")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| {
+            "Exact resume checkpoint is missing effective_training_config metadata.".to_string()
+        })?;
+    let precision_label = manifest
+        .get("training_precision_policy")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "Exact resume checkpoint is missing training_precision_policy.".to_string()
+        })?;
+
+    // Runtime-only choices stay under GUI control: dataset, output directory,
+    // target epoch count, save cadence, and device topology. Every field that
+    // participates in the persisted numerical/data trajectory is reconstructed
+    // from the checkpoint so the GUI cannot accidentally turn exact resume into
+    // a different training run.
+    let mut resolved = requested.clone();
+    resolved.vulkan_precision = VulkanTrainingPrecision::from_manifest_label(precision_label)?;
+
+    if let Some(value) = config_json_u64(config, "batch_size")? {
+        resolved.batch_size = u32::try_from(value)
+            .map_err(|_| "Checkpoint batch_size exceeds the GUI range.".to_string())?;
+    }
+    if let Some(value) = config_json_u64(config, "gradient_accumulation_steps")? {
+        resolved.accumulation_steps = u32::try_from(value).map_err(|_| {
+            "Checkpoint gradient_accumulation_steps exceeds the GUI range.".to_string()
+        })?;
+    }
+    if let Some(value) = config_json_f64(config, "starting_lr")? {
+        resolved.learning_rate = value;
+    }
+    if let Some(value) = config_json_f64(config, "min_lr")? {
+        resolved.min_lr = value;
+    }
+    if let Some(value) = config_json_u64(config, "warmup_steps")? {
+        resolved.warmup_steps = value;
+    }
+    if let Some(value) = config_json_f64(config, "warmup_ratio")? {
+        resolved.warmup_ratio = value;
+    }
+    if let Some(value) = config_json_bool(config, "disable_lr_schedule")? {
+        resolved.disable_lr_schedule = value;
+    }
+    if let Some(value) = config_json_f64(config, "beta1")? {
+        resolved.beta1 = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "beta2")? {
+        resolved.beta2 = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "eps")? {
+        resolved.eps = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "weight_decay")? {
+        resolved.weight_decay = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "z_loss_weight")? {
+        resolved.z_loss_weight = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "ponder_loss_weight")? {
+        resolved.ponder_loss_weight = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "commitment_loss_weight")? {
+        resolved.commitment_loss_weight = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "max_ce_loss_for_backward")? {
+        resolved.max_ce_loss_for_backward = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "max_ponder_cost_for_backward")? {
+        resolved.max_ponder_cost_for_backward = value as f32;
+    }
+    if let Some(value) = config_json_f64(config, "max_commitment_cost_for_backward")? {
+        resolved.max_commitment_cost_for_backward = value as f32;
+    }
+    if let Some(value) = config_json_u64(config, "max_skipped_train_batches")? {
+        resolved.max_skipped_train_batches = value;
+    }
+    if let Some(value) = config_json_u64(config, "seed")? {
+        resolved.seed = value;
+    }
+    if let Some(value) = config_json_bool(config, "shuffle")? {
+        resolved.shuffle = value;
+    }
+    if let Some(value) = config_json_f64(config, "grad_clip")? {
+        resolved.grad_clip = value as f32;
+    }
+    match config.get("tbptt_chunk_size") {
+        None => {}
+        Some(serde_json::Value::Null) => resolved.vulkan_tbptt_enabled = false,
+        Some(value) => {
+            let value = value.as_u64().ok_or_else(|| {
+                "Checkpoint training field \"tbptt_chunk_size\" must be an unsigned integer or null."
+                    .to_string()
+            })?;
+            resolved.training_chunk_size = u32::try_from(value)
+                .map_err(|_| "Checkpoint tbptt_chunk_size exceeds the GUI range.".to_string())?;
+            resolved.vulkan_tbptt_enabled = true;
+        }
+    }
+    if let Some(value) = config_json_bool(config, "persist_state")? {
+        resolved.persist_state = value;
+    }
+
+    Ok(resolved)
+}
+
+fn resolve_vulkan_launch_config(
+    model_dir: &Path,
+    requested: &TrainingConfig,
+) -> Result<TrainingConfig, String> {
+    if !requested.vulkan_exact_resume {
+        return Ok(requested.clone());
+    }
+    let manifest_path = model_dir.join("training_state.json");
+    let bytes = std::fs::read(&manifest_path)
+        .map_err(|error| format!("Could not read {}: {error}", manifest_path.display()))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Could not decode {}: {error}", manifest_path.display()))?;
+    resolve_vulkan_exact_resume_config_from_manifest(&manifest, requested)
+}
+
+fn parse_vulkan_device_indices(raw: &str) -> Result<Vec<usize>, String> {
+    let mut indices = Vec::new();
+    for value in raw.split(',') {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(
+                "Vulkan device indices must be a comma-separated list such as 0 or 0,1."
+                    .to_string(),
+            );
+        }
+        let index = value
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid Vulkan device index {value:?}."))?;
+        if indices.contains(&index) {
+            return Err(format!("Vulkan device index {index} is duplicated."));
+        }
+        indices.push(index);
+    }
+    if indices.is_empty() {
+        return Err("Select at least one Vulkan device index.".to_string());
+    }
+    Ok(indices)
+}
+
+fn parse_native_training_event(line: &str) -> Option<BridgeEvent> {
+    let payload = line.strip_prefix(NATIVE_VULKAN_EVENT_PREFIX)?;
+    let msg: serde_json::Value = serde_json::from_str(payload).ok()?;
+    match msg.get("event").and_then(|value| value.as_str())? {
+        "training_started" => {
+            let device = msg
+                .get("device")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Vulkan");
+            let total_steps = msg
+                .get("total_steps")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            Some(BridgeEvent::Status(format!(
+                "Native Vulkan training started on {device} ({total_steps} batches scheduled)."
+            )))
+        }
+        "training_metrics" => Some(BridgeEvent::TrainingMetrics {
+            epoch: msg
+                .get("epoch")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as u32,
+            step: msg
+                .get("step")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as u32,
+            total_steps: msg
+                .get("total_steps")
+                .and_then(|value| value.as_u64())
+                .map(|value| value.min(u64::from(u32::MAX)) as u32),
+            loss: msg
+                .get("loss")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0),
+            lr: msg
+                .get("lr")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0),
+            ponder_cost: None,
+            commitment_cost: None,
+            tokens_per_sec: msg.get("tokens_per_sec").and_then(|value| value.as_f64()),
+        }),
+        _ => None,
+    }
 }
 
 fn resolve_backend_launch(python_path: &str) -> Result<BackendLaunch, String> {
@@ -377,6 +803,9 @@ impl PythonBridge {
             connected: Arc::new(AtomicBool::new(false)),
             child_stdin: Arc::new(tokio::sync::Mutex::new(None)),
             child_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            native_training_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            native_training_active: Arc::new(AtomicBool::new(false)),
+            native_training_stop_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -552,6 +981,10 @@ impl PythonBridge {
                                 tx.send(BridgeEvent::TrainingMetrics {
                                     epoch: msg.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                                     step: msg.get("step").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                                    total_steps: msg
+                                        .get("total_steps")
+                                        .and_then(|v| v.as_u64())
+                                        .map(|value| value.min(u64::from(u32::MAX)) as u32),
                                     loss: msg.get("loss").and_then(|v| v.as_f64()).unwrap_or(0.0),
                                     lr: msg.get("lr").and_then(|v| v.as_f64()).unwrap_or(0.0),
                                     ponder_cost: msg.get("ponder_cost").and_then(|v| v.as_f64()),
@@ -676,6 +1109,9 @@ impl PythonBridge {
         let generating = self.generating.clone();
         let training = self.training.clone();
         let loading = self.loading.clone();
+        let native_training_handle = self.native_training_handle.clone();
+        let native_training_active = self.native_training_active.clone();
+        let native_training_stop_requested = self.native_training_stop_requested.clone();
 
         self.runtime.spawn(async move {
             // Drop stdin to signal EOF
@@ -690,11 +1126,20 @@ impl PythonBridge {
                     let _ = child.kill().await;
                 }
             }
+            {
+                let mut holder = native_training_handle.lock().await;
+                if let Some(child) = holder.as_mut() {
+                    native_training_stop_requested.store(true, Ordering::SeqCst);
+                    let _ = child.kill().await;
+                }
+                *holder = None;
+            }
             connected.store(false, Ordering::SeqCst);
             connecting.store(false, Ordering::SeqCst);
             model_loaded.store(false, Ordering::SeqCst);
             generating.store(false, Ordering::SeqCst);
             training.store(false, Ordering::SeqCst);
+            native_training_active.store(false, Ordering::SeqCst);
             loading.store(false, Ordering::SeqCst);
         });
     }
@@ -891,8 +1336,8 @@ impl PythonBridge {
         );
     }
 
-    /// Start a training run.
-    pub fn start_training(&self, config: TrainingConfig) {
+    /// Start a training run using either the Python/PyTorch backend or the native Vulkan trainer.
+    pub fn start_training(&self, config: TrainingConfig, model_path: String) {
         if !self.connected.load(Ordering::SeqCst) || !self.model_loaded.load(Ordering::SeqCst) {
             self.event_tx
                 .send(BridgeEvent::Error(
@@ -927,6 +1372,13 @@ impl PythonBridge {
                 .ok();
             return;
         }
+        match config.backend {
+            TrainingBackend::Pytorch => self.start_pytorch_training(config),
+            TrainingBackend::Vulkan => self.start_vulkan_training(config, model_path),
+        }
+    }
+
+    fn start_pytorch_training(&self, config: TrainingConfig) {
         self.send_rpc(
             "start_training",
             serde_json::json!({
@@ -962,6 +1414,316 @@ impl PythonBridge {
         );
     }
 
+    fn start_vulkan_training(&self, config: TrainingConfig, model_path: String) {
+        let reject = |message: String| {
+            self.training.store(false, Ordering::SeqCst);
+            self.event_tx.send(BridgeEvent::Error(message)).ok();
+            self.event_tx
+                .send(BridgeEvent::TrainingComplete {
+                    status: "rejected".to_string(),
+                })
+                .ok();
+        };
+
+        let Some(trainer) = find_vulkan_trainer() else {
+            reject(
+                "Native Vulkan trainer was not found. Build hierarchos-vulkan-train or install a Windows bundle that includes the vulkan runtime directory."
+                    .to_string(),
+            );
+            return;
+        };
+        let model_dir = match resolve_vulkan_model_dir(&model_path) {
+            Ok(path) => path,
+            Err(err) => {
+                reject(err);
+                return;
+            }
+        };
+        let dataset_path = PathBuf::from(config.data_path.trim());
+        if !dataset_path.is_file() && !dataset_path.is_dir() {
+            reject(format!(
+                "Training data not found: {}",
+                dataset_path.display()
+            ));
+            return;
+        }
+        if dataset_path.is_dir()
+            && !["_SUCCESS", "tokens.bin", "index.safetensors"]
+                .iter()
+                .all(|name| dataset_path.join(name).is_file())
+        {
+            reject(format!(
+                "Vulkan token-cache directory {} is incomplete or predates the cross-runtime index. Rebuild it with the current Hierarchos data pipeline so _SUCCESS, tokens.bin, and index.safetensors are present.",
+                dataset_path.display()
+            ));
+            return;
+        }
+        let output_dir = PathBuf::from(config.out_dir.trim());
+        if config.out_dir.trim().is_empty() {
+            reject("Choose an output directory for native Vulkan checkpoints.".to_string());
+            return;
+        }
+        if config.vulkan_exact_resume && !model_dir.join("training_state.json").is_file() {
+            reject(format!(
+                "Exact Vulkan resume requires training_state.json under {}. Disable exact resume to start a fresh optimizer/session from these weights.",
+                model_dir.display()
+            ));
+            return;
+        }
+        let config = match resolve_vulkan_launch_config(&model_dir, &config) {
+            Ok(config) => config,
+            Err(err) => {
+                reject(err);
+                return;
+            }
+        };
+        if output_dir == model_dir {
+            reject(
+                "Native Vulkan training output must be distinct from the loaded source package."
+                    .to_string(),
+            );
+            return;
+        }
+        let device_indices = match parse_vulkan_device_indices(&config.vulkan_device_indices) {
+            Ok(indices) => indices,
+            Err(err) => {
+                reject(err);
+                return;
+            }
+        };
+        if config.persist_state && device_indices.len() > 1 {
+            reject(
+                "Persistent recurrent state is currently single-device in the native Vulkan trainer. Select one Vulkan device or disable persisted state."
+                    .to_string(),
+            );
+            return;
+        }
+        if config.persist_state && config.shuffle {
+            reject(
+                "Persistent recurrent state requires deterministic lane-contiguous ordering. Disable Vulkan dataset shuffling or turn off persisted state."
+                    .to_string(),
+            );
+            return;
+        }
+
+        let mut command = Command::new(&trainer);
+        if config.vulkan_exact_resume {
+            command.arg("--resume-from-ckpt").arg(&model_dir);
+        } else {
+            command.arg("--model").arg(&model_dir);
+        }
+        command
+            .arg("--dataset")
+            .arg(&dataset_path)
+            .arg("--output")
+            .arg(&output_dir)
+            .arg("--epochs")
+            .arg(config.epochs.to_string())
+            .arg("--batch-size")
+            .arg(config.batch_size.to_string())
+            .arg("--gradient-accumulation-steps")
+            .arg(config.accumulation_steps.to_string())
+            .arg("--lr")
+            .arg(config.learning_rate.to_string())
+            .arg("--min-lr")
+            .arg(config.min_lr.to_string())
+            .arg("--warmup-steps")
+            .arg(config.warmup_steps.to_string())
+            .arg("--warmup-ratio")
+            .arg(config.warmup_ratio.to_string())
+            .arg("--beta1")
+            .arg(config.beta1.to_string())
+            .arg("--beta2")
+            .arg(config.beta2.to_string())
+            .arg("--eps")
+            .arg(config.eps.to_string())
+            .arg("--weight-decay")
+            .arg(config.weight_decay.to_string())
+            .arg("--z-loss-weight")
+            .arg(config.z_loss_weight.to_string())
+            .arg("--ponder-loss-weight")
+            .arg(config.ponder_loss_weight.to_string())
+            .arg("--commitment-loss-weight")
+            .arg(config.commitment_loss_weight.to_string())
+            .arg("--max-ce-loss-for-backward")
+            .arg(config.max_ce_loss_for_backward.to_string())
+            .arg("--max-ponder-cost-for-backward")
+            .arg(config.max_ponder_cost_for_backward.to_string())
+            .arg("--max-commitment-cost-for-backward")
+            .arg(config.max_commitment_cost_for_backward.to_string())
+            .arg("--max-skipped-train-batches")
+            .arg(config.max_skipped_train_batches.to_string())
+            .arg("--seed")
+            .arg(config.seed.to_string())
+            .arg("--grad-clip")
+            .arg(config.grad_clip.to_string())
+            .arg("--save-steps")
+            .arg(config.save_steps.to_string())
+            .arg("--json-events")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command.env(
+            "HIERARCHOS_VULKAN_TRAINING_PRECISION",
+            config.vulkan_precision.env_value(),
+        );
+        if config.disable_lr_schedule {
+            command.arg("--disable-lr-schedule");
+        }
+        if config.vulkan_tbptt_enabled {
+            command
+                .arg("--tbptt-chunk-size")
+                .arg(config.training_chunk_size.to_string());
+        }
+        if device_indices.len() == 1 {
+            command
+                .arg("--device-index")
+                .arg(device_indices[0].to_string());
+        } else {
+            command.arg("--device-indices").arg(
+                device_indices
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        if config.persist_state {
+            command.arg("--persist-state");
+        }
+        if !config.shuffle {
+            command.arg("--no-shuffle");
+        }
+        hide_backend_window(&mut command);
+
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                reject(format!(
+                    "Failed to start native Vulkan trainer {}: {err}",
+                    trainer.display()
+                ));
+                return;
+            }
+        };
+
+        let tx = self.event_tx.clone();
+        let training = self.training.clone();
+        let active = self.native_training_active.clone();
+        let stop_requested = self.native_training_stop_requested.clone();
+        let handle = self.native_training_handle.clone();
+        stop_requested.store(false, Ordering::SeqCst);
+        active.store(true, Ordering::SeqCst);
+        tx.send(BridgeEvent::Status(format!(
+            "Launching native Vulkan trainer with {} precision: {}",
+            config.vulkan_precision.label(),
+            trainer.display()
+        )))
+        .ok();
+
+        self.runtime.spawn(async move {
+            let mut child = child;
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            {
+                let mut holder = handle.lock().await;
+                *holder = Some(child);
+            }
+
+            if let Some(stdout) = stdout {
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stdout).lines();
+                    while let Ok(Some(_line)) = reader.next_line().await {
+                        // The trainer's final pretty JSON report remains available to CLI users.
+                        // The GUI consumes compact structured events from stderr instead.
+                    }
+                });
+            }
+            if let Some(stderr) = stderr {
+                let tx_stderr = tx.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = reader.next_line().await {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Some(event) = parse_native_training_event(trimmed) {
+                            tx_stderr.send(event).ok();
+                        } else {
+                            tx_stderr
+                                .send(BridgeEvent::Status(format!("Vulkan: {trimmed}")))
+                                .ok();
+                        }
+                    }
+                });
+            }
+
+            let exit_status = loop {
+                let result = {
+                    let mut holder = handle.lock().await;
+                    match holder.as_mut() {
+                        Some(child) => child.try_wait(),
+                        None => break None,
+                    }
+                };
+                match result {
+                    Ok(Some(status)) => break Some(Ok(status)),
+                    Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+                    Err(err) => break Some(Err(err)),
+                }
+            };
+
+            let stopped = stop_requested.swap(false, Ordering::SeqCst);
+            active.store(false, Ordering::SeqCst);
+            training.store(false, Ordering::SeqCst);
+            {
+                let mut holder = handle.lock().await;
+                *holder = None;
+            }
+            match exit_status {
+                Some(Ok(status)) if stopped => {
+                    tx.send(BridgeEvent::TrainingComplete {
+                        status: "stopped".to_string(),
+                    })
+                    .ok();
+                }
+                Some(Ok(status)) if status.success() => {
+                    tx.send(BridgeEvent::TrainingComplete {
+                        status: "completed".to_string(),
+                    })
+                    .ok();
+                }
+                Some(Ok(status)) => {
+                    tx.send(BridgeEvent::Error(format!(
+                        "Native Vulkan trainer exited with status {status}."
+                    )))
+                    .ok();
+                    tx.send(BridgeEvent::TrainingComplete {
+                        status: "error".to_string(),
+                    })
+                    .ok();
+                }
+                Some(Err(err)) => {
+                    tx.send(BridgeEvent::Error(format!(
+                        "Failed to observe native Vulkan trainer: {err}"
+                    )))
+                    .ok();
+                    tx.send(BridgeEvent::TrainingComplete {
+                        status: "error".to_string(),
+                    })
+                    .ok();
+                }
+                None => {
+                    tx.send(BridgeEvent::TrainingComplete {
+                        status: if stopped { "stopped" } else { "error" }.to_string(),
+                    })
+                    .ok();
+                }
+            }
+        });
+    }
+
     /// Stop ongoing generation.
     pub fn stop_generation(&self) {
         self.send_rpc("stop_generation", serde_json::json!({}));
@@ -969,7 +1731,25 @@ impl PythonBridge {
 
     /// Stop ongoing training.
     pub fn stop_training(&self) {
-        self.send_rpc("stop_training", serde_json::json!({}));
+        if self.native_training_active.load(Ordering::SeqCst) {
+            let handle = self.native_training_handle.clone();
+            let stop_requested = self.native_training_stop_requested.clone();
+            let tx = self.event_tx.clone();
+            stop_requested.store(true, Ordering::SeqCst);
+            self.runtime.spawn(async move {
+                let mut holder = handle.lock().await;
+                if let Some(child) = holder.as_mut() {
+                    if let Err(err) = child.kill().await {
+                        tx.send(BridgeEvent::Error(format!(
+                            "Failed to stop native Vulkan training: {err}"
+                        )))
+                        .ok();
+                    }
+                }
+            });
+        } else {
+            self.send_rpc("stop_training", serde_json::json!({}));
+        }
     }
 
     /// Request LTM memory snapshot.
@@ -1060,4 +1840,108 @@ fn parse_i32_vec(val: Option<&serde_json::Value>) -> Vec<i32> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_resume_rehydrates_vulkan_trajectory_but_keeps_runtime_choices() {
+        let mut requested = TrainingConfig::default();
+        requested.backend = TrainingBackend::Vulkan;
+        requested.vulkan_exact_resume = true;
+        requested.vulkan_precision = VulkanTrainingPrecision::Fp32;
+        requested.vulkan_device_indices = "1,2".to_string();
+        requested.data_path = "runtime-cache".to_string();
+        requested.out_dir = "runtime-output".to_string();
+        requested.epochs = 17;
+        requested.save_steps = 23;
+        requested.batch_size = 99;
+        requested.accumulation_steps = 7;
+        requested.learning_rate = 9.0e-4;
+        requested.shuffle = true;
+
+        let manifest = serde_json::json!({
+            "training_precision_policy": "fp16-storage-parity",
+            "training_session": {
+                "effective_training_config": {
+                    "batch_size": 4,
+                    "gradient_accumulation_steps": 3,
+                    "starting_lr": 0.0001,
+                    "min_lr": 0.000001,
+                    "warmup_steps": 12,
+                    "warmup_ratio": 0.125,
+                    "disable_lr_schedule": false,
+                    "beta1": 0.8,
+                    "beta2": 0.95,
+                    "eps": 0.0000001,
+                    "weight_decay": 0.2,
+                    "z_loss_weight": 0.0002,
+                    "ponder_loss_weight": 0.004,
+                    "commitment_loss_weight": 0.6,
+                    "max_ce_loss_for_backward": 12.0,
+                    "max_ponder_cost_for_backward": 3.0,
+                    "max_commitment_cost_for_backward": 1.5,
+                    "max_skipped_train_batches": 8,
+                    "seed": 42,
+                    "shuffle": false,
+                    "grad_clip": 0.75,
+                    "tbptt_chunk_size": 128,
+                    "persist_state": true
+                }
+            }
+        });
+
+        let resolved = resolve_vulkan_exact_resume_config_from_manifest(&manifest, &requested)
+            .expect("exact resume configuration should hydrate");
+
+        assert_eq!(
+            resolved.vulkan_precision,
+            VulkanTrainingPrecision::Fp16Parity
+        );
+        assert_eq!(resolved.batch_size, 4);
+        assert_eq!(resolved.accumulation_steps, 3);
+        assert_eq!(resolved.learning_rate, 1.0e-4);
+        assert_eq!(resolved.warmup_steps, 12);
+        assert_eq!(resolved.seed, 42);
+        assert!(!resolved.shuffle);
+        assert!(resolved.persist_state);
+        assert!(resolved.vulkan_tbptt_enabled);
+        assert_eq!(resolved.training_chunk_size, 128);
+
+        assert_eq!(resolved.vulkan_device_indices, "1,2");
+        assert_eq!(resolved.data_path, "runtime-cache");
+        assert_eq!(resolved.out_dir, "runtime-output");
+        assert_eq!(resolved.epochs, 17);
+        assert_eq!(resolved.save_steps, 23);
+    }
+
+    #[test]
+    fn exact_resume_restores_full_bptt_and_rejects_unknown_precision() {
+        let requested = TrainingConfig::default();
+        let full_bptt = serde_json::json!({
+            "training_precision_policy": "fp16-storage-fp32-compute",
+            "training_session": {
+                "effective_training_config": {
+                    "tbptt_chunk_size": null
+                }
+            }
+        });
+        let resolved = resolve_vulkan_exact_resume_config_from_manifest(&full_bptt, &requested)
+            .expect("full-BPTT checkpoint should hydrate");
+        assert!(!resolved.vulkan_tbptt_enabled);
+        assert_eq!(
+            resolved.vulkan_precision,
+            VulkanTrainingPrecision::Fp16StorageFp32Compute
+        );
+
+        let unsupported = serde_json::json!({
+            "training_precision_policy": "bf16-not-yet-supported",
+            "training_session": {"effective_training_config": {}}
+        });
+        let error = resolve_vulkan_exact_resume_config_from_manifest(&unsupported, &requested)
+            .expect_err("unsupported precision must be rejected");
+        assert!(error.contains("unsupported Vulkan training precision"));
+    }
 }

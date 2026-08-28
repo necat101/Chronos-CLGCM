@@ -252,6 +252,51 @@ def _legacy_numpy_checkpoint_safe_globals():
 
 def load_checkpoint_payload_compatible(path: str, map_location="cpu"):
     """Load Hierarchos payloads safely, including legacy NumPy RNG metadata."""
+    if isinstance(path, (str, os.PathLike)) and os.fspath(path).lower().endswith(
+        ".safetensors"
+    ):
+        # SafeTensors contains tensors only and has no pickle execution surface.
+        # Native/Vulkan training packages use this as their canonical portable
+        # master-weight format, so accept it directly in the ordinary PyTorch
+        # checkpoint loader instead of requiring an out-of-band conversion.
+        from safetensors.torch import load as load_safetensors
+        from safetensors.torch import load_file as load_safetensors_file
+
+        safe_path = os.fspath(path)
+        device = map_location
+        if isinstance(device, torch.device):
+            device = str(device)
+        checksum_path = safe_path + ".sha256"
+        if os.path.exists(checksum_path):
+            with open(checksum_path, "r", encoding="utf-8") as checksum_file:
+                checksum_parts = checksum_file.read().strip().split()
+            if not checksum_parts:
+                raise RuntimeError(
+                    f"Checkpoint SHA-256 sidecar is empty: {checksum_path}"
+                )
+            expected = checksum_parts[0].lower()
+            if len(expected) != 64 or any(
+                character not in "0123456789abcdef" for character in expected
+            ):
+                raise RuntimeError(
+                    f"Checkpoint SHA-256 sidecar is malformed: {checksum_path}"
+                )
+            hasher = hashlib.sha256()
+            with open(safe_path, "rb") as verified_file:
+                verified_bytes = verified_file.read()
+            hasher.update(verified_bytes)
+            actual = hasher.hexdigest()
+            if actual != expected:
+                raise RuntimeError(
+                    f"Checkpoint SHA-256 verification failed for {safe_path}: "
+                    f"expected={expected!r}, actual={actual!r}"
+                )
+            tensors = load_safetensors(verified_bytes)
+            if device not in ("cpu", torch.device("cpu")):
+                tensors = {name: tensor.to(device) for name, tensor in tensors.items()}
+            return tensors
+        return load_safetensors_file(safe_path, device=device)
+
     checksum_path = path + ".sha256"
     checkpoint_source = path
     verified_checkpoint_file = None
@@ -318,14 +363,21 @@ def _resolve_weights_path(model_path: str) -> Tuple[str, str]:
 
     resolved = os.path.abspath(os.path.expanduser(model_path))
     if os.path.isfile(resolved):
-        if not resolved.lower().endswith(".pt"):
-            raise FileNotFoundError(f"Model file must be a .pt checkpoint: {resolved}")
+        if not resolved.lower().endswith((".pt", ".safetensors")):
+            raise FileNotFoundError(
+                f"Model file must be a .pt or .safetensors checkpoint: {resolved}"
+            )
         return resolved, os.path.dirname(resolved)
 
     if not os.path.isdir(resolved):
         raise FileNotFoundError(f"Model path not found: {model_path}")
 
-    preferred = ("hierarchos.pt", "model.pt", "hierarchos_final.pt")
+    preferred = (
+        "hierarchos.pt",
+        "model.pt",
+        "hierarchos_final.pt",
+        "model.safetensors",
+    )
     preferred_candidates = [
         os.path.join(resolved, name)
         for name in preferred
@@ -341,13 +393,16 @@ def _resolve_weights_path(model_path: str) -> Tuple[str, str]:
             key=lambda path: (os.path.getmtime(path), path),
         ), resolved
 
-    pt_files = sorted(
-        f for f in os.listdir(resolved)
-        if f.lower().endswith(".pt")
+    tensor_files = sorted(
+        f
+        for f in os.listdir(resolved)
+        if f.lower().endswith((".pt", ".safetensors"))
     )
-    if pt_files:
-        pt_paths = [os.path.join(resolved, name) for name in pt_files]
-        return max(pt_paths, key=lambda path: (os.path.getmtime(path), path)), resolved
+    if tensor_files:
+        tensor_paths = [os.path.join(resolved, name) for name in tensor_files]
+        return max(
+            tensor_paths, key=lambda path: (os.path.getmtime(path), path)
+        ), resolved
 
     # Browser/Hugging Face downloads commonly wrap a model directory in one
     # same-named folder. Accept that layout only when it resolves unambiguously.
@@ -836,7 +891,19 @@ def load_full_model_with_config(model_path: str, device):
         state_source = {k: v for k, v in checkpoint.items() if torch.is_tensor(v)}
         if not state_source:
             raise ValueError("Model state_dict not found in checkpoint.")
-    state_dict = sanitize_model_state_dict(state_source, reset_transient_ltm=True)
+    preserve_native_runtime_state = False
+    if weights_path.lower().endswith(".safetensors"):
+        from safetensors import safe_open
+
+        with safe_open(weights_path, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata() or {}
+        preserve_native_runtime_state = (
+            metadata.get("format") == "hierarchos-rust-fp32-v1"
+        )
+    state_dict = sanitize_model_state_dict(
+        state_source,
+        reset_transient_ltm=not preserve_native_runtime_state,
+    )
     _reject_unsupported_rwkv_state_dict(state_dict, weights_path)
     _infer_arch_flags_from_state_dict(config_dict, state_dict)
     validate_checkpoint_architecture_contract(

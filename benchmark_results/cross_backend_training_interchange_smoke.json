@@ -1,0 +1,77 @@
+{
+  "schema": "hierarchos-cross-backend-training-benchmark-v1",
+  "fixture": {
+    "width": 32,
+    "vocab_size": 64,
+    "batch": 2,
+    "tokens_per_sequence": 6,
+    "model_token_positions_per_step": 12,
+    "supervised_target_positions_per_step": 8,
+    "warmup_updates": 0,
+    "measured_updates": 1
+  },
+  "training_contract": {
+    "precision": "fp32",
+    "gradient_accumulation_steps": 1,
+    "grad_clip": 1.0,
+    "optimizer": {
+      "lr": 0.0003,
+      "beta1": 0.9,
+      "beta2": 0.999,
+      "eps": 1e-08,
+      "weight_decay": 0.07
+    },
+    "pytorch_inside_vulkan_trainer": false,
+    "portable_checkpoint": "SafeTensors FP32 canonical masters"
+  },
+  "parity": {
+    "worst_parameter_name": "h_rnn.x_k_cm",
+    "max_abs_parameter_diff": 5.855245035490952e-07,
+    "threshold": 2e-05,
+    "status": "passed"
+  },
+  "inference_reload": {
+    "native_rust_status": "passed",
+    "native_rust_max_abs_diff_vs_pytorch_cpu": 3.5762786865234375e-07,
+    "native_architecture_contract_sha256": "80c7b876a906ca1ddb47a7e78c4380d7bd89f67784496eafc7c4eee16077422f",
+    "cuda_status": "skipped-no-cuda-device",
+    "cuda_max_abs_diff_vs_pytorch_cpu": null
+  },
+  "vulkan_execution": {
+    "device_index": 0,
+    "device_name": "AMD Radeon Graphics",
+    "queue_submissions": 3,
+    "training_precision_policy": "fp32",
+    "budgeted_plans": []
+  },
+  "backends": [
+    {
+      "backend": "vulkan-native",
+      "device": "AMD Radeon Graphics",
+      "median_optimizer_step_ms": 54.2575,
+      "model_token_positions_per_second": 221.1675805188223,
+      "supervised_target_positions_per_second": 147.44505367921485,
+      "peak_memory_bytes": null,
+      "hourly_cost_usd": null,
+      "cost_per_billion_model_tokens_usd": null,
+      "samples_ms": [
+        54.2575
+      ],
+      "throughput_vs_vulkan": 1.0
+    },
+    {
+      "backend": "pytorch-cpu",
+      "device": "cpu",
+      "median_optimizer_step_ms": 223.54819999964093,
+      "model_token_positions_per_second": 53.67969860647178,
+      "supervised_target_positions_per_second": 35.78646573764785,
+      "peak_memory_bytes": null,
+      "hourly_cost_usd": null,
+      "cost_per_billion_model_tokens_usd": null,
+      "samples_ms": [
+        223.54819999964093
+      ],
+      "throughput_vs_vulkan": 0.24271052059505355
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import argparse
+import json
 import os
 import tempfile
 
@@ -8,7 +9,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, IterableDataset, TensorDataset
 
-from hierarchos.training.datasets import EpochShuffleSampler, LengthGroupedBatchSampler
+from hierarchos.training.datasets import (
+    LEGACY_TORCH_SAMPLER_RNG_ALGORITHM,
+    PORTABLE_SAMPLER_RNG_ALGORITHM,
+    EpochShuffleSampler,
+    LengthGroupedBatchSampler,
+    portable_fisher_yates_permutation,
+)
 from hierarchos.training.trainer import (
     build_hierarchos_optimizer,
     build_training_checkpoint,
@@ -18,7 +25,9 @@ from hierarchos.training.trainer import (
     capture_ltm_lr_scheduler_state,
     capture_main_lr_scheduler_state,
     capture_dataloader_state,
+    capture_data_stream_cursor,
     capture_rng_state,
+    capture_training_execution_policy,
     accumulation_divisor_for_step,
     configure_ltm_lr_schedule,
     compute_update_steps,
@@ -28,12 +37,15 @@ from hierarchos.training.trainer import (
     mark_val_proj_trained,
     advance_ltm_lr_schedule,
     restore_dataloader_state,
+    restore_data_stream_cursor,
     restore_rng_state,
     restore_model_grad_state,
     restore_checkpoint_gradient_accumulation,
     restore_scheduler_state_and_live_lrs,
     resolve_training_step_offset,
     save_training_checkpoint_if_finite,
+    scale_canonical_pending_gradients_for_amp_,
+    scaler_state_from_execution_policy,
     set_dataloader_start_batch,
     host_batches_from_resume,
     should_step_accumulation,
@@ -935,6 +947,7 @@ def _continuation_parser_and_args(model_path=None, resume_from_ckpt=None, epochs
         "h_stride": 4,
         "training_chunk_size": 256,
         "batch_size": 64,
+        "accumulation_normalization": "weighted-token",
         "starting_lr": 1e-4,
         "min_lr": 1e-6,
         "warmup_steps": 0,
@@ -1258,6 +1271,25 @@ def test_raw_rwkv_matrices_receive_v2_weight_decay():
     assert args._optimizer_grouping_version == 2
 
 
+def test_hierarchos_optimizer_uses_explicit_adamw_epsilon():
+    model = _RawRWKVMatrixModel()
+    args = SimpleNamespace(
+        starting_lr=1e-3,
+        rwkv_weight_decay=0.1,
+        adamw_eps=1e-6,
+    )
+
+    optimizer = build_hierarchos_optimizer(model, args, torch.device("cpu"))
+
+    assert {group["eps"] for group in optimizer.param_groups} == {1e-6}
+
+
+def test_effective_training_config_captures_adamw_epsilon():
+    args = SimpleNamespace(adamw_eps=1e-6)
+
+    assert capture_effective_training_config(args)["adamw_eps"] == 1e-6
+
+
 def test_read_only_ltm_training_skips_inner_update_but_carries_state():
     model = _LTMModeRecordingModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -1389,6 +1421,64 @@ def test_cli_resume_checkpoint_hydrates_config_without_base_epoch_offset():
     assert args.epochs == 14
     assert args.resume_completed_epoch == 11
     assert not hasattr(args, "base_completed_epoch")
+
+
+def test_cli_vulkan_resume_package_hydrates_portable_replay_defaults(tmp_path):
+    from tools.vulkan_optimizer_bridge import (
+        VULKAN_TRAINING_FORMAT_V4,
+        write_vulkan_training_replay,
+    )
+
+    package_dir = tmp_path / "vulkan-resume"
+    package_dir.mkdir()
+    (package_dir / "training_state.json").write_text(
+        json.dumps(
+            {
+                "format": VULKAN_TRAINING_FORMAT_V4,
+                "model_file": "model.safetensors",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (package_dir / "hierarchos_config.json").write_text(
+        json.dumps({"context_dim": 32, "vocab_size": 128}),
+        encoding="utf-8",
+    )
+    write_vulkan_training_replay(
+        package_dir,
+        {
+            "completed_epoch": 4,
+            "mid_epoch_step": 0,
+            "effective_training_config": {
+                "hf_dataset": "netcat420/Experiment_0.1",
+                "max_length": 4096,
+            },
+            "run_identity": {
+                "objective": {
+                    "starting_lr": 3.0e-5,
+                    "accumulation_normalization": "weighted-token",
+                }
+            },
+            "optimizer_grouping_version": 2,
+        },
+    )
+
+    parser, args = _continuation_parser_and_args(
+        resume_from_ckpt=str(package_dir),
+        epochs=7,
+    )
+    hierarchos_cli._hydrate_training_args_from_model_config(
+        args,
+        parser,
+        explicit_dests={"epochs", "out_dir"},
+    )
+
+    assert args.hf_dataset == "netcat420/Experiment_0.1"
+    assert args.max_length == 4096
+    assert args.starting_lr == 3.0e-5
+    assert args.accumulation_normalization == "weighted-token"
+    assert args.resume_completed_epoch == 4
+    assert args.epochs == 7
 
 
 def test_cli_resume_checkpoint_hydrates_channel_mix_clamp_defaults():
@@ -2552,6 +2642,126 @@ def test_epoch_shuffle_sampler_state_restores_epoch_order():
     assert list(iter(sampler)) == expected_order
 
 
+def test_portable_sampler_permutation_matches_rust_contract_vector():
+    assert portable_fisher_yates_permutation(12, 123, 4) == [
+        10, 8, 3, 9, 0, 1, 11, 5, 7, 4, 6, 2
+    ]
+
+
+def test_portable_data_stream_cursor_restores_remaining_epoch_without_rng_blob():
+    dataset = TensorDataset(torch.arange(17))
+    sampler = EpochShuffleSampler(dataset, shuffle=True, seed=321)
+    sampler.set_epoch(7)
+    loader = DataLoader(dataset, batch_size=3, sampler=sampler)
+    expected = list(iter(sampler))[6:]
+    cursor = capture_data_stream_cursor(loader, batch_cursor=2)
+
+    assert cursor["format"] == "hierarchos-data-stream-rng-cursor-v1"
+    assert cursor["rng_algorithm"] == PORTABLE_SAMPLER_RNG_ALGORITHM
+    sampler.seed = 999
+    sampler.epoch = 0
+    sampler.set_start_index(0)
+
+    assert restore_data_stream_cursor(loader, cursor, strict=True) is True
+    assert list(iter(sampler)) == expected
+
+
+def test_legacy_sampler_checkpoint_without_algorithm_replays_torch_recipe():
+    dataset = TensorDataset(torch.arange(13))
+    sampler = EpochShuffleSampler(dataset, shuffle=True, seed=321)
+    loader = DataLoader(dataset, batch_size=2, sampler=sampler)
+    legacy_state = capture_dataloader_state(loader)
+    legacy_state["sampler"].pop("rng_algorithm")
+    sampler.rng_algorithm = PORTABLE_SAMPLER_RNG_ALGORITHM
+
+    restore_dataloader_state(loader, legacy_state, strict=True)
+    assert sampler.rng_algorithm == LEGACY_TORCH_SAMPLER_RNG_ALGORITHM
+    generator = torch.Generator().manual_seed(321)
+    assert list(iter(sampler)) == torch.randperm(13, generator=generator).tolist()
+
+
+def test_execution_policy_round_trips_dynamic_scaler_and_scales_pending_grads():
+    class _FakeScaler:
+        def state_dict(self):
+            return {
+                "scale": 1024.0,
+                "growth_factor": 2.0,
+                "backoff_factor": 0.5,
+                "growth_interval": 2000,
+                "_growth_tracker": 11,
+            }
+
+        def get_scale(self):
+            return 1024.0
+
+    args = SimpleNamespace(
+        amp=True,
+        amp_dtype="float16",
+        _resolved_training_backend="cuda",
+    )
+    scaler = _FakeScaler()
+    policy = capture_training_execution_policy(
+        args,
+        scaler,
+        pending_gradients=True,
+    )
+    assert policy["format"] == "hierarchos-training-execution-policy-v1"
+    assert policy["loss_scaling"]["pending_gradients_scaled"] is True
+    assert scaler_state_from_execution_policy(policy) == scaler.state_dict()
+
+    model = nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[1.5, -2.0]])
+    assert scale_canonical_pending_gradients_for_amp_(model, scaler) is True
+    torch.testing.assert_close(
+        model.weight.grad,
+        torch.tensor([[1536.0, -2048.0]]),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_exact_resume_accepts_typed_stream_and_rng_free_vulkan_policy():
+    identity = {
+        "version": 1,
+        "objective": {"batch_size": 2},
+        "dataset": {"replay_guarantee": "content-addressed-token-cache"},
+        "tokenizer": {"vocab_size": 8},
+        "token_cache": {"ordered_record_sha256": "a" * 64},
+        "loader": {"iterable_dataset": False},
+        "optimizer_grouping_version": 2,
+    }
+    checkpoint = {
+        "run_identity": identity,
+        "mid_epoch_step": 2,
+        "data_stream_cursor": {
+            "format": "hierarchos-data-stream-rng-cursor-v1",
+            "sampler_kind": "epoch-shuffle",
+            "rng_algorithm": PORTABLE_SAMPLER_RNG_ALGORITHM,
+            "seed": 321,
+            "epoch": 0,
+            "batch_cursor": 2,
+            "dataset_size": 8,
+            "batch_size": 2,
+            "shuffle": True,
+            "drop_last": False,
+        },
+        "execution_policy": {
+            "format": "hierarchos-training-execution-policy-v1",
+            "source_backend": "vulkan",
+            "compute_dtype": "float32",
+            "autocast_enabled": False,
+            "stochastic_rng": {"mode": "none", "state_required": False},
+            "loss_scaling": {"mode": "none", "pending_gradients_scaled": False},
+        },
+    }
+    assert validate_exact_resume_identity(
+        checkpoint,
+        identity,
+        "vulkan-package",
+        allow_execution_backend_transition=True,
+    ) is True
+
+
 @pytest.mark.parametrize("preserve_order", [False, True])
 def test_length_grouped_resume_cursor_preserves_exact_remaining_batches(
     preserve_order,
@@ -2706,6 +2916,74 @@ def test_exact_resume_identity_rejects_cursor_geometry_change():
             {"run_identity": saved_identity},
             changed_identity,
             "checkpoint.pt",
+        )
+
+
+def test_vulkan_cross_backend_identity_ignores_only_execution_policy():
+    saved_identity = {
+        "version": 1,
+        "objective": {
+            "_resolved_training_backend": "vulkan",
+            "amp": False,
+            "amp_dtype": "float32",
+            "compile": False,
+            "cuda_chunked_lm_loss": False,
+            "batch_size": 8,
+            "accumulation_steps": 4,
+            "accumulation_normalization": "weighted-token",
+            "detach_every_n_steps": 32,
+            "starting_lr": 1.0e-4,
+            "adamw_eps": 1.0e-6,
+        },
+        "dataset": {"replay_guarantee": "content-addressed-token-cache"},
+        "tokenizer": {"vocab_size": 128},
+        "token_cache": {"ordered_record_sha256": "a" * 64},
+        "loader": {"iterable_dataset": False},
+        "optimizer_grouping_version": 2,
+    }
+    current_identity = json.loads(json.dumps(saved_identity))
+    current_identity["objective"].update(
+        {
+            "_resolved_training_backend": "cuda",
+            "amp": True,
+            "amp_dtype": "bfloat16",
+            "compile": True,
+            "cuda_chunked_lm_loss": True,
+        }
+    )
+    checkpoint = {"run_identity": saved_identity, "mid_epoch_step": 0}
+
+    with pytest.raises(RuntimeError, match="_resolved_training_backend"):
+        validate_exact_resume_identity(
+            checkpoint,
+            current_identity,
+            "vulkan-package",
+        )
+
+    validate_exact_resume_identity(
+        checkpoint,
+        current_identity,
+        "vulkan-package",
+        allow_execution_backend_transition=True,
+    )
+
+    current_identity["objective"]["adamw_eps"] = 1.0e-8
+    with pytest.raises(RuntimeError, match="adamw_eps"):
+        validate_exact_resume_identity(
+            checkpoint,
+            current_identity,
+            "vulkan-package",
+            allow_execution_backend_transition=True,
+        )
+    current_identity["objective"]["adamw_eps"] = 1.0e-6
+
+    current_identity["objective"]["batch_size"] = 16
+    with pytest.raises(RuntimeError, match="batch_size"):
+        validate_exact_resume_identity(
+            checkpoint,
+            current_identity,
+            "vulkan-package",
+            allow_execution_backend_transition=True,
         )
 
 

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import load_file as load_safetensors_file
 
 import hierarchos_cli
 from hierarchos.training.datasets import TokenizedBinaryDataset
@@ -189,6 +190,13 @@ def test_local_compact_cache_is_lossless_small_and_backward_ready(tmp_path, monk
     assert builder_kwargs["enforce_rosa_max_context"] is False
     assert len(index["ordered_record_sha256"]) == 64
     assert len(index["tokens_sha256"]) == 64
+    portable_index_path = os.path.join(cache_dir, "index.safetensors")
+    portable_index = load_safetensors_file(portable_index_path, device="cpu")
+    assert torch.equal(portable_index["offsets"], index["offsets"])
+    assert torch.equal(portable_index["lengths"], index["lengths"])
+    assert torch.equal(portable_index["loss_run_offsets"], index["loss_run_offsets"])
+    assert torch.equal(portable_index["loss_run_ends"], index["loss_run_ends"])
+    assert torch.equal(portable_index["loss_run_codes"], index["loss_run_codes"])
 
     # Eight real tokens at four bytes/token: uint16 input plus ROSA. Labels are
     # reconstructed exactly from input ids after the writer verifies equality.
@@ -199,6 +207,9 @@ def test_local_compact_cache_is_lossless_small_and_backward_ready(tmp_path, monk
     assert success["bytes"] == 8 * 4
     assert success["ordered_record_sha256"] == index["ordered_record_sha256"]
     assert success["tokens_sha256"] == index["tokens_sha256"]
+    assert success["portable_index_file"] == "index.safetensors"
+    assert success["portable_index_format"] == "hierarchos-token-cache-index-v1"
+    assert success["portable_index_sha256"] == hierarchos_cli._file_sha256(portable_index_path)
     assert args._token_cache_identity["tokens_sha256"] == index["tokens_sha256"]
     assert success["rosa_ids_context_mode"] == "legacy-unbounded-v1"
     with open(os.path.join(cache_dir, "cache_audit.json"), "r", encoding="utf-8") as audit_file:
@@ -411,6 +422,7 @@ def test_hf_schema_v6_cache_can_move_roots_without_retokenizing(tmp_path, monkey
     assert {
         "_SUCCESS",
         "index.pt",
+        "index.safetensors",
         "tokens.bin",
     }.issubset(set(os.listdir(original_leaf)))
     index = torch.load(

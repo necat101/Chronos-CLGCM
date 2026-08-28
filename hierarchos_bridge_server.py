@@ -2927,6 +2927,19 @@ HANDLERS = {
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    # The packaged backend also serves as the compatibility runtime for the
+    # native Rust CLI.  Keep this path completely separate from the line-based
+    # GUI bridge protocol: HierarchosCLI.exe launches us with ``--cli`` and the
+    # remaining argv is handed verbatim to the canonical Python CLI parser.
+    # PyInstaller carries ``hierarchos_cli`` as a hidden import so this works in
+    # a release without a system Python installation.
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        from hierarchos_cli import main as cli_main
+
+        sys.argv = [sys.argv[0], *sys.argv[2:]]
+        cli_main()
+        return
+
     emit_status("Hierarchos bridge server started.")
     _emit_backend_runtime_info()
 

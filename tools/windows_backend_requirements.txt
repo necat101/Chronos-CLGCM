@@ -7,3 +7,7 @@ tokenizers
 safetensors
 numpy
 tqdm
+datasets
+peft
+accelerate
+lm-eval

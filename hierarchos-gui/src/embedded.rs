@@ -66,6 +66,14 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
         "hierarchos/training/objectives.py",
         include_str!("../../hierarchos/training/objectives.py"),
     ),
+    (
+        "hierarchos/training/stochastic.py",
+        include_str!("../../hierarchos/training/stochastic.py"),
+    ),
+    (
+        "hierarchos/training/cuda_stochastic.py",
+        include_str!("../../hierarchos/training/cuda_stochastic.py"),
+    ),
     // Inference
     (
         "hierarchos/inference/chat.py",
@@ -74,6 +82,10 @@ const EMBEDDED_FILES: &[(&str, &str)] = &[
     (
         "hierarchos/inference/chat_state.py",
         include_str!("../../hierarchos/inference/chat_state.py"),
+    ),
+    (
+        "hierarchos/inference/runtime_state_interchange.py",
+        include_str!("../../hierarchos/inference/runtime_state_interchange.py"),
     ),
     // Utils
     (

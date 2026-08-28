@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from hierarchos.training.datasets import (
+    LEGACY_TORCH_SAMPLER_RNG_ALGORITHM,
     LengthGroupedBatchSampler,
     PTChunkedDataset,
     TokenizedBinaryDataset,
@@ -147,7 +148,11 @@ def test_tensor_sampler_matches_legacy_order_and_coverage(
         "seed": 7719,
         "preserve_order": preserve_order,
     }
-    sampler = LengthGroupedBatchSampler(lengths, **kwargs)
+    sampler = LengthGroupedBatchSampler(
+        lengths,
+        rng_algorithm=LEGACY_TORCH_SAMPLER_RNG_ALGORITHM,
+        **kwargs,
+    )
     sampler.set_epoch(3)
 
     actual = list(sampler)
@@ -168,6 +173,40 @@ def test_tensor_sampler_matches_legacy_order_and_coverage(
     if shuffle:
         sampler.set_epoch(4)
         assert list(sampler) != actual
+
+
+@pytest.mark.parametrize(
+    "preserve_order,expected",
+    [
+        (
+            False,
+            [[5, 3, 1], [7, 4, 10], [0, 2, 9], [6, 8, 11]],
+        ),
+        (
+            True,
+            [[4, 0, 2], [5, 3, 1], [10, 11, 9], [6, 8, 7]],
+        ),
+    ],
+)
+def test_portable_length_grouped_sampler_matches_rust_contract_vector(
+    preserve_order,
+    expected,
+):
+    lengths = torch.tensor(
+        [5, 1, 4, 2, 6, 3, 9, 7, 8, 2, 5, 4],
+        dtype=torch.int32,
+    )
+    sampler = LengthGroupedBatchSampler(
+        lengths,
+        batch_size=3,
+        shuffle=True,
+        drop_last=False,
+        bucket_size=6,
+        seed=123,
+        preserve_order=preserve_order,
+    )
+
+    assert list(sampler) == expected
 
 
 def test_length_normalization_preserves_compact_tensor_storage():

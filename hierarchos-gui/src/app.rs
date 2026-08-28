@@ -123,6 +123,7 @@ impl HierarchosApp {
                 BridgeEvent::TrainingMetrics {
                     epoch,
                     step,
+                    total_steps,
                     loss,
                     lr,
                     ponder_cost,
@@ -132,6 +133,7 @@ impl HierarchosApp {
                     self.training_state.on_metrics(
                         epoch,
                         step,
+                        total_steps,
                         loss,
                         lr,
                         ponder_cost,
@@ -198,6 +200,9 @@ impl HierarchosApp {
                 }
                 BridgeEvent::Status(msg) => {
                     self.status_messages.push(msg.clone());
+                    if self.training_state.is_training {
+                        self.training_state.log_messages.push(msg.clone());
+                    }
                     self.chat_state.on_status(msg);
                 }
                 BridgeEvent::Error(err) => {
@@ -359,9 +364,12 @@ impl eframe::App for HierarchosApp {
                     Panel::Chat => {
                         draw_chat_panel(ui, &mut self.chat_state, &self.bridge, &self.settings)
                     }
-                    Panel::Training => {
-                        draw_training_panel(ui, &mut self.training_state, &self.bridge)
-                    }
+                    Panel::Training => draw_training_panel(
+                        ui,
+                        &mut self.training_state,
+                        &self.bridge,
+                        &self.settings.model_path,
+                    ),
                     // Note: bridge.connect() is called from Settings panel when user loads a model
                     Panel::Inspector => {
                         draw_inspector_panel(ui, &mut self.inspector_state, &self.bridge)

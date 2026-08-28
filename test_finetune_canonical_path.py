@@ -9,15 +9,24 @@ from hierarchos import AttrDict, HierarchosCore
 from hierarchos.training.trainer import (
     HIERARCHOS_PEFT_TARGET_MODULES,
     _apply_runtime_model_config_overrides,
+    _checkpointed_training_model_call,
     account_skipped_training_batch,
     build_exact_resume_identity,
     build_training_checkpoint,
+    capture_training_execution_policy,
+    configure_canonical_lora_dropout,
     configure_checkpoint_rng_policy,
     ensure_finetune_training_mode,
     restore_model_grad_state,
     train_step,
     train_step_skip_reason,
     validate_exact_resume_identity,
+)
+from hierarchos.training.stochastic import (
+    CanonicalDropout,
+    CanonicalRngReservation,
+    CanonicalRngState,
+    canonical_dropout_from_reservation,
 )
 from hierarchos.utils.checkpoint import load_model_state_dict_compatible
 
@@ -534,12 +543,148 @@ def test_real_peft_wrapper_runs_canonical_step_and_resumes_exact_state():
         )
 
 
-def test_real_lora_dropout_enables_checkpoint_rng_replay():
+def test_real_lora_dropout_moves_to_canonical_counter_rng():
+    args = _step_args(seed=17)
     model = ensure_finetune_training_mode(
         _real_peft_model(dropout=0.05).eval()
     )
+    assert configure_canonical_lora_dropout(model, args) > 0
+    assert any(isinstance(module, CanonicalDropout) for module in model.modules())
+    assert configure_checkpoint_rng_policy(model) is False
+    assert model._hierarchos_checkpoint_preserve_rng_state is False
+
+    dropout = next(
+        module for module in model.modules() if isinstance(module, CanonicalDropout)
+    )
+    dropout(torch.ones(2, 3))
+    policy = capture_training_execution_policy(args)
+    assert policy["stochastic_rng"] == {
+        "mode": "canonical-counter",
+        "state_required": False,
+        "canonical_counter": {
+            "algorithm": "philox4x32-10-word-v1",
+            "seed": 17,
+            "next_word": 6,
+        },
+    }
+
+    resumed_args = _step_args(seed=999)
+    resumed = ensure_finetune_training_mode(_real_peft_model(dropout=0.05).eval())
+    assert configure_canonical_lora_dropout(
+        resumed,
+        resumed_args,
+        checkpoint={"execution_policy": policy},
+    ) > 0
+    assert resumed._hierarchos_canonical_rng_state.seed == 17
+    assert resumed._hierarchos_canonical_rng_state.next_word == 6
+
+
+def test_legacy_lora_dropout_resume_keeps_backend_native_rng_contract():
+    args = _step_args(seed=17)
+    model = ensure_finetune_training_mode(_real_peft_model(dropout=0.05).eval())
+    legacy_checkpoint = {
+        "execution_policy": {
+            "stochastic_rng": {
+                "mode": "backend-native",
+                "state_required": True,
+            }
+        }
+    }
+    assert configure_canonical_lora_dropout(
+        model,
+        args,
+        checkpoint=legacy_checkpoint,
+    ) == 0
+    assert any(isinstance(module, nn.Dropout) for module in model.modules())
     assert configure_checkpoint_rng_policy(model) is True
-    assert model._hierarchos_checkpoint_preserve_rng_state is True
+
+
+def test_checkpoint_rematerialization_replays_canonical_dropout_reservation():
+    rng = CanonicalRngState(seed=0x1234)
+
+    class _CanonicalCheckpointModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dropout = CanonicalDropout(0.5, rng)
+            self.weight = nn.Parameter(torch.tensor(1.0))
+            self._hierarchos_canonical_rng_state = rng
+            self._hierarchos_checkpoint_preserve_rng_state = False
+
+        def forward(self, values):
+            dropped = self.dropout(values)
+            return {"loss": (dropped * self.weight).sum()}
+
+    model = _CanonicalCheckpointModule().train()
+    values = torch.arange(1.0, 9.0, requires_grad=True)
+    outputs = _checkpointed_training_model_call(model, {"values": values})
+    assert rng.next_word == values.numel()
+
+    reservation = CanonicalRngReservation(
+        seed=rng.seed,
+        start_word=0,
+        word_count=values.numel(),
+    )
+    expected_weight_grad = canonical_dropout_from_reservation(
+        values.detach(),
+        reservation,
+        0.5,
+    ).sum()
+
+    # Deliberately scramble PyTorch's RNG between forward and backward. The
+    # rematerialized LoRA-style dropout mask belongs to the canonical tape.
+    torch.manual_seed(99991)
+    torch.rand(257)
+    outputs["loss"].backward()
+    assert rng.next_word == values.numel()
+    torch.testing.assert_close(model.weight.grad, expected_weight_grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device is unavailable")
+def test_fused_cuda_canonical_dropout_matches_reference_forward_and_backward():
+    from hierarchos.training.cuda_stochastic import cuda_stochastic_extension_error
+
+    probability = 0.375
+    reservation = CanonicalRngReservation(
+        seed=0x0123456789ABCDEF,
+        start_word=(1 << 32) - 3,
+        word_count=17,
+    )
+    cpu_values = torch.linspace(-2.0, 2.0, 17, dtype=torch.float32)
+    expected = canonical_dropout_from_reservation(
+        cpu_values,
+        reservation,
+        probability,
+    )
+
+    cuda_values = cpu_values.cuda().requires_grad_(True)
+    actual = canonical_dropout_from_reservation(
+        cuda_values,
+        reservation,
+        probability,
+    )
+    extension_error = cuda_stochastic_extension_error()
+    if extension_error is not None:
+        pytest.skip(f"fused CUDA stochastic extension could not load: {extension_error}")
+
+    torch.testing.assert_close(actual.cpu(), expected)
+    actual.sum().backward()
+    expected_grad = canonical_dropout_from_reservation(
+        torch.ones_like(cpu_values),
+        reservation,
+        probability,
+    )
+    torch.testing.assert_close(cuda_values.grad.cpu(), expected_grad)
+
+
+def test_canonical_dropout_rejects_reservation_word_offset_overflow_before_materialization():
+    values = torch.ones(2)
+    reservation = CanonicalRngReservation(
+        seed=3,
+        start_word=(1 << 64) - 1,
+        word_count=2,
+    )
+    with pytest.raises(OverflowError, match="reservation word offset overflow"):
+        canonical_dropout_from_reservation(values, reservation, 0.25)
 
 
 def test_runtime_finetune_threshold_preserves_checkpoint_or_resolves_default():

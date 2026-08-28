@@ -1,0 +1,17 @@
+[package]
+name = "hierarchos-infer"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust f32 inference runtime for Hierarchos"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libm = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

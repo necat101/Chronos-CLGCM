@@ -70,6 +70,8 @@ from hierarchos.models.revisions import (
 )
 
 HF_CACHE_FORMATTER_VERSION = "alpaca-previous-context-v6-min-response-filter"
+PORTABLE_TOKEN_CACHE_INDEX_FILENAME = "index.safetensors"
+PORTABLE_TOKEN_CACHE_INDEX_FORMAT = "hierarchos-token-cache-index-v1"
 _RETRY_CACHE_DIRECTORY_PERMISSION_ERRORS = os.name == "nt"
 DEFAULT_TRAINING_CHUNK_SIZE = COHERENT_TRAINING_CHUNK_SIZE
 DEFAULT_CHAT_TEMPERATURE = 0.7
@@ -1499,6 +1501,43 @@ def _file_sha256(path, *, chunk_bytes=8 << 20):
     return hasher.hexdigest()
 
 
+def _write_portable_token_cache_index(index, directory):
+    """Mirror cache indexing tensors in a pickle-free cross-runtime ABI.
+
+    ``index.pt`` remains the native PyTorch fast path.  The SafeTensors mirror
+    carries only the integer arrays required to locate/decode records, while
+    human-readable storage metadata stays in ``_SUCCESS``.  Rust/Vulkan can
+    therefore consume the exact same immutable cache without embedding Python
+    or implementing the torch.save archive format.
+    """
+    from safetensors.torch import save_file
+
+    tensor_names = (
+        "offsets",
+        "lengths",
+        "loss_run_offsets",
+        "loss_run_ends",
+        "loss_run_codes",
+    )
+    tensors = {}
+    for name in tensor_names:
+        value = index.get(name)
+        if torch.is_tensor(value):
+            tensors[name] = value.detach().cpu().contiguous()
+    if "offsets" not in tensors or "lengths" not in tensors:
+        raise ValueError("Portable token-cache index requires offsets and lengths")
+    path = os.path.join(directory, PORTABLE_TOKEN_CACHE_INDEX_FILENAME)
+    save_file(
+        tensors,
+        path,
+        metadata={
+            "format": PORTABLE_TOKEN_CACHE_INDEX_FORMAT,
+            "version": "1",
+        },
+    )
+    return _file_sha256(path)
+
+
 def _is_sha256_digest(value):
     normalized = str(value or "").strip()
     return (
@@ -1518,7 +1557,15 @@ def _read_token_cache_identity(cache_dir):
         raise ValueError(
             f"Token-cache index has no tensor lengths payload: {index_path}"
         )
-    for field_name in ("cache_key", "format", "cache_payload", "audit_sha256"):
+    for field_name in (
+        "cache_key",
+        "format",
+        "cache_payload",
+        "audit_sha256",
+        "portable_index_file",
+        "portable_index_format",
+        "portable_index_sha256",
+    ):
         index_value = index.get(field_name)
         success_value = success.get(field_name)
         if (
@@ -1627,6 +1674,29 @@ def _read_token_cache_identity(cache_dir):
                 "Token cache binary checksum failed for "
                 f"{data_path}: expected={str(expected_tokens_hash)!r}, "
                 f"actual={actual_tokens_hash!r}. Rebuild the cache before training."
+            )
+    portable_index_file = success.get("portable_index_file") or index.get("portable_index_file")
+    portable_index_hash = success.get("portable_index_sha256") or index.get("portable_index_sha256")
+    if portable_index_file or portable_index_hash:
+        if str(success.get("portable_index_format") or index.get("portable_index_format") or "") != PORTABLE_TOKEN_CACHE_INDEX_FORMAT:
+            raise RuntimeError(
+                f"Token cache has an unsupported portable index format: {cache_dir}"
+            )
+        if not portable_index_file or os.path.basename(str(portable_index_file)) != str(portable_index_file):
+            raise RuntimeError(
+                f"Token cache portable index must be a cache-local filename: {cache_dir}"
+            )
+        if not portable_index_hash or not _is_sha256_digest(portable_index_hash):
+            raise RuntimeError(
+                f"Token cache has a malformed portable-index checksum: {cache_dir}"
+            )
+        portable_index_path = os.path.join(cache_dir, str(portable_index_file))
+        if (
+            not os.path.isfile(portable_index_path)
+            or _file_sha256(portable_index_path) != str(portable_index_hash)
+        ):
+            raise RuntimeError(
+                f"Token cache portable-index checksum failed: {portable_index_path}"
             )
     samples = length_count
     identity = {
@@ -1923,6 +1993,12 @@ def materialize_hf_token_cache(args, tokenizer):
         loss_run_ends,
         loss_run_codes,
     ))
+    portable_index_sha256 = _write_portable_token_cache_index(index, tmp_dir)
+    index.update({
+        "portable_index_file": PORTABLE_TOKEN_CACHE_INDEX_FILENAME,
+        "portable_index_format": PORTABLE_TOKEN_CACHE_INDEX_FORMAT,
+        "portable_index_sha256": portable_index_sha256,
+    })
     torch.save(index, os.path.join(tmp_dir, "index.pt"))
     with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as f:
         json.dump({
@@ -1952,6 +2028,9 @@ def materialize_hf_token_cache(args, tokenizer):
             "ordered_record_sha256": ordered_record_sha256,
             "ordered_record_hash_algorithm": "record-stream-v1",
             "tokens_sha256": tokens_sha256,
+            "portable_index_file": PORTABLE_TOKEN_CACHE_INDEX_FILENAME,
+            "portable_index_format": PORTABLE_TOKEN_CACHE_INDEX_FORMAT,
+            "portable_index_sha256": portable_index_sha256,
             "audit_sha256": audit_sha256,
             "audit_file": "cache_audit.json",
             "audit": {
@@ -2231,6 +2310,12 @@ def materialize_local_token_cache(args, tokenizer):
         loss_run_ends,
         loss_run_codes,
     ))
+    portable_index_sha256 = _write_portable_token_cache_index(index, tmp_dir)
+    index.update({
+        "portable_index_file": PORTABLE_TOKEN_CACHE_INDEX_FILENAME,
+        "portable_index_format": PORTABLE_TOKEN_CACHE_INDEX_FORMAT,
+        "portable_index_sha256": portable_index_sha256,
+    })
     torch.save(index, os.path.join(tmp_dir, "index.pt"))
     with open(os.path.join(tmp_dir, "_SUCCESS"), "w", encoding="utf-8") as success_file:
         json.dump({
@@ -2259,6 +2344,9 @@ def materialize_local_token_cache(args, tokenizer):
             "ordered_record_sha256": ordered_record_sha256,
             "ordered_record_hash_algorithm": "record-stream-v1",
             "tokens_sha256": tokens_sha256,
+            "portable_index_file": PORTABLE_TOKEN_CACHE_INDEX_FILENAME,
+            "portable_index_format": PORTABLE_TOKEN_CACHE_INDEX_FORMAT,
+            "portable_index_sha256": portable_index_sha256,
             "audit_sha256": audit_sha256,
             "audit_file": "cache_audit.json",
             "audit": {
@@ -2668,6 +2756,32 @@ def _read_model_config_defaults(model_path):
         return None, None
 
     resolved = os.path.abspath(os.path.expanduser(model_path))
+    continuation_overlay = {}
+    if os.path.isdir(resolved) and os.path.isfile(
+        os.path.join(resolved, "training_state.json")
+    ):
+        from tools.vulkan_optimizer_bridge import (
+            read_vulkan_training_manifest,
+            read_vulkan_training_replay,
+        )
+
+        manifest = read_vulkan_training_manifest(resolved)
+        replay = read_vulkan_training_replay(resolved, manifest)
+        if isinstance(replay, dict):
+            effective = replay.get("effective_training_config")
+            if isinstance(effective, dict):
+                continuation_overlay.update(
+                    {key: value for key, value in effective.items() if value is not None}
+                )
+            run_identity = replay.get("run_identity")
+            if isinstance(run_identity, dict):
+                objective = run_identity.get("objective")
+                if isinstance(objective, dict):
+                    continuation_overlay.update(
+                        {key: value for key, value in objective.items() if value is not None}
+                    )
+            if replay.get("completed_epoch") is not None:
+                continuation_overlay["completed_epoch"] = replay.get("completed_epoch")
     local_checkpoint = None
     local_checkpoint_path = None
     if os.path.exists(resolved):
@@ -2733,6 +2847,7 @@ def _read_model_config_defaults(model_path):
                     })
             if "completed_epoch" not in config and local_checkpoint.get("completed_epoch") is not None:
                 config["completed_epoch"] = local_checkpoint.get("completed_epoch")
+            config.update(continuation_overlay)
             return config, local_checkpoint_path
 
     model_dir = resolved if os.path.isdir(resolved) else os.path.dirname(resolved)
@@ -2740,7 +2855,9 @@ def _read_model_config_defaults(model_path):
         candidate = os.path.join(model_dir, name)
         if os.path.exists(candidate):
             with open(candidate, "r", encoding="utf-8") as f:
-                return dict(json.load(f)), candidate
+                config = dict(json.load(f))
+                config.update(continuation_overlay)
+                return config, candidate
 
     if os.path.isfile(resolved) and resolved.lower().endswith(".pt"):
         try:
@@ -2970,7 +3087,15 @@ def main():
             "custom Python code. Disabled by default."
         ),
     )
-    path_group.add_argument("--resume-from-ckpt", type=str, default=None, help="Path to a training checkpoint .pt file.")
+    path_group.add_argument(
+        "--resume-from-ckpt",
+        type=str,
+        default=None,
+        help=(
+            "Path to a PyTorch training checkpoint or a Hierarchos Vulkan "
+            "training-package directory with portable replay state."
+        ),
+    )
     path_group.add_argument(
         "--shadow-model-path",
         type=str,
@@ -3096,6 +3221,17 @@ def main():
         help="Shortcut for --ltm-training-mode read-only; recommended for assistant rescue/coherence runs.",
     )
     train_group.add_argument("--rwkv-weight-decay", "--rwkv_weight_decay", dest="rwkv_weight_decay", type=float, default=0.1, help="AdamW decay for RWKV matrices/embeddings; norms/scalars use 0 decay.")
+    train_group.add_argument(
+        "--adamw-eps",
+        "--adamw_eps",
+        dest="adamw_eps",
+        type=float,
+        default=1e-8,
+        help=(
+            "AdamW denominator epsilon. Exact resumes bind this value across "
+            "PyTorch/CUDA/Vulkan; 1e-6 is the qualified mixed-FP16 parity setting."
+        ),
+    )
     train_group.add_argument("--ltm-score-grad-scale", "--ltm_score_grad_scale", type=float, default=1.0, help="Straight-through gradient scale for LTM query/key addressing. Set 0 to keep retrieval addressing frozen.")
     train_group.add_argument(
         "--ltm-value-alignment-weight",

@@ -1,0 +1,38 @@
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+.pytest_cache/
+
+# Local build and packaging outputs
+build/
+dist/
+**/target/
+
+# Local model/checkpoint/cache artifacts
+.hierarchos-hf-cache/
+cuda_test_model/
+rog_ally_model/
+rog_ally_model_test/
+rog_ally_model_v8_preflight/
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+
+# Local runtime state and generated smoke/acceptance artifacts
+.agents/
+.codex-*
+..codex-*
+*.native-tokenized.jsonl
+hierarchos_chat_states/
+
+# Generated benchmark scratch/log bundles; keep benchmark JSON results tracked
+benchmark_results/_tmp*
+benchmark_results/packed_tbptt_sweep/
+benchmark_results/*.logs/
+
+# Logs and platform debug symbols
+*.log
+*.pdb

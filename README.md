@@ -25,10 +25,24 @@
 > [RWKV-v9 migration notes](COHERENT_V9_MIGRATION.md) before starting,
 > resuming, fine-tuning, or merging an expensive run.
 >
+> **Native backend:** Alpha v0.30 also ships an independent Rust/Vulkan path in
+> `hierarchos-vulkan/`, `hierarchos-inference/`, and `hierarchos-native-cli/`.
+> The native binaries do not import, embed, or launch Python/PyTorch. They use
+> the canonical SafeTensors parameter contract for interchange with other
+> runtimes. Native `train` can either start from an existing canonical package
+> or initialize a fresh coherent-v9 package directly from local tokenizer assets;
+> native inference/chat is implemented in Rust and native training/optimization
+> uses Vulkan compute. Framework-specific workflows remain outside the native
+> backend and fail closed instead of being silently delegated. For the isolated
+> native build, binary layout, training commands, and exact interoperability
+> boundary, see [NATIVE_BACKEND.md](NATIVE_BACKEND.md).
+>
 > Release-gate totals are deliberately not frozen as the regression suite grows.
-> Before a paid run, execute `python -m pytest -q` and
-> `python tools/check_architecture_integrity.py --strict`, then record the
-> resulting output with the run manifest.
+> For the Python/framework runtime, execute `python -m pytest -q` and
+> `python tools/check_architecture_integrity.py --strict` before a paid run. For
+> the isolated Rust/Vulkan runtime, use `tools/build_native_release.ps1`; that
+> builder runs the native Rust gates, audits the dependency trees for
+> Python/libtorch bindings, builds the production binaries, and probes Vulkan.
 
 ## RWKV core v8 to v9 architecture flow
 
@@ -473,19 +487,28 @@ An experimental dual-module design in which a high-level "Manager" and low-level
   * 🤔 **Adaptive "Ponder" Time**: Dynamically adjusts its reasoning depth, "thinking" longer for complex problems and saving computation on simpler ones.
   * 🕰️ **Structured & Queryable Memory**: LTM slots are augmented with timestamps and source data, enabling powerful temporal and contextual queries during chat.
   * 🧠 **Dynamic "Online" Learning**: Learns from experience during chat with a Cosine Annealing LR schedule by default for more stable knowledge consolidation.
-  * 🚀 **PyTorch 2.4+ Runtime Contract**: The supported full-precision path
-    requires PyTorch 2.4 or newer for restricted artifact loading; CUDA builds
-    can use `torch.compile` with `--compile` / `--force-compile`.
+  * 🦀 **Native Rust/Vulkan Runtime**: `hierarchos-native-cli`,
+    `hierarchos-inference`, and `hierarchos-vulkan` form an independent
+    Python-free path. Inference/chat and package handling are Rust; training and
+    optimization execute through Vulkan compute. Canonical FP32-master
+    SafeTensors are the interchange boundary with other runtimes.
+  * 🚀 **PyTorch 2.4+ Framework Runtime Contract**: The separate
+    Python/framework path requires PyTorch 2.4 or newer for restricted artifact
+    loading; CUDA builds can use `torch.compile` with `--compile` /
+    `--force-compile`.
   * 🛡️ **Training Guardrails**: Finite-gradient rejection, gradient clipping (`--grad-clip`), Z-loss regularization, and state/activation clamps reduce instability risk. Clamps intentionally alter values when triggered and cannot guarantee convergence.
   * 📦 **Self-Contained & Portable Models**: Models are saved as HuggingFace-style directories containing weights, tokenizer, and architecture config for easy sharing and deployment.
   * 🌱 **Enhanced Model Expansion**: Includes `expand_model.py` script to transplant weights from smaller models to larger ones.
-  * 🛡️ **Fail-Closed Deployment Contract**: Full-precision artifacts load only
-    through PyTorch's restricted `weights_only` path with narrowly allowlisted
-    project types. Legacy scalar-RWKV `.npz`, automatic re-quantization, and
-    Vulkan model inference are unsupported for the Alpha v0.30 RWKV-v9 core.
-  * 🐍 **Runtime Versions**: Python 3.10+ and PyTorch 2.4+ are required for the
-    supported path. Python 3.13 is usable only with a compatible PyTorch build;
-    DirectML currently requires Python 3.10–3.12.
+  * 🛡️ **Fail-Closed Deployment Contract**: The Python/framework loader accepts
+    framework checkpoints only through PyTorch's restricted `weights_only` path
+    with narrowly allowlisted project types. The native loader accepts canonical
+    SafeTensors packages and does not deserialize framework-object `.pt` files.
+    Legacy scalar-RWKV `.npz`, automatic re-quantization, and the old scalar
+    Vulkan inference path remain unsupported for the Alpha v0.30 RWKV-v9 core.
+  * 🐍 **Framework Runtime Versions**: Python 3.10+ and PyTorch 2.4+ are required
+    only for the Python/framework path. Python 3.13 is usable only with a
+    compatible PyTorch build; DirectML currently requires Python 3.10–3.12.
+    The native Rust/Vulkan binaries do not require Python or PyTorch at runtime.
 
 -----
 
@@ -495,11 +518,22 @@ Follow these steps to get a local copy up and running.
 
 ### Prerequisites
 
-  * **Python 3.10+**
-  * **PyTorch 2.4+** (required by the fail-closed checkpoint and cache loaders)
-  * **For Hugging Face Datasets:** `pip install datasets`
-  * **For AMD GPU Training (Windows):** Install DirectML via `pip install torch-directml` and follow [README_ZLUDA.md](README_ZLUDA.md). Its current Python support is 3.10–3.12; do not use a Python 3.13 DirectML environment.
-  * **Optional (AMP Training/Gradient Checkpointing):** NVIDIA GPU with CUDA support (Compute Capability 7.0+ recommended) and a PyTorch build with CUDA enabled.
+Choose the runtime you intend to use:
+
+  * **Native Rust/Vulkan:** a stable Rust toolchain plus a working Vulkan loader
+    and driver. Build the isolated package with
+    `powershell -ExecutionPolicy Bypass -File .\tools\build_native_release.ps1`.
+    Python, PyTorch, CUDA, libtorch, and `pyo3` are not runtime dependencies of
+    the native CLI/trainer/inference crates. See [NATIVE_BACKEND.md](NATIVE_BACKEND.md).
+  * **Python/framework:** Python 3.10+ and PyTorch 2.4+ are required by the
+    fail-closed framework checkpoint/cache loaders.
+  * **For Hugging Face Datasets on the framework path:** `pip install datasets`.
+  * **For AMD framework training (Windows):** Install DirectML via
+    `pip install torch-directml` and follow [README_ZLUDA.md](README_ZLUDA.md).
+    Its current Python support is 3.10–3.12; do not use a Python 3.13 DirectML
+    environment.
+  * **Optional framework CUDA training:** NVIDIA GPU with CUDA support (Compute
+    Capability 7.0+ recommended) and a PyTorch build with CUDA enabled.
 
 ### Installation
 
@@ -562,11 +596,16 @@ This guide covers common scenarios from data preparation to inference.
 
 ### Choosing Your Entry Point
 
-> ⚠️ **Important:** The modular CLI (`hierarchos_cli.py`) is the **only supported entry point**. The original `hierarchos.py` is legacy and no longer maintained.
+> ⚠️ **Important:** For the Python/framework stack, the modular CLI
+> (`hierarchos_cli.py`) is the **only supported Python entry point**. The original
+> `hierarchos.py` is legacy and no longer maintained. The independent supported
+> Rust/Vulkan entry point is `hierarchos-native-cli`; see
+> [NATIVE_BACKEND.md](NATIVE_BACKEND.md).
 
 | Entry Point | Status | Description |
 |-------------|--------|-------------|
 | `hierarchos_cli.py` | ✅ **Recommended** | Modular CLI - faster, stable, actively maintained |
+| `hierarchos-native-cli` | ✅ **Native** | Pure-Rust CLI for coherent-v9 inference and Vulkan training; no Python/PyTorch runtime dispatcher. |
 | `hierarchos.py` | ⚠️ **Legacy** | Unmaintained monolith (5,600 lines). Kept only as reference for agentic AI workflows. | <-- DO NOT USE THIS! ITS 16 VERSIONS OUT OF DATE!!
 
 > **Product version boundary:** Hierarchos Alpha v0.30 is the current release.
@@ -1361,12 +1400,512 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 
 -----
 
+## Native Rust/Vulkan backend
+
+The coherent-v9 full-model native training backend now lives in
+`hierarchos-vulkan/`. It uses raw Vulkan compute through Rust/`ash` and standard
+FP32 SafeTensors, with the same canonical tensor names, row-major layouts, and
+shapes consumed by external PyTorch/CUDA tooling and the `hierarchos-inference`
+native runtime. The current graph carries raw-token coherent-v9 training through
+the Hierarchos memory/control frontend, recurrent H/L reverse passes, exact
+sparse state replay, full-model gradient accumulation, cross-entropy, and
+canonical AdamW updates while preserving that exported SafeTensors contract.
+
+The production native backend does not import or launch Python/PyTorch. Optional
+developer-only cross-runtime parity checks live outside the native binaries and
+can be run with:
+
+Here, "PyTorch-compatible" describes the portable tensor/checkpoint ABI and the
+numerical parity target only. PyTorch is not embedded, linked, imported, or
+invoked by `hierarchos-native-cli`, `hierarchos-vulkan`, or
+`hierarchos-inference`; training and inference stay on the Rust/Vulkan path.
+
+```powershell
+python tools/verify_vulkan_training_parity.py
+python tools/verify_vulkan_model_interchange.py
+```
+
+The second check exports a coherent-v9 package, performs a Vulkan training step,
+rewrites `model.safetensors`, and verifies that both PyTorch and the pure-Rust
+inference engine consume the trained package. On hosts with CUDA available it
+also executes the PyTorch CUDA inference check.
+
+The native Rust trainer is also a standalone CLI. It consumes either the same
+schema-v6 token cache used by the PyTorch data pipeline or legacy tokenized
+JSONL, trains directly through Vulkan, and writes portable FP32-master
+SafeTensors plus backend-neutral optimizer/resume sidecars:
+
+```powershell
+$env:HIERARCHOS_VULKAN_TRAINING_PRECISION="fp16-storage-parity"
+cargo run --release --manifest-path hierarchos-vulkan/Cargo.toml --bin hierarchos-vulkan-train -- `
+  --model .\hierarchos_model `
+  --dataset .\token_cache `
+  --output .\hierarchos_vulkan_model `
+  --epochs 3 --batch-size 4 --gradient-accumulation-steps 4 `
+  --lr 1e-4 --min-lr 1e-6 --warmup-ratio 0.03 `
+  --tbptt-chunk-size 256 --device-index 0 --save-steps 100
+```
+
+There is now a higher-level native command-line frontend in its own Rust crate.
+The native GUI keeps a tiny wrapper entrypoint around the same implementation,
+so CLI behavior has one source of truth and the command-line runtime does not
+pull in the GUI dependency graph. The preferred Windows build is the isolated
+native-only release builder; it audits the Rust dependency graph, runs the native
+test gates, builds the Rust GUI/CLI plus Vulkan runtime, and refuses Python
+runtime artifacts in the staged bundle:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build_native_release.ps1
+```
+
+That produces `dist\Hierarchos-Native\HierarchosNative.exe`,
+`HierarchosCLI.exe`, and the Vulkan trainer/device binaries under `vulkan\`.
+See [NATIVE_BACKEND.md](NATIVE_BACKEND.md) for the complete native workflow.
+To build only the lower-level standalone binaries manually:
+
+```powershell
+cargo build --release --manifest-path hierarchos-vulkan/Cargo.toml --bin hierarchos-vulkan-train --bin hierarchos-vulkan-devices
+cargo build --release --manifest-path hierarchos-native-cli/Cargo.toml
+```
+
+The resulting `hierarchos-native-cli` binary exposes the root CLI's major modes
+while keeping the model/training hot paths native. In particular, `train`
+translates the familiar Python option aliases into the Vulkan trainer, accepts
+the canonical schema-v6 token cache directly, and can also tokenize ordinary
+local JSONL with the package's `tokenizer.json` before launching Vulkan. For a
+fresh run, `--model-path` is optional: pass local tokenizer assets and the CLI
+constructs the coherent-v9 parameter package in Rust, then hands that package to
+the same Vulkan trainer:
+
+```powershell
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe devices
+
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe train `
+  --model-path .\hierarchos_model `
+  --train .\instruct_dataset.jsonl `
+  --out-dir .\hierarchos_vulkan_model `
+  --epochs 3 --batch_size 4 --accumulation-steps 4 `
+  --starting-lr 1e-4 --min-lr 1e-6 --warmup-ratio 0.03 `
+  --training-chunk-size 256 --precision fp16-storage-parity --device-index 0
+
+# Exact continuation restores optimizer, scheduler/scaler, data cursor,
+# pending accumulation state, and portable recurrent/LTM/ROSA replay state.
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe train `
+  --resume-from-ckpt .\hierarchos_vulkan_model `
+  --train .\instruct_dataset.jsonl `
+  --out-dir .\hierarchos_vulkan_resumed `
+  --epochs 4 --batch_size 4 --accumulation-steps 4 `
+  --starting-lr 1e-4 --min-lr 1e-6 --warmup-ratio 0.03 `
+  --training-chunk-size 256 --precision fp16-storage-parity --device-index 0
+
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe finetune `
+  --model-path .\hierarchos_vulkan_model `
+  --train .\domain_dataset.jsonl `
+  --out-dir .\hierarchos_vulkan_finetuned `
+  --epochs 1 --batch_size 4 --accumulation-steps 4 `
+  --starting-lr 1e-5 --training-chunk-size 256 `
+  --precision fp32 --device-index 0
+
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe chat `
+  --model-path .\hierarchos_vulkan_finetuned `
+  --prompt "Explain hierarchical recurrent reasoning." `
+  --temperature 0.7 --top-k 40 --top-p 0.9 `
+  --entropy-stop-threshold 0 --eos-stop-prob 0
+```
+
+The native chat frontend also implements the root CLI's opt-in raw-logit
+uncertainty guards: `--entropy-stop-threshold`, `--entropy-stop-min-tokens`,
+`--entropy-stop-top-prob`, and `--eos-stop-prob`. They use a stable Rust
+softmax over the unmodified model logits before sampling, preserve the root
+defaults (`0`, `3`, `0.05`, `0`), and stop fail-closed if an active guard sees
+non-finite logits. No Python tensor/runtime is involved.
+
+Fresh initialization is available directly from the same executable:
+
+```powershell
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe train `
+  --tokenizer-path .\tokenizer_assets `
+  --train .\instruct_dataset.jsonl `
+  --out-dir .\hierarchos_vulkan_fresh `
+  --context_dim 448 --h_hidden 448 --l_hidden 448 --rwkv-head-size 64 `
+  --persistent_dim 128 --ltm_slots 1024 --ltm_key_dim 128 --ltm_val_dim 128 --ltm_topk 4 `
+  --epochs 3 --batch_size 4 --accumulation-steps 4 `
+  --starting-lr 1e-4 --min-lr 1e-6 --warmup-ratio 0.03 `
+  --training-chunk-size 256 --precision fp16-storage-parity --device-index 0
+```
+
+This fresh path constructs `model.safetensors`, both native/config interchange
+files, and tokenizer-bound package assets in Rust before the first Vulkan
+training submission. It does not import, embed, or launch Python/PyTorch.
+
+Hugging Face acquisition is also native. The same executable now performs HTTPS
+Hub downloads in Rust, writes through a local cache, and then enters the exact
+same package/tokenization/training path. It does not shell out to Python,
+`huggingface_hub`, Git LFS, or a framework loader:
+
+```powershell
+# Pull a complete published Hierarchos package for native chat/training.
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe pull `
+  --repo YOUR_ORG/YOUR_HIERARCHOS_REPO `
+  --revision main `
+  --out-dir .\hierarchos_from_hf
+
+# Warm-start Vulkan training from a canonical HF model package and a JSONL split
+# discovered from an HF dataset repository.
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe train `
+  --hf-model YOUR_ORG/YOUR_HIERARCHOS_REPO `
+  --hf-model-revision main `
+  --hf-dataset YOUR_ORG/YOUR_DATASET `
+  --hf_dataset_split train `
+  --hf-dataset-revision main `
+  --out-dir .\hierarchos_vulkan_hf `
+  --epochs 3 --batch_size 4 --accumulation-steps 4 `
+  --starting-lr 1e-4 --training-chunk-size 256 --precision fp32
+
+# A standard HF tokenizer can seed a completely fresh coherent-v9 package.
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe train `
+  --tokenizer-path openai-community/gpt2 `
+  --train .\instruct_dataset.jsonl `
+  --out-dir .\hierarchos_vulkan_fresh_hf_tokenizer `
+  --context_dim 448 --h_hidden 448 --l_hidden 448 --rwkv-head-size 64
+```
+
+`--hf-cache-dir DIR` relocates the native cache; otherwise
+`.hierarchos-hf-cache` is used. `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` enables
+private/gated repositories. `--hf-model-revision`, `--hf-tokenizer-revision`,
+and `--hf-dataset-revision` pin the three sources independently. Model pulls are
+intentionally strict: a Hub repo must contain the canonical Hierarchos
+`model.safetensors`, both config files, and `tokenizer.json`. For tokenizer
+compatibility, a non-existent `--tokenizer-path OWNER/REPO` is treated as the
+root CLI's Hugging Face tokenizer form. Dataset discovery reads only repository
+metadata, honors `--hf_dataset_config`/`--hf_dataset_split`, selects
+JSONL/NDJSON files, and combines matching shards in lexical order. Ambiguous
+repositories can be pinned to one exact file with `--hf-dataset-file`. The
+native binary never executes remote dataset builder code, implicitly converts
+Parquet/CSV, or enables `trust_remote_code`.
+
+The compatibility target is workflow/mode parity, not emulation of every
+framework-specific Python flag. The native command intentionally has no hidden
+fallback path:
+
+| Root CLI mode | Native status |
+| --- | --- |
+| `train` | Full coherent-v9 model training in Vulkan, including fresh Rust-only model initialization from local tokenizer assets, warm-start from canonical SafeTensors, gradient accumulation, AdamW, LR scheduling, periodic exact-resume checkpoints, raw local JSONL tokenization, schema-v6 token-cache input, and single-/multi-device Vulkan selection. |
+| `finetune` | Vulkan training with a frozen optimizer selection. By default it trains existing coherent-v9 recurrent low-rank factors, DeepEmbed/ROSA factors and routers, plus slow-LTM tensors; repeat `--trainable-prefix` for an explicit canonical selection. |
+| `chat` | Pure-Rust full-precision inference through `hierarchos-inference`, including portable recurrent/ROSA/LTM chat-state save/resume and the root CLI's opt-in raw-logit entropy/EOS uncertainty stop guards. |
+| `benchmark` | Pure-Rust local inference/throughput benchmarking. Python `lm-eval`, ARC catalogs, and other external benchmark registries are deliberately not launched by the native binary. |
+| `pull` | Pure-Rust HTTPS download of a canonical Hierarchos SafeTensors/config/tokenizer package from Hugging Face, with revision pinning, caching, optional bearer-token authentication, and staged validation before publication. |
+| `merge-lora` | Pure-Rust merge of a bound Hierarchos PEFT-LoRA SafeTensors adapter into a standalone canonical model package. |
+| `ckpt-2-inf` | Native SafeTensors-package export/validation. Framework-object `.pt` checkpoints are rejected rather than deserialized through PyTorch. |
+| `quantize` | Intentionally unavailable for coherent-v9 until a matrix-state quantized format can preserve the current learned function. The command fails closed. |
+
+Exact native continuation is deliberately stricter than a weights-only restart.
+`--resume-from-ckpt` restores and validates the optimizer, scheduler/scaler,
+data cursor, pending accumulation state, and portable recurrent/LTM/ROSA replay
+state. To start a new optimizer/schedule from existing weights, pass the package
+with `--model-path` instead. Framework-only resume conveniences such as arbitrary
+Python optimizer-object mutation are not treated as native parity features.
+
+The GUI crate also keeps a tiny wrapper entrypoint around this same native CLI
+implementation, but the standalone binary above has no GUI dependency graph.
+The chat command can save and resume the backend-neutral recurrent/ROSA/LTM
+runtime state without a framework-specific object format:
+
+```powershell
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe chat `
+  --model-path .\hierarchos_vulkan_model `
+  --carry-chat-state --chat-state-file .\chat-state.json
+
+.\hierarchos-native-cli\target\release\hierarchos-native-cli.exe chat `
+  --model-path .\hierarchos_vulkan_model `
+  --resume-chat-from-state-file .\chat-state.json
+```
+
+For exact PyTorch/Vulkan data-objective parity, the schema-v6 token cache remains
+the canonical interchange path because it preserves the already-tokenized IDs,
+labels, masks, loss weights, and content identity. Native raw-JSONL tokenization
+is a convenience path for local datasets and intentionally keeps the package
+tokenizer authoritative. That raw path now mirrors the root data contract for
+`text`/`content`, `instruction`/`output`, `prompt`/`completion`, and
+`question`/`answer` rows, resolves and appends EOS natively, drops blank
+completions by default, preserves the prompt suffix plus the start of the answer
+during truncation, and supports `--min-response-tokens`,
+`--allow-empty-completions`, response-boundary weighting, and the supported
+native portion of `--assistant-recovery`. Schema-v6 remains the exact interchange
+path when a run must preserve a precomputed PyTorch-side token/loss object
+bit-for-bit.
+
+`chat`, the local throughput `benchmark`, Vulkan `devices`, native `train`,
+native `finetune`, SafeTensors-package `ckpt-2-inf`, and bound SafeTensors
+`merge-lora` are pure Rust/Vulkan-native paths. The standalone native binary has
+no Python/PyTorch dispatcher and never silently crosses runtimes. Native
+`hierarchos-vulkan`, `hierarchos-native-cli`, and `hierarchos-inference` also do
+not link `pyo3`, `tch`, or libtorch; Python tooling elsewhere in the repository is
+outside this native backend and is not invoked by it. Native
+`finetune` freezes the canonical optimizer by default to coherent-v9's existing
+low-rank recurrent factors, DeepEmbed/ROSA adapter factors and routers, and slow
+LTM tensors; `--trainable-prefix` can replace that selection with an explicit
+canonical tensor-prefix set. Because those factors are already part of the model
+architecture, finetuning emits a complete `model.safetensors` package directly
+and requires no framework adapter object or post-training merge. `merge-lora`
+separately validates an externally supplied bound SafeTensors adapter/base and
+architecture contract in Rust, applies the standard LoRA `B @ A` delta, restores
+any saved slow-LTM tensors, and emits another canonical model package.
+
+A request for a genuinely framework-only workflow still fails closed with a
+native error instead of silently launching Python. That currently includes
+Hugging Face dataset-builder execution beyond the native repository-metadata +
+JSONL/NDJSON path, framework-object `.pt` conversion, external lm-eval/ARC
+catalogs, and injecting a new arbitrary PEFT-LoRA geometry at runtime. Legacy
+`--lora_r`, `--lora_alpha`, `--lora_dropout`, and
+`--finetune-unlock-percent` options are accepted by native `finetune` only as
+compatibility geometry hints; they do not mutate coherent-v9's architecture.
+`quantize` remains intentionally disabled for coherent-v9 because the old
+scalar-RWKV format cannot represent the current learned function.
+
+The native training objective supports both the root defaults
+(`--max-ce-loss-for-backward=0` and `--max-ponder-cost-for-backward=0`) and the
+optional nonzero sequence-scalar CE/ponder backward caps. When either cap is
+active, the Vulkan trainer performs a forward-only scalar preflight for each
+historical PyTorch-TBPTT chunk, derives the exact `torch.minimum(value, cap)`
+backward gate (`1` below the cap, `0` above it, and `0.5` at an exact tie), and
+then applies that gate to the native reverse-mode sources. The cap policy is
+carried through both dense and sparse replay plus gradient-accumulation windows;
+the standalone `hierarchos-native-cli train` frontend forwards the same flags
+without invoking Python/PyTorch. The commitment cap remains gradient-transparent,
+matching the root trainer's straight-through `preserve_gradient=True` behavior.
+
+The higher-level native `train` frontend also carries the root CLI's ordinary
+defaults rather than inheriting the low-level trainer's deliberately tiny smoke
+defaults: 3 epochs, batch size 64, seed 1337, minimum LR `1e-6`, and ponder-loss
+weight `0.01`. Explicit launch arguments remain last-write-wins. `--amp` maps to
+the qualified Vulkan `fp16-storage-parity` policy and `--no-amp` maps to `fp32`,
+so existing launch scripts can select mixed precision without introducing a
+framework dependency.
+
+### Native backend acceptance status
+
+On the local AMD Radeon Graphics Vulkan target on August 27, 2026, the release
+native CLI completed a four-step FP32 training run, emitted optimizer-boundary
+periodic checkpoints, and then resumed the exported package for a second epoch
+through optimizer step 8. The resumed run reported that model, optimizer,
+training-session, scheduler, and data-stream state were restored rather than
+reinitialized. A fresh native `finetune` smoke selected 27 canonical tensors and
+froze 68, completed four Vulkan optimizer steps, and produced a package that the
+standalone pure-Rust inference binary immediately reloaded and executed. A
+separate from-scratch acceptance run started with only local GPT-2 tokenizer
+assets plus tokenized JSONL, constructed a 50,257-vocabulary coherent-v9 model
+entirely in Rust, completed two FP32 Vulkan optimizer steps on the same AMD GPU
+(recorded loss `10.8399` then `10.8068`), emitted canonical `model.safetensors`
+plus optimizer/resume state, and was immediately reloaded for generation by the
+pure-Rust `chat` path. The
+current Rust test gate also reports `16 passed` for `hierarchos-native-cli`,
+`197 passed, 8 ignored` for the runnable `hierarchos-vulkan` library tests, and
+`6 passed` for the dedicated `hierarchos-native` GUI; the
+ignored cases are explicit GPU microprofiles rather than failed correctness
+tests. `hierarchos-inference` additionally reports `12 passed`, including native
+bootstrap/package loading and recurrent/ROSA runtime-state coverage. The native
+GUI tests cover exact-resume policy rehydration, Vulkan device parsing/selection,
+and native training-event parsing rather than relying on a compile-only gate.
+
+The optimized release binaries were rebuilt after the raw-JSONL parity changes.
+The standalone native CLI's `devices` command then enumerated the local
+`AMD Radeon Graphics` Vulkan adapter from that release executable. A Cargo
+dependency-tree audit of `hierarchos-native-cli` and its native stack found no
+`pyo3`, `tch`, `torch-sys`, or libtorch dependency; those binaries therefore do
+not gain a hidden Python/PyTorch runtime through their Rust dependency graph.
+
+A final release-path revalidation on August 27, 2026 used the public
+`hierarchos-native-cli` executable and the rebuilt Vulkan trainer/device binaries.
+The CLI discovered the AMD adapter, completed an FP32 optimizer step with an
+optimizer-boundary checkpoint, resumed that package exactly into epoch 2 with
+both `resumed_optimizer=true` and `resumed_training_session=true`, reached
+optimizer step 2, and then loaded the resumed package through the pure-Rust
+`benchmark` inference path. This revalidation did not invoke the repository's
+Python tooling.
+
+After the native chat uncertainty guards were added, the release binaries were
+validated again through the same public frontend. A four-row masked tokenized
+JSONL fixture completed one FP32 Vulkan optimizer step on `AMD Radeon Graphics`
+at batch size 4 (`mean_recorded_loss=10.738201`), emitted an optimizer-boundary
+checkpoint, and published a canonical SafeTensors package. That newly trained
+package immediately reloaded through native `chat` with all four entropy/EOS
+guard switches enabled and through the pure-Rust local `benchmark` path. The
+post-change CLI gate reports `16 passed, 0 failed`; the Vulkan library gate
+reports `197 passed, 0 failed, 8 ignored` and `hierarchos-inference` remains
+`12 passed, 0 failed`.
+
+On August 28, 2026, the release public `hierarchos-native-cli train` entrypoint
+was rebuilt and exercised on the local `AMD Radeon Graphics` adapter with
+`--max-ce-loss-for-backward 4.0`, `--max-ponder-cost-for-backward 1.0`, and a
+two-microbatch gradient-accumulation window. The four-row native fixture
+completed both batches, performed one optimizer step, wrote an optimizer-boundary
+checkpoint, reported `mean_recorded_loss=3.743555`, and exited successfully.
+Exact resume from that checkpoint restored both optimizer and training-session
+state, continued at epoch 2, reached optimizer step 2, and reported
+`mean_recorded_loss=3.740881` with the same cap policy. These runs used the Rust
+CLI and Vulkan trainer directly; no Python/PyTorch runtime participated in the
+training path.
+
+Also on August 28, 2026, `tools/build_native_release.ps1` was exercised as the
+isolated native release gate. It audited `hierarchos-inference`,
+`hierarchos-vulkan`, `hierarchos-native-cli`, and the dedicated
+`hierarchos-native` GUI dependency trees for Python/libtorch Rust bindings, ran
+the native correctness gates (`12` inference tests, `197` Vulkan tests with `8`
+explicit GPU microprofiles ignored, `16` native-CLI tests, and `6` dedicated
+native-GUI tests), compiled the native GUI, and produced `dist/Hierarchos-Native`
+without `.py`, `.pyc`, `.pyd`,
+or Python DLL artifacts. The bundled device probe enumerated `AMD Radeon
+Graphics`. The bundled `HierarchosCLI.exe` then completed a one-step FP32 Vulkan
+training run (`mean_recorded_loss=11.027534`), wrote an optimizer-boundary
+checkpoint, resumed it into epoch 2 with both `resumed_optimizer=true` and
+`resumed_training_session=true` (`mean_recorded_loss=10.988756`), and the
+resulting package loaded successfully through the bundled pure-Rust local
+`benchmark` inference path. These tiny-fixture losses are acceptance values, not
+quality or performance benchmarks.
+
+The Hub transport itself was re-exercised on August 27, 2026 through the release
+native binary. `openai-community/gpt2` supplied `tokenizer.json` and its available
+sidecars through the Rust HTTPS/cache layer; those Hub tokenizer assets were then
+used to initialize a coherent-v9 package from scratch and complete a Vulkan FP32
+optimizer step without a local model input. The same binary also fetched
+`polinaeterna/jsonl_test` `data/train.jsonl` through `--hf-dataset` /
+`--hf-dataset-file`, tokenized its three `text` rows natively, and completed three
+Vulkan optimizer steps. The current native CLI unit gate reports `16 passed`, including
+traversal rejection, URL/path encoding, dataset split/shard-selection tests for
+the Hub boundary, response-preserving truncation, EOS-safe response-boundary
+weighting, and root-style raw-text schema detection. A canonical Hierarchos model
+pull remains package-validation-bound: publication occurs only after the required
+native SafeTensors/config/tokenizer files are present and the tokenizer vocabulary
+matches the model contract.
+
+That AMD run is evidence for the Vulkan backend, not an NVIDIA/CUDA execution
+claim. CUDA interoperability is defined at the canonical SafeTensors tensor
+names/shapes/layout boundary so an external CUDA implementation can consume the
+same trained weights. The native backend itself remains Vulkan on NVIDIA as
+well; qualifying a particular NVIDIA driver/GPU still requires running the
+repository's cross-runtime qualification checks on that hardware.
+
+The native training contract is deliberately explicit. `train` accepts
+either (a) an existing canonical SafeTensors model package, (b) an exact native
+resume package, or (c) no model at all when local tokenizer assets are supplied
+for fresh coherent-v9 initialization. `--hf-model` can materialize case (a) from
+a canonical Hub repository, and `--hf-tokenizer` can supply case (c) without a
+local tokenizer copy. `finetune` remains model-bound. Training data can be local
+JSONL/tokenized JSONL, a schema-v6 token cache, or an explicit JSONL-compatible
+file pulled from a Hub dataset repository with `--hf-dataset`; config/split
+selection follows the root-compatible `--hf_dataset_config` and
+`--hf_dataset_split` hints, while `--hf-dataset-file` remains the exact-file
+override. The package keeps
+ordinary tensor names/layouts and `hierarchos_config.json` alongside the stricter
+`hierarchos_rust_config.json`; this is the interoperability boundary for external
+CUDA consumers while the actual native optimizer/training loop stays entirely in
+Rust and Vulkan. Training/checkpoint export carries tokenizer assets into the
+resulting package, so fresh and warm-started outputs remain directly usable by
+the native `chat` command. Minimal token-ID parity fixtures may intentionally omit
+tokenizer assets; those can still be consumed by the lower-level pure-Rust
+inference engine with explicit token IDs.
+
+The main `hierarchos-gui` Training dashboard can launch this same executable by
+selecting **Vulkan (native)**. Its Vulkan parity controls map directly to the
+Rust trainer's precision, AdamW, warmup/cosine schedule, objective weights,
+backward safety caps, TBPTT, recurrent persistence, seed, and shuffle policy.
+Exact resume is fail-closed: the GUI reloads trajectory-defining values and the
+saved precision policy from `training_state.json` before launch, while leaving
+only runtime choices such as output directory, target epoch count, save cadence,
+and Vulkan device topology editable. This prevents an FP16/GradScaler checkpoint
+from being accidentally resumed as a nominally similar FP32/default-optimizer
+run.
+
+End-to-end training-submission profiling is plan-aware rather than limited to
+individual kernel islands. The benchmark can force a memory-safe sequence
+microbatch/checkpoint plan, and the collector persists rank/device/architecture
+geometry plus timing, queue-submission, memory-headroom, and rejected-plan
+records in JSONL:
+
+```powershell
+python tools/benchmark_vulkan_training_submission.py --tokens 8 --sequences 2 --microbatch-size 1 --checkpoint-stride 2
+python tools/benchmark_vulkan_training_submission.py --tokens 8 --sequences 2 --microbatch-size 1 --checkpoint-stride 2 --precision fp16-storage-fp32-compute
+python tools/benchmark_vulkan_training_submission.py --tokens 8 --sequences 2 --microbatch-size 1 --checkpoint-stride 2 --precision fp16-storage-fp16-lm-backward
+python tools/collect_vulkan_training_submission_profiles.py --tokens 4,8,16 --sequences 1,2,4 --microbatches auto,1,2,4 --checkpoint-strides 1,2,4 --numerics strict,fast-recurrent-tree,fast-recurrent-tiled --precisions fp32,fp16-storage-fp32-compute,fp16-storage-fp16-lm-backward
+# Exercise a 64-wide RWKV head with a two-lane WG128 recurrent reduction.
+python tools/collect_vulkan_training_submission_profiles.py --fixture-width 64 --tokens 4 --sequences 1 --microbatches 1 --checkpoint-strides 1 --kernel-geometries 128 --numerics strict,fast-recurrent-tree,fast-recurrent-tiled
+```
+
+The opt-in FP16-storage arm now covers the six recurrent low-rank matrices in
+each H/L tower plus dense `lm_head.weight` forward and hidden-adjoint reads. The
+canonical masters, gradients, AdamW moments, tied embedding reads, and exported
+SafeTensors remain FP32, so a Vulkan-trained package uses the same model-file ABI
+as PyTorch CPU/CUDA and `hierarchos-inference`. FP16 mirror writes use explicit
+IEEE round-to-nearest-ties-to-even rather than driver-dependent half packing, and
+the parity harness checks the post-AdamW LM mirror bit-exactly against the Vulkan
+FP32 master. Benchmark/profile records expose an
+`lm_head_fp16_parameter_storage_active` bit alongside the H/L low-rank bits and
+reject a requested FP16 run if any of those consumers silently falls back.
+
+The first true FP16-compute backward tranche is available as
+`fp16-storage-fp16-lm-backward`. It retains the FP32 softmax/log-sum-exp,
+gradient accumulators, master parameters, AdamW moments, and checkpoint ABI, but
+rounds the final source-scaled CE adjoint to FP16 and executes the LM-head
+`W^T`/`dW` products as native Float16 multiplies before widening each product
+into FP32 accumulation. This precision policy requires Vulkan Float16 + 16-bit
+storage support and never silently degrades to the storage-only arm. The
+Vulkan↔PyTorch/CUDA trajectory gate can pin the same policy on every Vulkan leg
+with `python tools/verify_vulkan_cuda_vulkan_trajectory.py --precision fp16-storage-fp16-lm-backward --require-cuda`.
+
+The dense LM-head FP16 plan now has vocabulary-major CE-tape candidates in
+addition to the row-major baseline. The projection writes compact per-vocabulary
+tile `(max, scaled-exp-sum, target-logit)` partials alongside the reusable logit
+tape, so CE row statistics no longer reread every FP32 logit. A rows16 variant
+keeps packed half2 weights in shared memory and unpacks at FP32 accumulation
+time, reducing the width-448 shared footprint from roughly 30.5 KiB to 16.2 KiB
+while halving vocabulary workgroups versus rows8. On the local 32 KiB,
+subgroup-64 AMD Radeon at vocab 50,257, the width-448 LM backward microprofile
+measured rows16 at about `22.24 ms` versus rows8 at `24.07 ms` for two rows, and
+`38.86 ms` versus `46.13 ms` for eight rows. The LM autotuner selected rows16 in
+both cases; this remains a device/geometry-specific race rather than a global
+default, and it does not alter the FP32 SafeTensors/PyTorch/CUDA/native-inference
+ABI.
+
+This expansion is intentionally not the default yet. On the current AMD Radeon
+Graphics width-32 scheduler fixture, an isolated automatic-plan A/B selected the
+same WG64/microbatch-2 plan for both precision arms, but measured `367.76`
+batch-tokens/s for FP32 versus `346.49` for FP16 storage. Representative
+large-vocabulary geometry must show a stable throughput win before the scheduler
+evidence gate is considered strong enough for default promotion.
+
+The Rust tape scheduler now consumes that JSONL database automatically when it
+is present at `benchmark_results/vulkan_training_submission_profiles.v1.jsonl`.
+For an installed/runtime-specific database, set
+`HIERARCHOS_VULKAN_TAPE_PROFILE_DB=PATH`. Matching is exact across Vulkan device,
+subgroup width, coherent-v9 model geometry, batch, sequence count, and token
+span, compiled H/L backward geometry, RWKV reduction-numerics policy, and
+training precision policy. Legacy profile records mean FP32 precision.
+Matching controlled explicit profiling records are aggregated with recency and
+uncertainty-aware throughput statistics rather than treating one fast sample as
+a universal winner. Automatic-plan
+records remain useful diagnostics but are not re-ingested as training data, so
+the scheduler cannot reinforce its own previous choices. A candidate is never
+selectable unless the live Vulkan memory budget and conservative tape footprint
+model say it fits. Set
+`HIERARCHOS_VULKAN_DISABLE_TAPE_PROFILES=1` to restore the memory-only heuristic,
+or `HIERARCHOS_VULKAN_TAPE_PROFILE_LOG=1` to print profile hits and the safety
+headroom that admitted them.
+
+For a real coherent-v9 PyTorch checkpoint, pass `--source-model MODEL_OR_DIR` to
+the collector. It exports the standard Rust/SafeTensors package into a temporary
+directory before profiling, so the measured execution path is the same package
+contract used for native inference and PyTorch/CUDA interchange. Legacy v8 and
+scalar-RWKV checkpoints remain intentionally fail-closed.
+
 ## Roadmap
 
-  * [ ] Develop a user-friendly GUI wrapper for easier interaction.
+  * [x] Ship a dedicated pure-Rust GUI wrapper for native inference and direct Vulkan training (`hierarchos-native`).
   * [ ] Extend the architecture to support multi-modal inputs (images, audio).
   * [ ] Implement multi-GPU training with DistributedDataParallel / FSDP.
-  * [ ] Implement the entire training loop in Vulkan/CUDA for end-to-end GPU acceleration.
+  * [x] Implement the coherent-v9 full-model training loop in Vulkan with portable FP32-master SafeTensors, AdamW/resume state, TBPTT, mixed-precision policies, and native multi-adapter execution.
+  * [x] Add native parameter-efficient coherent-v9 finetuning over built-in low-rank/shared factors plus Rust SafeTensors LoRA adapter merge parity.
+  * [ ] Add optional on-the-fly arbitrary PEFT-LoRA geometry injection/training without changing the canonical native runtime contract.
   * [ ] Expand DirectML support to Linux via ROCm.
   * [ ] Optimize LTM retrieval with approximate nearest neighbor search for larger memory capacities.
   * [ ] Explore RWKV v8 custom CUDA kernels for fused WKV computation.

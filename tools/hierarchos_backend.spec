@@ -13,6 +13,7 @@ ROOT = Path(SPECPATH).resolve().parent
 
 hiddenimports = collect_submodules("hierarchos")
 hiddenimports += [
+    "hierarchos_cli",
     "huggingface_hub",
     "numpy",
     "safetensors",
@@ -27,6 +28,16 @@ hiddenimports += [
     "transformers",
     "transformers.models.auto.tokenization_auto",
 ]
+
+# HierarchosCLI.exe owns the public CLI surface, but Python-only compatibility
+# modes execute inside this bundled runtime.  Collect their lazily-imported
+# packages explicitly so PEFT LoRA, HF datasets, and lm-eval remain available
+# without requiring a separately installed Python environment.
+for package in ["datasets", "peft", "accelerate", "lm_eval"]:
+    try:
+        hiddenimports += collect_submodules(package)
+    except Exception:
+        pass
 
 datas = [
     (str(ROOT / "hierarchos"), "hierarchos"),
@@ -52,25 +63,35 @@ for package in [
     "safetensors",
     "numpy",
     "tqdm",
+    "datasets",
+    "peft",
+    "accelerate",
+    "lm_eval",
+    "pyarrow",
+    "pandas",
+    "sklearn",
+    "scipy",
 ]:
     try:
         datas += copy_metadata(package)
     except Exception:
         pass
 
+for package in ["datasets", "peft", "accelerate", "lm_eval"]:
+    try:
+        datas += collect_data_files(package, include_py_files=False)
+    except Exception:
+        pass
+
 excludes = [
-    "accelerate",
-    "aiohttp",
     "bitsandbytes",
     "IPython",
     "lxml",
     "mcp",
     "nltk",
     "optuna",
-    "peft",
     "PIL",
     "PIL.ImageQt",
-    "pyarrow",
     "redis",
     "soundfile",
     "sqlalchemy",
@@ -82,19 +103,14 @@ excludes = [
     "boto3",
     "botocore",
     "cv2",
-    "datasets",
     "django",
     "fastapi",
     "jupyter",
-    "lm_eval",
     "matplotlib",
     "notebook",
     "openai",
-    "pandas",
     "pygame",
     "pytest",
-    "scipy",
-    "sklearn",
     "tensorflow",
     "uvicorn",
 ]

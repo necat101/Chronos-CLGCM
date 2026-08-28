@@ -18,6 +18,15 @@ import itertools
 
 from .optimizers import DirectMLAdamW
 from .objectives import adaptive_ponder_objective, resolve_ponder_objective
+from .datasets import (
+    LEGACY_TORCH_SAMPLER_RNG_ALGORITHM,
+    PORTABLE_SAMPLER_RNG_ALGORITHM,
+)
+from .stochastic import (
+    CanonicalDropout,
+    CanonicalRngState,
+    canonical_rng_checkpoint_context_fn,
+)
 from ..utils.device import is_directml_device, set_threads
 from ..utils.tokenizer import validate_inference_tokenizer_identity
 from ..utils.checkpoint import (
@@ -598,13 +607,22 @@ def _checkpointed_training_model_call(model, model_kwargs):
     preserve_rng_state = bool(
         getattr(model, "_hierarchos_checkpoint_preserve_rng_state", False)
     )
-    return activation_checkpoint(
-        run,
-        *values,
+    checkpoint_kwargs = dict(
         use_reentrant=False,
         preserve_rng_state=preserve_rng_state,
         determinism_check="default",
     )
+    canonical_rng = getattr(model, "_hierarchos_canonical_rng_state", None)
+    if isinstance(canonical_rng, CanonicalRngState):
+        if preserve_rng_state:
+            raise RuntimeError(
+                "Canonical Hierarchos stochastic RNG cannot be mixed with active "
+                "backend-native checkpoint RNG replay."
+            )
+        checkpoint_kwargs["context_fn"] = canonical_rng_checkpoint_context_fn(
+            canonical_rng
+        )
+    return activation_checkpoint(run, *values, **checkpoint_kwargs)
 
 
 def _checkpoint_replay_safe_rosa_ids(model, input_ids: torch.Tensor):
@@ -648,8 +666,123 @@ def _checkpoint_replay_safe_rosa_ids(model, input_ids: torch.Tensor):
     )
 
 
+def _active_lora_dropout_entries(model):
+    entries = []
+    for module in model.modules():
+        lora_dropout = getattr(module, "lora_dropout", None)
+        if not isinstance(lora_dropout, nn.ModuleDict):
+            continue
+        for adapter_name, dropout in list(lora_dropout.items()):
+            probability = float(getattr(dropout, "p", 0.0) or 0.0)
+            if probability > 0.0:
+                entries.append((lora_dropout, adapter_name, dropout, probability))
+    return entries
+
+
+def configure_canonical_lora_dropout(model, args, checkpoint=None) -> int:
+    """Move ordinary PEFT LoRA dropout onto the cross-backend Philox cursor.
+
+    New fine-tune trajectories use the canonical counter immediately. Exact
+    resumes from legacy/backend-native checkpoints intentionally retain their
+    historical PyTorch RNG semantics. A canonical checkpoint restores the
+    persisted word cursor before another stochastic forward can reserve words.
+    """
+
+    entries = _active_lora_dropout_entries(model)
+    execution_policy = (
+        checkpoint.get("execution_policy") if isinstance(checkpoint, dict) else None
+    )
+    stochastic_rng = (
+        execution_policy.get("stochastic_rng")
+        if isinstance(execution_policy, dict)
+        else None
+    )
+    saved_mode = (
+        stochastic_rng.get("mode") if isinstance(stochastic_rng, dict) else None
+    )
+
+    if checkpoint is not None and saved_mode != "canonical-counter":
+        # Old checkpoints consumed PyTorch/CUDA RNG state. Switching their
+        # dropout source mid-trajectory would make an "exact" resume inexact.
+        args._canonical_rng_state = None
+        if hasattr(model, "_hierarchos_canonical_rng_state"):
+            delattr(model, "_hierarchos_canonical_rng_state")
+        if saved_mode == "none" and entries:
+            raise RuntimeError(
+                "Checkpoint declares stochastic_rng mode='none' but the resumed "
+                "PEFT model has active LoRA dropout."
+            )
+        return 0
+
+    if checkpoint is not None:
+        canonical_counter = stochastic_rng.get("canonical_counter")
+        if not isinstance(canonical_counter, dict):
+            raise RuntimeError(
+                "Canonical stochastic checkpoint is missing canonical_counter state."
+            )
+        try:
+            rng = CanonicalRngState(
+                seed=int(canonical_counter["seed"]),
+                next_word=int(canonical_counter["next_word"]),
+                algorithm=str(canonical_counter["algorithm"]),
+            )
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                "Canonical stochastic checkpoint has malformed counter state."
+            ) from exc
+        rng.validate()
+    else:
+        if not entries:
+            args._canonical_rng_state = None
+            return 0
+        rng = CanonicalRngState(seed=int(getattr(args, "seed", 1337)))
+        rng.validate()
+
+    peft_dropout_ids = {id(dropout) for _owner, _name, dropout, _p in entries}
+    native_dropout = next(
+        (
+            module
+            for module in model.modules()
+            if isinstance(module, nn.modules.dropout._DropoutNd)
+            and module.training
+            and float(module.p) > 0.0
+            and id(module) not in peft_dropout_ids
+        ),
+        None,
+    )
+    if native_dropout is not None:
+        if checkpoint is not None:
+            raise RuntimeError(
+                "Canonical stochastic checkpoint cannot resume while the model "
+                "contains an active non-LoRA backend-native dropout module."
+            )
+        args._canonical_rng_state = None
+        return 0
+
+    replaced = 0
+    for owner, adapter_name, dropout, probability in entries:
+        if isinstance(dropout, CanonicalDropout):
+            dropout.rng = rng
+            continue
+        if not isinstance(dropout, nn.Dropout):
+            raise RuntimeError(
+                "PEFT LoRA dropout uses an unsupported module type for canonical "
+                f"RNG conversion: {dropout.__class__.__name__}."
+            )
+        replacement = CanonicalDropout(probability, rng)
+        replacement.train(dropout.training)
+        owner[adapter_name] = replacement
+        replaced += 1
+
+    # Keep the cursor on both participants that need it: the model owns runtime
+    # reservations, while args owns checkpoint execution-policy serialization.
+    model._hierarchos_canonical_rng_state = rng
+    args._canonical_rng_state = rng
+    return replaced
+
+
 def configure_checkpoint_rng_policy(model) -> bool:
-    """Record whether activation rematerialization must replay RNG exactly."""
+    """Record whether rematerialization still needs backend-native RNG replay."""
     preserve_rng_state = any(
         isinstance(module, nn.modules.dropout._DropoutNd)
         and module.training
@@ -1747,6 +1880,9 @@ def build_hierarchos_optimizer(model, args, device):
     """RWKV-style AdamW grouping: decay matrices/embeddings, never norms or scalars."""
     lr = args.starting_lr
     weight_decay = float(getattr(args, "rwkv_weight_decay", 0.1))
+    adamw_eps = float(getattr(args, "adamw_eps", 1.0e-8))
+    if not math.isfinite(adamw_eps) or adamw_eps <= 0.0:
+        raise ValueError(f"adamw_eps must be finite and positive, got {adamw_eps}")
     grouping_version = int(getattr(args, "_optimizer_grouping_version", 2) or 2)
     args._optimizer_grouping_version = grouping_version
     decay = []
@@ -1799,10 +1935,10 @@ def build_hierarchos_optimizer(model, args, device):
         f"{len(no_decay)} norm/vector/special tensor(s) without decay."
     )
     if is_directml_device(device):
-        return DirectMLAdamW(param_groups, lr=lr)
+        return DirectMLAdamW(param_groups, lr=lr, eps=adamw_eps)
     if device.type == 'cuda':
-        return torch.optim.AdamW(param_groups, lr=lr, fused=True)
-    return torch.optim.AdamW(param_groups, lr=lr)
+        return torch.optim.AdamW(param_groups, lr=lr, eps=adamw_eps, fused=True)
+    return torch.optim.AdamW(param_groups, lr=lr, eps=adamw_eps)
 
 def estimate_cuda_loss_chunk_rows(free_bytes: int, batch_size: int, chunk_size: int,
                                   vocab_size: int, requested_rows: int = 0) -> int:
@@ -2384,6 +2520,12 @@ def _capture_loader_component_state(component):
                 found = True
             except Exception:
                 pass
+    if hasattr(component, "rng_algorithm"):
+        try:
+            state["rng_algorithm"] = str(component.rng_algorithm)
+            found = True
+        except Exception:
+            pass
     generator = getattr(component, "generator", None)
     if isinstance(generator, torch.Generator):
         try:
@@ -2407,6 +2549,200 @@ def capture_dataloader_state(dataloader):
         if component_state:
             state[name] = component_state
     return state or None
+
+
+PORTABLE_DATA_STREAM_CURSOR_FORMAT = "hierarchos-data-stream-rng-cursor-v1"
+PORTABLE_EXECUTION_POLICY_FORMAT = "hierarchos-training-execution-policy-v1"
+
+
+def _active_resume_sampler(dataloader):
+    if dataloader is None:
+        return None, None
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if hasattr(batch_sampler, "set_start_batch") and hasattr(batch_sampler, "rng_algorithm"):
+        return "length-grouped-batch", batch_sampler
+    sample_sampler = getattr(batch_sampler, "sampler", None)
+    if sample_sampler is None:
+        sample_sampler = getattr(dataloader, "sampler", None)
+    if hasattr(sample_sampler, "set_start_index") and hasattr(sample_sampler, "rng_algorithm"):
+        return "epoch-shuffle", sample_sampler
+    return None, None
+
+
+def capture_data_stream_cursor(dataloader, batch_cursor: int = 0):
+    """Capture a Python-free deterministic data-order recipe for cross-backend resume."""
+
+    sampler_kind, sampler = _active_resume_sampler(dataloader)
+    if sampler is None:
+        return None
+    algorithm = str(getattr(sampler, "rng_algorithm", ""))
+    if algorithm != PORTABLE_SAMPLER_RNG_ALGORITHM:
+        return None
+    try:
+        dataset_size = int(len(getattr(dataloader, "dataset", None)))
+    except Exception:
+        return None
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    batch_size = getattr(sampler, "batch_size", None)
+    if batch_size is None:
+        batch_size = getattr(batch_sampler, "batch_size", None)
+    if batch_size is None:
+        batch_size = getattr(dataloader, "batch_size", None)
+    if batch_size is None:
+        return None
+    cursor = {
+        "format": PORTABLE_DATA_STREAM_CURSOR_FORMAT,
+        "sampler_kind": sampler_kind,
+        "rng_algorithm": algorithm,
+        "seed": int(getattr(sampler, "seed")),
+        "epoch": int(getattr(sampler, "epoch", 0)),
+        "batch_cursor": max(0, int(batch_cursor or 0)),
+        "dataset_size": dataset_size,
+        "batch_size": int(batch_size),
+        "shuffle": bool(getattr(sampler, "shuffle", False)),
+    }
+    if sampler_kind == "length-grouped-batch":
+        cursor.update({
+            "drop_last": bool(getattr(sampler, "drop_last", False)),
+            "bucket_size": int(getattr(sampler, "bucket_size")),
+            "preserve_order": bool(getattr(sampler, "preserve_order", False)),
+        })
+    else:
+        cursor["drop_last"] = bool(getattr(batch_sampler, "drop_last", False))
+    return cursor
+
+
+def restore_data_stream_cursor(dataloader, cursor, *, strict: bool = False):
+    """Restore a canonical data-order recipe without Python/PyTorch RNG blobs."""
+
+    if not cursor:
+        if strict:
+            raise RuntimeError("Exact mid-epoch resume requires a portable data-stream cursor.")
+        return False
+    if not isinstance(cursor, dict) or cursor.get("format") != PORTABLE_DATA_STREAM_CURSOR_FORMAT:
+        if strict:
+            raise RuntimeError("Saved portable data-stream cursor has an unsupported format.")
+        return False
+    sampler_kind, sampler = _active_resume_sampler(dataloader)
+    if sampler is None or sampler_kind != cursor.get("sampler_kind"):
+        if strict:
+            raise RuntimeError("Portable data-stream sampler topology changed across exact resume.")
+        return False
+    if cursor.get("rng_algorithm") != PORTABLE_SAMPLER_RNG_ALGORITHM:
+        if strict:
+            raise RuntimeError("Portable data-stream cursor uses an unsupported RNG algorithm.")
+        return False
+    try:
+        runtime_dataset_size = int(len(getattr(dataloader, "dataset", None)))
+        saved_dataset_size = int(cursor["dataset_size"])
+        saved_batch_size = int(cursor["batch_size"])
+        saved_seed = int(cursor["seed"])
+        saved_epoch = int(cursor["epoch"])
+        batch_cursor = max(0, int(cursor["batch_cursor"]))
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        if strict:
+            raise RuntimeError("Portable data-stream cursor is malformed.") from exc
+        return False
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    runtime_batch_size = getattr(sampler, "batch_size", None)
+    if runtime_batch_size is None:
+        runtime_batch_size = getattr(batch_sampler, "batch_size", None)
+    if runtime_batch_size is None:
+        runtime_batch_size = getattr(dataloader, "batch_size", None)
+    geometry_matches = (
+        runtime_dataset_size == saved_dataset_size
+        and runtime_batch_size is not None
+        and int(runtime_batch_size) == saved_batch_size
+        and bool(getattr(sampler, "shuffle", False)) == bool(cursor.get("shuffle", False))
+    )
+    if sampler_kind == "length-grouped-batch":
+        geometry_matches = geometry_matches and all((
+            bool(getattr(sampler, "drop_last", False)) == bool(cursor.get("drop_last", False)),
+            int(getattr(sampler, "bucket_size")) == int(cursor.get("bucket_size", -1)),
+            bool(getattr(sampler, "preserve_order", False)) == bool(cursor.get("preserve_order", False)),
+        ))
+    if not geometry_matches:
+        if strict:
+            raise RuntimeError("Portable data-stream geometry changed across exact resume.")
+        return False
+    sampler.rng_algorithm = PORTABLE_SAMPLER_RNG_ALGORITHM
+    sampler.seed = saved_seed
+    sampler.epoch = saved_epoch
+    if not set_dataloader_start_batch(dataloader, batch_cursor):
+        if strict:
+            raise RuntimeError("Portable data-stream cursor has no compatible runtime cursor target.")
+        return False
+    print("INFO: Restored backend-neutral data-stream/RNG cursor from checkpoint.")
+    return True
+
+
+def capture_training_execution_policy(args, scaler=None, *, pending_gradients: bool = False):
+    """Describe numerical execution state separately from model/optimizer semantics."""
+
+    amp_enabled = bool(getattr(args, "amp", False))
+    amp_dtype = str(getattr(args, "amp_dtype", "float16") or "float16")
+    compute_dtype = amp_dtype if amp_enabled else "float32"
+    loss_scaling = {"mode": "none", "pending_gradients_scaled": False}
+    if scaler is not None:
+        raw = dict(scaler.state_dict())
+        loss_scaling = {
+            "mode": "dynamic",
+            "scale": float(raw.get("scale", scaler.get_scale())),
+            "growth_factor": float(raw.get("growth_factor", 2.0)),
+            "backoff_factor": float(raw.get("backoff_factor", 0.5)),
+            "growth_interval": int(raw.get("growth_interval", 2000)),
+            "growth_tracker": int(raw.get("_growth_tracker", 0)),
+            "pending_gradients_scaled": bool(pending_gradients),
+        }
+    canonical_rng = getattr(args, "_canonical_rng_state", None)
+    stochastic_rng = (
+        canonical_rng.execution_policy_state()
+        if isinstance(canonical_rng, CanonicalRngState)
+        else {"mode": "backend-native", "state_required": True}
+    )
+    return {
+        "format": PORTABLE_EXECUTION_POLICY_FORMAT,
+        "source_backend": str(getattr(args, "_resolved_training_backend", "unknown")),
+        "compute_dtype": compute_dtype,
+        "autocast_enabled": amp_enabled,
+        # Canonical LoRA dropout persists only a backend-neutral Philox cursor.
+        # Legacy/other stochastic PyTorch modules retain the backend-native
+        # declaration so exact resume continues to require their RNG blobs.
+        "stochastic_rng": stochastic_rng,
+        "loss_scaling": loss_scaling,
+    }
+
+
+def scaler_state_from_execution_policy(policy):
+    if not isinstance(policy, dict) or policy.get("format") != PORTABLE_EXECUTION_POLICY_FORMAT:
+        return None
+    scaling = policy.get("loss_scaling")
+    if not isinstance(scaling, dict) or scaling.get("mode") != "dynamic":
+        return None
+    return {
+        "scale": float(scaling["scale"]),
+        "growth_factor": float(scaling["growth_factor"]),
+        "backoff_factor": float(scaling["backoff_factor"]),
+        "growth_interval": int(scaling["growth_interval"]),
+        "_growth_tracker": int(scaling["growth_tracker"]),
+    }
+
+
+def scale_canonical_pending_gradients_for_amp_(model, scaler):
+    """Move unscaled cross-backend pending gradients into GradScaler's domain."""
+
+    if scaler is None:
+        return False
+    scale = float(scaler.get_scale())
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise RuntimeError(f"Invalid AMP loss scale {scale!r} during checkpoint resume.")
+    scaled = False
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale)
+                scaled = True
+    return scaled
 
 def _restore_loader_component_state(component, state, *, strict: bool = False):
     if component is None or not state:
@@ -2444,6 +2780,23 @@ def _restore_loader_component_state(component, state, *, strict: bool = False):
                     raise RuntimeError(
                         f"Could not restore dataloader {attr} for exact resume."
                     ) from exc
+    if hasattr(component, "rng_algorithm"):
+        saved_algorithm = state.get("rng_algorithm")
+        if saved_algorithm is None:
+            # Checkpoints written before the portable sampler contract used
+            # torch.Generator/randperm. Force that recipe during strict legacy
+            # resume so upgrading Hierarchos does not silently reorder data.
+            if strict:
+                component.rng_algorithm = LEGACY_TORCH_SAMPLER_RNG_ALGORITHM
+        elif saved_algorithm in {
+            PORTABLE_SAMPLER_RNG_ALGORITHM,
+            LEGACY_TORCH_SAMPLER_RNG_ALGORITHM,
+        }:
+            component.rng_algorithm = str(saved_algorithm)
+        elif strict:
+            raise RuntimeError(
+                f"Unsupported saved dataloader RNG algorithm {saved_algorithm!r}."
+            )
     generator = getattr(component, "generator", None)
     if "generator_state" in state:
         if not isinstance(generator, torch.Generator):
@@ -2506,6 +2859,29 @@ _EXACT_RESUME_SCHEDULE_KEYS = (
 )
 
 
+# These controls change device execution, memory/recomputation strategy, or
+# floating-point reduction order without changing the learned objective or data
+# cursor. A Vulkan -> PyTorch/CUDA handoff must be allowed to change them, while
+# same-backend ``.pt`` resumes remain bit-for-bit strict about the full set.
+_PORTABLE_BACKEND_EXECUTION_KEYS = {
+    "_resolved_training_backend",
+    "amp",
+    "amp_dtype",
+    "cuda_chunked_lm_loss",
+    "cuda_loss_chunk_rows",
+    "cpu_chunked_lm_loss",
+    "cpu_loss_chunk_rows",
+    "gradient_checkpointing",
+    "compile",
+    "force_compile",
+    "compile_mode",
+    "compile_static_worker_loop",
+    "compile_pad_to_chunk_size",
+    "full_sample_activation_checkpointing",
+    "full_sample_checkpoint_segment_size",
+}
+
+
 _EXACT_RESUME_ARG_KEYS = (
     "seed",
     "batch_size",
@@ -2557,6 +2933,7 @@ _EXACT_RESUME_ARG_KEYS = (
     "max_ponder_cost_for_backward",
     "max_commitment_cost_for_backward",
     "rwkv_weight_decay",
+    "adamw_eps",
     "startup_weight_max_abs",
     "ponder_loss_weight",
     "adaptive_ponder",
@@ -2768,12 +3145,32 @@ def _identity_mismatches(saved, current, path="run_identity"):
     return mismatches
 
 
+def _portable_backend_identity_view(identity):
+    """Remove execution-only fields for an explicit cross-backend handoff.
+
+    Dataset identity, tokenizer behavior, architecture, optimizer grouping,
+    accumulation geometry, recurrent detach policy, loss semantics, gradient
+    transforms, and LR schedules remain strict. Only backend implementation
+    choices that cannot be shared between Vulkan and PyTorch/CUDA are ignored.
+    """
+
+    if not isinstance(identity, dict):
+        return identity
+    portable = dict(identity)
+    objective = dict(portable.get("objective") or {})
+    for key in _PORTABLE_BACKEND_EXECUTION_KEYS:
+        objective.pop(key, None)
+    portable["objective"] = objective
+    return portable
+
+
 def validate_exact_resume_identity(
     checkpoint,
     current_identity,
     checkpoint_path,
     *,
     allow_schedule_rebuild=False,
+    allow_execution_backend_transition=False,
 ):
     loader_identity = (
         current_identity.get("loader")
@@ -2906,6 +3303,10 @@ def validate_exact_resume_identity(
         # Public None means "inherit min_lr"; compare the effective curve
         # rather than treating equivalent serialized spellings as drift.
         saved_objective["min_ltm_lr"] = saved_objective.get("min_lr")
+    # AdamW epsilon was an implicit framework default before it became part of
+    # the portable optimizer contract. Preserve exact-resume compatibility for
+    # those checkpoints by authenticating the historical value explicitly.
+    saved_objective.setdefault("adamw_eps", 1.0e-8)
     saved_for_compare["objective"] = saved_objective
     saved_dataset = dict(saved_for_compare.get("dataset") or {})
     saved_dataset.setdefault(
@@ -2914,10 +3315,20 @@ def validate_exact_resume_identity(
     )
     saved_for_compare["dataset"] = saved_dataset
     current_for_compare = current_identity
+    if isinstance(current_identity, dict):
+        # Compare the effective optimizer contract on both sides. A current
+        # identity produced by an older/minimal caller can omit AdamW epsilon
+        # for the same reason a historical checkpoint can: PyTorch's default
+        # was implicitly 1e-8. Normalizing only the saved side manufactures a
+        # cross-backend resume mismatch even when both runs use that default.
+        current_for_compare = dict(current_identity)
+        current_objective = dict(current_for_compare.get("objective") or {})
+        current_objective.setdefault("adamw_eps", 1.0e-8)
+        current_for_compare["objective"] = current_objective
     saved_tokenizer = saved_for_compare.get("tokenizer")
     current_tokenizer = (
-        current_identity.get("tokenizer")
-        if isinstance(current_identity, dict)
+        current_for_compare.get("tokenizer")
+        if isinstance(current_for_compare, dict)
         else None
     )
     if (
@@ -2930,10 +3341,13 @@ def validate_exact_resume_identity(
         # digest. Preserve those checkpoints' established resume contract by
         # comparing the fields they actually authenticated. New v2 checkpoints
         # retain the field and therefore fail closed on any tokenizer-rule drift.
-        current_for_compare = dict(current_identity)
+        current_for_compare = dict(current_for_compare)
         current_tokenizer = dict(current_tokenizer)
         current_tokenizer.pop("behavior_sha256_v2", None)
         current_for_compare["tokenizer"] = current_tokenizer
+    if allow_execution_backend_transition:
+        saved_for_compare = _portable_backend_identity_view(saved_for_compare)
+        current_for_compare = _portable_backend_identity_view(current_for_compare)
     mismatches = _identity_mismatches(saved_for_compare, current_for_compare)
     schedule_prefixes = tuple(
         f"run_identity.objective.{key}"
@@ -2977,24 +3391,45 @@ def validate_exact_resume_identity(
             f"data objective. {recovery}"
         )
     if mid_epoch_step > 0:
-        data_state = checkpoint.get("data_state")
-        if not isinstance(data_state, dict) or not data_state:
-            raise RuntimeError(
-                "Exact mid-epoch resume requires a non-empty saved dataloader "
-                f"state in {checkpoint_path}. Resume from an epoch boundary, or "
-                "use --model-path for an intentional weights-only continuation."
-            )
-        rng_state = checkpoint.get("rng_state")
-        required_rng_keys = {"python", "numpy", "torch"}
-        if (
-            not isinstance(rng_state, dict)
-            or not required_rng_keys.issubset(rng_state)
-        ):
-            raise RuntimeError(
-                "Exact mid-epoch resume requires complete Python/NumPy/PyTorch "
-                f"RNG state in {checkpoint_path}. Resume from an epoch boundary, "
-                "or use --model-path for an intentional weights-only continuation."
-            )
+        stream_cursor = checkpoint.get("data_stream_cursor")
+        has_portable_stream = (
+            isinstance(stream_cursor, dict)
+            and stream_cursor.get("format") == PORTABLE_DATA_STREAM_CURSOR_FORMAT
+        )
+        if not has_portable_stream:
+            data_state = checkpoint.get("data_state")
+            if not isinstance(data_state, dict) or not data_state:
+                raise RuntimeError(
+                    "Exact mid-epoch resume requires a portable data-stream cursor "
+                    "or non-empty saved dataloader state in "
+                    f"{checkpoint_path}. Resume from an epoch boundary, or use "
+                    "--model-path for an intentional weights-only continuation."
+                )
+        execution_policy = checkpoint.get("execution_policy")
+        stochastic_rng = (
+            execution_policy.get("stochastic_rng")
+            if isinstance(execution_policy, dict)
+            else None
+        )
+        backend_rng_required = not (
+            isinstance(stochastic_rng, dict)
+            and stochastic_rng.get("mode") in {"none", "canonical-counter"}
+            and not bool(stochastic_rng.get("state_required", False))
+        )
+        if backend_rng_required:
+            rng_state = checkpoint.get("rng_state")
+            required_rng_keys = {"python", "numpy", "torch"}
+            if (
+                not isinstance(rng_state, dict)
+                or not required_rng_keys.issubset(rng_state)
+            ):
+                raise RuntimeError(
+                    "Exact mid-epoch resume requires complete Python/NumPy/PyTorch "
+                    f"RNG state in {checkpoint_path} because its execution policy "
+                    "declares backend-native stochastic RNG. Resume from an epoch "
+                    "boundary, or use --model-path for an intentional weights-only "
+                    "continuation."
+                )
     if is_iterable:
         print(
             "WARNING: IterableDataset identity/topology matched at an epoch "
@@ -3073,6 +3508,10 @@ def build_training_checkpoint(
         "architecture_contract_sha256": model_architecture_hash,
         "rng_state": capture_rng_state(),
         "data_state": capture_dataloader_state(dataloader),
+        "data_stream_cursor": capture_data_stream_cursor(
+            dataloader,
+            mid_epoch_step,
+        ),
         "grad_state_dict": grad_state,
         "grad_accumulation_active": bool(grad_state),
         "grad_state_keys": tuple(sorted(grad_state)) if grad_state else (),
@@ -3096,6 +3535,11 @@ def build_training_checkpoint(
             ),
         },
         "best_metric_state": getattr(args, "_best_metric_state", None),
+        "execution_policy": capture_training_execution_policy(
+            args,
+            scaler,
+            pending_gradients=bool(grad_state),
+        ),
         "training_complete": False,
     }
     # Independent shuffled samples never consume the terminal recurrent/ROSA
@@ -4502,6 +4946,7 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
     scaler = None
     scheduler = None
     checkpoint = None
+    vulkan_training_package = None
     # NOTE: use_amp MUST be read AFTER the CUDA block above, which may auto-enable AMP.
     use_amp = getattr(args, 'amp', False)
     epoch_offset = (
@@ -4575,6 +5020,159 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
         optimizer = build_hierarchos_optimizer(model, args, device)
         if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16':
             scaler = GradScaler()
+
+    elif (
+        args.resume_from_ckpt
+        and os.path.isdir(args.resume_from_ckpt)
+        and os.path.isfile(os.path.join(args.resume_from_ckpt, "training_state.json"))
+    ):
+        from tools.vulkan_optimizer_bridge import (
+            load_vulkan_training_package_into_torch,
+            read_vulkan_training_manifest,
+            read_vulkan_training_replay,
+        )
+
+        print(f"Resuming from Vulkan training package: {args.resume_from_ckpt}")
+        if reset_optimizer_state_requested(args):
+            raise ValueError(
+                "--resume-from-ckpt with a Vulkan package is an exact training-state "
+                "handoff and cannot reset AdamW moments. Use --model-path on the same "
+                "package for an intentional weights-only continuation."
+            )
+        vulkan_manifest = read_vulkan_training_manifest(args.resume_from_ckpt)
+        replay_checkpoint = read_vulkan_training_replay(
+            args.resume_from_ckpt,
+            vulkan_manifest,
+        )
+        if replay_checkpoint is None:
+            raise RuntimeError(
+                "This Vulkan training package has model/optimizer state but no portable "
+                "host replay companion. Exact --resume-from-ckpt requires DataLoader, "
+                "RNG, scheduler, and recurrent replay state; attach training_replay.json/"
+                "training_replay.safetensors first, or use --model-path for a deliberate "
+                "weights-only continuation."
+            )
+        checkpoint = dict(replay_checkpoint)
+        args._optimizer_grouping_version = int(
+            checkpoint.get("optimizer_grouping_version", 2) or 2
+        )
+
+        model, loaded_model_config = load_full_model_with_config(
+            args.resume_from_ckpt,
+            device,
+        )
+        if validate_inference_tokenizer_identity(
+            tokenizer,
+            getattr(model, "_hierarchos_checkpoint_metadata", None),
+        ):
+            print("INFO: Vulkan-package tokenizer content fingerprint verified.")
+        else:
+            print(
+                "WARNING: Vulkan package has no tokenizer content fingerprint; "
+                "only vocabulary-size compatibility can be checked."
+            )
+        loaded_config = dict(loaded_model_config)
+        runtime_config = AttrDict(loaded_config)
+        runtime_config.update(dict(config))
+        for key in (
+            'vocab_size',
+            'context_dim',
+            'persistent_dim',
+            'ltm_slots',
+            'ltm_key_dim',
+            'ltm_val_dim',
+            'ltm_topk',
+            'h_hidden',
+            'l_hidden',
+            'h_stride',
+            'max_h_steps',
+            'max_l_steps',
+            'min_h_steps',
+            'architecture_revision',
+            'core_recurrence_version',
+            'drift_recurrence_mode',
+            'rwkv_state_readout_mode',
+            'manager_state_commit_mode',
+            'manager_compute_mode',
+            'commitment_cost_mode',
+            'use_deepembed',
+            'deepembed_mode',
+            'use_rosa',
+            'rosa_embedding_mode',
+            'token_adapter_rank',
+            'memory_token_routers',
+            'rosa_max_context',
+            'enforce_rosa_max_context',
+            'rosa_zero_no_prediction',
+            'rwkv_head_size',
+            'h_rwkv_head_size',
+            'l_rwkv_head_size',
+        ):
+            if key in loaded_config:
+                runtime_config[key] = loaded_config[key]
+        model_config = runtime_config
+        model_config.compile = args.compile
+        _apply_runtime_model_config_overrides(model_config, args)
+        model.config = model_config
+        checkpoint.setdefault("config", dict(loaded_config))
+
+        optimizer = build_hierarchos_optimizer(model, args, device)
+        vulkan_training_package = load_vulkan_training_package_into_torch(
+            model,
+            optimizer,
+            args.resume_from_ckpt,
+        )
+        if vulkan_training_package.replay_state is None:
+            raise RuntimeError("Vulkan replay state disappeared while loading the package")
+        if vulkan_training_package.pytorch_accumulation_normalization is not None:
+            args.accumulation_normalization = (
+                vulkan_training_package.pytorch_accumulation_normalization
+            )
+            config.accumulation_normalization = args.accumulation_normalization
+
+        start_epoch = int(checkpoint.get('completed_epoch', 0) or 0)
+        start_step = int(checkpoint.get('mid_epoch_step', 0) or 0)
+        if start_step >= dataloader_len:
+            start_epoch += 1
+            start_step = 0
+        if start_epoch >= int(getattr(args, 'epochs', 0) or 0):
+            raise ValueError(
+                f"Vulkan checkpoint is already at completed_epoch={start_epoch}, "
+                f"but --epochs={args.epochs}; choose a larger total target epoch."
+            )
+        if start_step > 0:
+            print(
+                f"Loaded Vulkan model + AdamW state. Resuming PyTorch on {device} "
+                f"from epoch {start_epoch + 1}, step {start_step}."
+            )
+        else:
+            print(
+                f"Loaded Vulkan model + AdamW state. Resuming PyTorch on {device} "
+                f"from epoch {start_epoch + 1}."
+            )
+        if use_amp and getattr(config, 'amp_dtype', 'float16') == 'float16':
+            scaler = GradScaler()
+            source_policy = checkpoint.get("execution_policy")
+            source_loss_scaling = (
+                source_policy.get("loss_scaling")
+                if isinstance(source_policy, dict)
+                else None
+            )
+            if (
+                isinstance(source_loss_scaling, dict)
+                and source_loss_scaling.get("mode") == "dynamic"
+            ):
+                _restore_resume_component_state(
+                    scaler,
+                    checkpoint.get('scaler_state_dict'),
+                    "AMP scaler",
+                    args.resume_from_ckpt,
+                )
+            else:
+                print(
+                    "INFO: Target CUDA FP16 execution starts a fresh loss scaler; "
+                    "the Vulkan checkpoint carries canonical unscaled optimizer semantics."
+                )
 
     elif args.resume_from_ckpt:
         print(f"Resuming from checkpoint: {args.resume_from_ckpt}")
@@ -4872,6 +5470,9 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
             args._run_identity,
             args.resume_from_ckpt,
             allow_schedule_rebuild=rebuild_lr_schedule_requested(args),
+            allow_execution_backend_transition=(
+                vulkan_training_package is not None
+            ),
         )
     # ----------------------------------------------------
 
@@ -4987,23 +5588,68 @@ def train(args, device, tokenizer, dataloader, dataloader_len, model_override=No
     args._accumulation_weighted_token_mass = 0.0
     if checkpoint:
         exact_mid_epoch = start_step > 0
-        restore_dataloader_state(
-            dataloader,
-            checkpoint.get('data_state'),
-            strict=exact_mid_epoch,
+        stream_restored = False
+        if checkpoint.get("data_stream_cursor") is not None:
+            stream_restored = restore_data_stream_cursor(
+                dataloader,
+                checkpoint.get("data_stream_cursor"),
+                strict=exact_mid_epoch,
+            )
+        if not stream_restored:
+            restore_dataloader_state(
+                dataloader,
+                checkpoint.get('data_state'),
+                strict=exact_mid_epoch,
+            )
+        execution_policy = checkpoint.get("execution_policy")
+        stochastic_rng = (
+            execution_policy.get("stochastic_rng")
+            if isinstance(execution_policy, dict)
+            else None
         )
-        restore_rng_state(
-            checkpoint.get('rng_state'),
-            strict=exact_mid_epoch,
-            require_cuda=exact_mid_epoch and device.type == "cuda",
+        backend_rng_required = not (
+            isinstance(stochastic_rng, dict)
+            and stochastic_rng.get("mode") in {"none", "canonical-counter"}
+            and not bool(stochastic_rng.get("state_required", False))
         )
-        restored_pending_grads = restore_checkpoint_gradient_accumulation(
-            model,
-            checkpoint,
-            args,
-            device,
-            scope="Checkpoint",
-        )
+        if backend_rng_required:
+            restore_rng_state(
+                checkpoint.get('rng_state'),
+                strict=exact_mid_epoch,
+                require_cuda=exact_mid_epoch and device.type == "cuda",
+            )
+        if vulkan_training_package is not None:
+            restored_pending_grads = (
+                vulkan_training_package.pending_gradients is not None
+            )
+            if restored_pending_grads:
+                args._accumulation_weighted_token_mass = float(
+                    vulkan_training_package.consumed_weighted_token_mass
+                )
+                if args.accumulation_normalization != "weighted-token":
+                    raise RuntimeError(
+                        "Vulkan pending gradients require weighted-token "
+                        "normalization after bridge restoration."
+                    )
+                if scaler is not None:
+                    scale_canonical_pending_gradients_for_amp_(model, scaler)
+                    print(
+                        "INFO: Lifted canonical Vulkan pending gradients into "
+                        f"the target FP16 loss-scale domain ({scaler.get_scale():.0f}x)."
+                    )
+                print(
+                    "INFO: Restored Vulkan in-flight gradient accumulation "
+                    f"({len(vulkan_training_package.pending_gradients.slot_names)} "
+                    "canonical parameter slots)."
+                )
+        else:
+            restored_pending_grads = restore_checkpoint_gradient_accumulation(
+                model,
+                checkpoint,
+                args,
+                device,
+                scope="Checkpoint",
+            )
         exact_running_states = validate_exact_running_states(
             checkpoint,
             args,
@@ -5625,7 +6271,17 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
     # flipped back recursively, which would enable inference-only recurrence,
     # disable training detachment/checkpointing, and change LoRA dropout.
     ensure_finetune_training_mode(model)
+    canonical_lora_dropouts = configure_canonical_lora_dropout(
+        model,
+        args,
+        checkpoint=checkpoint,
+    )
     checkpoint_replays_rng = configure_checkpoint_rng_policy(model)
+    if canonical_lora_dropouts:
+        print(
+            "INFO: PEFT LoRA dropout now consumes the backend-neutral Hierarchos "
+            "Philox reservation cursor."
+        )
     if checkpoint_replays_rng and bool(
         getattr(args, "full_sample_activation_checkpointing", False)
     ):
@@ -5745,16 +6401,36 @@ def finetune(args, device, tokenizer, dataloader, dataloader_len):
             allow_schedule_rebuild=rebuild_lr_schedule_requested(args),
         )
         exact_mid_epoch = int(start_step or 0) > 0
-        restore_dataloader_state(
-            dataloader,
-            checkpoint.get("data_state"),
-            strict=exact_mid_epoch,
+        stream_restored = False
+        if checkpoint.get("data_stream_cursor") is not None:
+            stream_restored = restore_data_stream_cursor(
+                dataloader,
+                checkpoint.get("data_stream_cursor"),
+                strict=exact_mid_epoch,
+            )
+        if not stream_restored:
+            restore_dataloader_state(
+                dataloader,
+                checkpoint.get("data_state"),
+                strict=exact_mid_epoch,
+            )
+        execution_policy = checkpoint.get("execution_policy")
+        stochastic_rng = (
+            execution_policy.get("stochastic_rng")
+            if isinstance(execution_policy, dict)
+            else None
         )
-        restore_rng_state(
-            checkpoint.get("rng_state"),
-            strict=exact_mid_epoch,
-            require_cuda=exact_mid_epoch and device.type == "cuda",
+        backend_rng_required = not (
+            isinstance(stochastic_rng, dict)
+            and stochastic_rng.get("mode") in {"none", "canonical-counter"}
+            and not bool(stochastic_rng.get("state_required", False))
         )
+        if backend_rng_required:
+            restore_rng_state(
+                checkpoint.get("rng_state"),
+                strict=exact_mid_epoch,
+                require_cuda=exact_mid_epoch and device.type == "cuda",
+            )
         validate_exact_running_states(
             checkpoint,
             args,

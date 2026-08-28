@@ -1,5 +1,10 @@
 import numpy as np
-import hierarchos_matmul
+import pytest
+
+hierarchos_matmul = pytest.importorskip(
+    "hierarchos_matmul",
+    reason="optional C++ quantized matmul extension is not built",
+)
 import time
 import inspect
 
