@@ -1,53 +1,192 @@
 -----
 
-# Hierarchos Alpha v0.30
+# Hierarchos Alpha v0.30 — Native/Vulkan Major Update
 
-> **Current release: Hierarchos Alpha v0.30.** New training runs use the
-> RWKV-v9 core with corrected manager/worker recurrence, hard per-row ACT,
-> bounded ROSA, shared factorized token adapters, persisted memory-gate schedule
-> state, a causally trained transactional fast-memory writer, full-precision
-> train/chat parity controls, and fail-closed checkpoint/resume boundaries. A
-> reference `448/448/448` Alpha v0.30 model with the GPT-2 vocabulary has
-> `30,227,653` unique parameters and `102`
-> state-dict entries. The historical RWKV-v8 design has `232,516,229`
-> parameters and `95` state-dict entries.
->
-> **Naming boundary:** `v0.30` is the Hierarchos product release. RWKV-v8 and
-> RWKV-v9 identify core architecture generations; they are not Hierarchos
-> release numbers. The literal values `legacy-v8` and `coherent-v9` remain in
-> CLI/config/checkpoint metadata solely as compatibility-stable internal
-> architecture identifiers.
->
-> v2/v3 checkpoints remain on the internal `legacy-v8` contract; they are not
-> silently reinterpreted as RWKV-v9. Quantized `.npz` export/inference is
-> intentionally unsupported because the old scalar-RWKV path cannot reproduce
-> the active matrix-state contract. Read the
-> [RWKV-v9 migration notes](COHERENT_V9_MIGRATION.md) before starting,
-> resuming, fine-tuning, or merging an expensive run.
->
-> **Native backend:** Alpha v0.30 also ships an independent Rust/Vulkan path in
-> `hierarchos-vulkan/`, `hierarchos-inference/`, and `hierarchos-native-cli/`.
-> The native binaries do not import, embed, or launch Python/PyTorch. They use
-> the canonical SafeTensors parameter contract for interchange with other
-> runtimes. Native `train` can either start from an existing canonical package
-> or initialize a fresh coherent-v9 package directly from local tokenizer assets;
-> native inference/chat is implemented in Rust and native training/optimization
-> uses Vulkan compute. Framework-specific workflows remain outside the native
-> backend and fail closed instead of being silently delegated. For the isolated
-> native build, binary layout, training commands, and exact interoperability
-> boundary, see [NATIVE_BACKEND.md](NATIVE_BACKEND.md).
->
-> Release-gate totals are deliberately not frozen as the regression suite grows.
-> For the Python/framework runtime, execute `python -m pytest -q` and
-> `python tools/check_architecture_integrity.py --strict` before a paid run. For
-> the isolated Rust/Vulkan runtime, use `tools/build_native_release.ps1`; that
-> builder runs the native Rust gates, audits the dependency trees for
-> Python/libtorch bindings, builds the production binaries, and probes Vulkan.
+> [!IMPORTANT]
+> **Hierarchos Native is now the primary execution path and the center of active
+> backend development.** Alpha v0.30 can initialize, train, fine-tune, resume,
+> load, chat with, and benchmark coherent-v9 / RWKV-v9 model packages without a
+> Python or PyTorch runtime. Rust owns model/package orchestration, tokenization,
+> inference, the CLI, and the native GUI; full-model training and optimization
+> run through Vulkan compute.
 
-## RWKV core v8 to v9 architecture flow
+The native stack is intentionally framework-free at runtime:
 
-The diagram compares core architecture generations inside Hierarchos. The
-right-hand side is the core used by **Hierarchos Alpha v0.30**.
+- **`hierarchos-vulkan/`** — Vulkan compute training, backward passes, gradient
+  accumulation, AdamW, mixed-storage precision policies, checkpointing, device
+  discovery, and GPU profiling.
+- **`hierarchos-inference/`** — pure-Rust coherent-v9 model loading and inference.
+- **`hierarchos-native-cli/`** — native `train`, `finetune`, `chat`, `benchmark`,
+  `devices`, Hugging Face transport, package conversion/validation, and LoRA
+  merge workflows.
+- **`hierarchos-gui/`** — the dedicated `HierarchosNative.exe` Rust GUI, sharing
+  the same native model and Vulkan training path rather than wrapping Python.
+- **Canonical SafeTensors packages** are the interchange boundary. Native Vulkan
+  training keeps FP32 master parameters and writes portable model plus
+  backend-neutral resume state that can be consumed by the Rust runtime or by
+  external implementations that understand the Hierarchos tensor contract.
+
+Python/PyTorch remains in the repository as a reference, compatibility, and
+research implementation. It is no longer the recommended starting point for a
+normal Hierarchos v0.30 build or local training workflow. Framework-only
+features remain explicit and fail closed from the native CLI instead of causing
+an invisible fallback to Python.
+
+## Native-first architecture
+
+```text
+                         HIERARCHOS ALPHA v0.30
+                              native path
+
+     +----------------------+        +-----------------------+
+     | HierarchosNative.exe |        |   HierarchosCLI.exe   |
+     |      Rust GUI        |        |       Rust CLI        |
+     +----------+-----------+        +-----------+-----------+
+                |                                |
+                +---------------+----------------+
+                                |
+                                v
+                 +------------------------------+
+                 | Rust package/model frontend  |
+                 | tokenizer + config + HF I/O  |
+                 +---------------+--------------+
+                                 |
+                  +--------------+--------------+
+                  |                             |
+                  v                             v
+     +---------------------------+   +---------------------------+
+     | hierarchos-inference      |   | hierarchos-vulkan         |
+     | coherent-v9 Rust runtime  |   | forward/backward + AdamW  |
+     | chat + recurrent state    |   | full-model Vulkan training|
+     +-------------+-------------+   +-------------+-------------+
+                   |                               |
+                   +---------------+---------------+
+                                   |
+                                   v
+                    +-----------------------------+
+                    | Canonical SafeTensors model |
+                    | + portable resume sidecars  |
+                    +-----------------------------+
+```
+
+This split keeps the hot path native while preserving a stable model-package
+contract across implementations. "CUDA compatible" in this project means an
+external CUDA implementation can consume the same canonical package; the native
+trainer itself remains Vulkan on NVIDIA, AMD, and other conformant Vulkan
+devices.
+
+## Build and run the native release
+
+On Windows, the recommended entry point is the isolated native release builder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\build_native_release.ps1
+```
+
+It audits the Rust dependency graph for Python/libtorch bindings, runs the native
+test gates, builds optimized binaries, probes Vulkan when available, and stages:
+
+```text
+dist\Hierarchos-Native\
+  HierarchosNative.exe
+  HierarchosCLI.exe
+  vulkan\
+    hierarchos-vulkan-train.exe
+    hierarchos-vulkan-devices.exe
+  README.md
+  NATIVE_BACKEND.md
+  SHA256SUMS.txt
+```
+
+Then inspect the available Vulkan adapters:
+
+```powershell
+.\dist\Hierarchos-Native\HierarchosCLI.exe devices
+```
+
+Start a completely fresh coherent-v9 run without Python:
+
+```powershell
+.\dist\Hierarchos-Native\HierarchosCLI.exe train `
+  --tokenizer-path .\tokenizer_assets `
+  --train .\instruct_dataset.jsonl `
+  --out-dir .\hierarchos_vulkan_fresh `
+  --epochs 3 `
+  --batch_size 4 `
+  --training-chunk-size 256 `
+  --precision fp32 `
+  --device-index 0
+```
+
+Or train an existing canonical package with native mixed-storage execution:
+
+```powershell
+.\dist\Hierarchos-Native\HierarchosCLI.exe train `
+  --model-path .\hierarchos_model `
+  --train .\instruct_dataset.jsonl `
+  --out-dir .\hierarchos_vulkan_model `
+  --epochs 3 `
+  --batch_size 4 `
+  --accumulation-steps 4 `
+  --starting-lr 1e-4 `
+  --min-lr 1e-6 `
+  --warmup-ratio 0.03 `
+  --training-chunk-size 256 `
+  --precision fp16-storage-parity `
+  --device-index 0
+```
+
+For native chat:
+
+```powershell
+.\dist\Hierarchos-Native\HierarchosCLI.exe chat `
+  --model-path .\hierarchos_vulkan_model `
+  --prompt "Explain hierarchical recurrent reasoning."
+```
+
+See [NATIVE_BACKEND.md](NATIVE_BACKEND.md) for exact-resume semantics, native
+fine-tuning, Hugging Face transport, LoRA merge, precision policies, manual
+cross-platform Cargo builds, and the explicit fail-closed boundary.
+
+### Native acceptance status — August 28, 2026
+
+The isolated release gate currently records `12/12` `hierarchos-inference`
+tests, `197/197` runnable `hierarchos-vulkan` library tests (`8` additional GPU
+microprofiles intentionally ignored), `16/16` `hierarchos-native-cli` tests,
+and `6/6` native GUI tests. The release dependency audit reports no `pyo3`,
+`tch`, `torch-sys`, or libtorch bindings, and the staged native bundle is
+checked to contain no Python runtime artifacts.
+
+The bundled smoke path has also exercised Vulkan device discovery on an AMD
+Radeon adapter, FP32 training with gradient accumulation, optimizer-boundary
+checkpoint creation, exact resume into the next epoch, and direct loading of the
+trained package through `hierarchos-inference`. These are readiness/correctness
+gates, not cross-vendor performance claims.
+
+## Release and model contract
+
+**Current release: Hierarchos Alpha v0.30.** New models use the RWKV-v9 core with
+corrected manager/worker recurrence, hard per-row ACT, bounded ROSA, shared
+factorized token adapters, persisted memory-gate schedule state, a causally
+trained transactional fast-memory writer, and fail-closed checkpoint/resume
+boundaries. A reference `448/448/448` Alpha v0.30 model with the GPT-2 vocabulary
+has `30,227,653` unique parameters and `102` state-dict entries. The historical
+RWKV-v8 design has `232,516,229` parameters and `95` state-dict entries.
+
+`v0.30` is the Hierarchos product release; RWKV-v8 and RWKV-v9 are core
+architecture generations. The literal `legacy-v8` and `coherent-v9` values stay
+in CLI/config/checkpoint metadata as compatibility-stable internal identifiers.
+v2/v3 checkpoints remain on `legacy-v8` and are never silently reinterpreted as
+RWKV-v9. The old scalar-RWKV quantized `.npz` path cannot reproduce the active
+matrix-state contract and remains intentionally unsupported. Read the
+[RWKV-v9 migration notes](COHERENT_V9_MIGRATION.md) before moving an expensive
+legacy run.
+
+## Model architecture: RWKV core v8 to v9
+
+The diagram below is the model-level architecture transition. The right-hand
+side is the coherent-v9 core used by **Hierarchos Alpha v0.30** in both the
+native implementation and the framework reference path.
 
 ```text
                 RWKV CORE v8                                  RWKV CORE v9
@@ -161,8 +300,11 @@ learning the supplied correction. Natural-language feedback interpretation is
 off by default; enable `--natural-feedback-detection` only when that heuristic
 behavior is desired. Exact slash actions are the auditable path.
 
-For the measured Colab profile, this is the literal one-line Alpha v0.30
-fresh-run command (batch `64`, accumulation `1`, no legacy checkpoint resume):
+For framework-reference CUDA reproduction, the measured Colab profile below is
+the literal one-line Alpha v0.30 PyTorch fresh-run command (batch `64`,
+accumulation `1`, no legacy checkpoint resume). New users should start with the
+native Vulkan workflow above unless they specifically need a framework-only
+feature:
 
 ```bash
 !cd ./Hierarchos && python hierarchos_cli.py train --architecture-revision coherent-v9 --hf_dataset "netcat420/Experiment_0.1" --hf_dataset_split "train" --hf-dataset-revision "4ef25be0ca46e7da7c70121b0b6d8e99cc232a51" --out-dir "./chatHRM_alpha_v030" --tokenizer-path "openai-community/gpt2" --epochs 15 --batch_size 64 --accumulation-steps 1 --accumulation-normalization weighted-token --max_length 8880 --training-chunk-size 256 --no-full-sample-bptt --no-full-sample-activation-checkpointing --detach-every-n-steps 0 --no-persist-state --context_dim 448 --h_hidden 448 --l_hidden 448 --rwkv-head-size 64 --max_h_steps 5 --max_l_steps 5 --alpaca --assistant-recovery --ltm-training-mode read-only --ltm-value-alignment-weight 0.01 --ltm-value-alignment-stride 8 --ltm-value-alignment-min-updates 100 --train-prompt-tokens --prompt-loss-weight 0.10 --response-loss-weight 1.0 --response-boundary-loss-weight 2.0 --response-boundary-tokens 64 --min-response-tokens 1 --starting-lr 2e-5 --min-lr 1e-7 --warmup-ratio 0.01 --ltm-lr 3e-4 --min-ltm-lr 1e-5 --adaptive-ponder --ponder-target-scale 0.65 --ponder-loss-weight 0.003 --commitment-loss-weight 0.5 --max-commitment-cost-for-backward 4.0 --max-ce-loss-for-backward 0 --max-ponder-cost-for-backward 0 --startup-weight-max-abs 0 --halt-logit-clamp 30.0 --recurrent-state-clamp 50.0 --context-state-clamp 50.0 --activation-clamp 100.0 --drift-state-clamp 2.0 --drift-norm-clamp 4.0 --rwkv-channel-mix-key-clamp 12.0 --rwkv-channel-mix-deepembed-clamp 4.0 --drift-delta-scale 0.35 --memory-gate-warmup-steps 5000 --memory-gate-warmup-floor 0.10 --grad-clip 0.75 --device cuda --amp --force-compile --compile-mode max-autotune-no-cudagraphs --compile-static-worker-loop --hf-token-cache --hf-token-cache-dir "/content/hierarchos_token_cache/experiment_0_1_alpha_v030" --token-cache-build-batch-size 256 --length-bucket-auto-sample-size 1000000 --cuda-prefetch --cuda-loss-chunk-rows 0 --num_workers -1 --padding-metric-steps 0 --save-steps 600
@@ -427,53 +569,86 @@ max_ce_loss_for_backward=0.0
 
 The field of AI has been dominated by a paradigm of unprecedented scale, yet fundamental limitations in today's Transformer models are becoming apparent. The path to Artificial General Intelligence (AGI) may not be paved with scale alone. Hierarchos challenges this paradigm by focusing on **architectural intelligence**.
 
-This project introduces a novel hybrid model where a deep reasoning engine operates within a dynamic, lifelong learning memory environment. Hierarchos is conceived not merely to process information, but to **think, learn, and remember** in a cohesive, integrated, and human-like manner.
+Hierarchos combines recurrent sequence modeling, hierarchical iterative
+reasoning, and structured long-term memory. With Alpha v0.30, the project also
+makes a backend-level commitment: the primary implementation is now the
+framework-free **Hierarchos Native** stack, with Rust for orchestration and
+inference and Vulkan compute for full-model training. The Python/PyTorch codebase
+remains valuable as a reference implementation and compatibility surface, but it
+is no longer the architectural center of the project.
 
 ## Core Concepts
 
-Hierarchos is built on three revolutionary, brain-inspired pillars:
+Hierarchos v0.30 is organized around four layers:
 
-🔄 **RWKV v8 Backbone (The Neural Engine)**
-A modernized recurrent model with linear-attention-style state and O(1) generation-state memory per token. It features Time Mixing (WKV recurrence with exponential decay), ReLU-squared Channel Mixing, DeepEmbed gating, and ROSA neurosymbolic embeddings. Training throughput is implementation- and hardware-dependent and is not claimed to match a Transformer without a controlled benchmark.
+🔄 **RWKV-v9 Backbone (The Neural Engine)**
 
-🧠 **Titans Architecture (The Cognitive Substrate)**
-A sophisticated, multi-tiered memory workspace that enables dynamic, lifelong learning. It learns *what to remember* based on the principle of "surprise," and its memory slots are now structured with timestamps and source metadata, allowing for sophisticated, context-aware queries.
+The coherent-v9 core uses corrected matrix-state recurrence, ReLU-squared
+channel mixing, shared factorized token adapters, bounded ROSA features, and
+row-local recurrent refinement. It preserves constant-size recurrent generation
+state rather than growing a Transformer-style KV cache with sequence length.
 
-⚙️ **Hierarchical Reasoning Model (The Cognitive Process)**
-An experimental dual-module design in which a high-level "Manager" and low-level "Worker" add computational depth through iterative refinement. Whether this improves complex reasoning relative to Transformer baselines must be established with held-out evaluations rather than assumed from the architecture.
+🧠 **Titans-Inspired Memory (The Cognitive Substrate)**
+
+A structured long-term-memory workspace provides learned retrieval plus bounded,
+transactional adaptation. Memory slots carry explicit metadata and the v0.30
+contract separates training a writer from allowing that writer to mutate live
+conversation state.
+
+⚙️ **Hierarchical Reasoning (The Cognitive Process)**
+
+A high-level Manager and low-level Worker add adaptive iterative computation.
+Hard per-row ACT selects committed states, while bounded convergence and
+commitment controls keep the recurrent process explicit and testable.
+
+🦀 **Rust + Vulkan (The Execution Layer)**
+
+The primary backend is not a Python launcher. Rust owns the native CLI, GUI,
+tokenization, package lifecycle, and inference runtime; Vulkan compute owns the
+training hot path. Canonical SafeTensors keep the model portable across the
+native runtime and compatible external implementations.
 
 ## Architecture Diagram
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ Input Tokens → tok_emb + ROSA(Suffix Automaton) + DeepEmbed(4x) │
-│                    ↓                                             │
-│ LTM Retrieval (differentiable top-k attention via qproj)         │
-│                    ↓                                             │
-│ Encoder → in_proj(GELU)                                         │
-│                    ↓                                             │
-│ Manager H-RNN (RWKV v8) ← l_feedback_proj                      │
-│   · ACT Pondering (shadow state, halt probabilities)            │
-│   · Strided Context Plan + LERP interpolation                   │
-│                    ↓                                             │
-│ Worker L-RNN (RWKV v8, torch.compiled on CUDA)                  │
-│   · Shadow-state exploration + convergence detection             │
-│   · Drift commitment cost                                       │
-│                    ↓                                             │
-│ out_norm → lm_head → Logits (weight-tied with tok_emb)          │
-│                    ↓                                             │
-│ Titans LTM Update (gradient-based surprise + Hebbian)           │
-│                    ↓                                             │
-│ CE Loss + Z-Loss + Ponder Cost + Commitment Cost                │
-└──────────────────────────────────────────────────────────────────┘
+```text
+┌────────────────────────────────────────────────────────────────────┐
+│ Rust tokenizer / canonical model package                           │
+│                    ↓                                               │
+│ tied token embedding + shared H/L/ROSA adapters                    │
+│                    ↓                                               │
+│ metadata-safe LTM retrieval + learned value path                   │
+│                    ↓                                               │
+│ Manager H recurrence (RWKV-v9 matrix state + hard per-row ACT)     │
+│                    ↓                                               │
+│ Worker L recurrence (RWKV-v9 row-local iterative refinement)       │
+│                    ↓                                               │
+│ out_norm → tied lm_head → logits                                   │
+│                    │                                               │
+│          ┌─────────┴─────────┐                                     │
+│          ↓                   ↓                                     │
+│  Rust inference/chat   Vulkan training graph                       │
+│  recurrent/LTM state   CE + auxiliaries → backward → AdamW         │
+│          │                   │                                     │
+│          └─────────┬─────────┘                                     │
+│                    ↓                                               │
+│      canonical SafeTensors + portable resume state                 │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Features ✨
 
-  * 🔄 **RWKV v8 Backbone**: Linear-complexity attention with O(1) inference cost. WKV recurrence, ReLU-squared FFN, DeepEmbed gating, and ROSA neurosymbolic embeddings.
-  * ⚙️ **Adaptive CPU/CUDA LTM Math**: Keeps CPU-friendly dense LTM math on CPU while automatically using GPU-friendly gather/scatter retrieval and update paths on CUDA.
-  * ⚡ **CUDA Datacenter Ready**: Auto-enables AMP (bfloat16 on Ampere+), TF32 matmul, cuDNN benchmark, torch.compile, non-blocking transfers, CUDA pinned memory, and bounded DataLoader prefetch — zero configuration needed.
-  * 🪟 **Windows GUI Bundle**: Build a portable GUI release with `Hierarchos.exe` and a bundled backend for normal inference without requiring users to clone the repo.
+### Primary native capabilities
+
+  * 🦀 **Framework-Free Rust Runtime**: Native package handling, tokenization, inference, chat, CLI orchestration, and the dedicated GUI run without Python, PyTorch, `tch`, `pyo3`, or libtorch.
+  * 🌋 **Full-Model Vulkan Training**: Coherent-v9 forward/backward execution, recurrent replay, gradient accumulation, AdamW, mixed-storage precision policies, checkpointing, and device selection run through Vulkan compute.
+  * 🪟 **Native Windows Release**: `tools/build_native_release.ps1` produces `HierarchosNative.exe`, `HierarchosCLI.exe`, and the Vulkan trainer/device tools as an isolated distribution with dependency and runtime-artifact audits.
+  * 💾 **Exact Native Resume**: Restores weights, AdamW slots/clocks, scheduler and loss-scaler state, pending accumulated gradients, data cursor/shuffle state, and portable recurrent/LTM/ROSA replay state.
+  * 🌐 **Rust Hugging Face Transport**: Supported canonical model/tokenizer assets and JSONL/NDJSON datasets can be fetched directly over Rust HTTPS without `huggingface_hub` or Python.
+  * 📦 **Canonical SafeTensors ABI**: Vulkan training retains FP32 master parameters and writes packages that load directly in `hierarchos-inference` and remain consumable by compatible external implementations.
+  * 🎛️ **Explicit Precision Policies**: Native execution exposes capability-checked `fp32`, mixed FP16-storage/FP32-compute, parity, and qualified FP16 LM-backward modes rather than framework autocast.
+  * 🔄 **RWKV-v9 Coherent Core**: Corrected matrix-state recurrence, hard per-row ACT, bounded ROSA, shared factorized token adapters, and row-local refinement are the model contract for new Alpha v0.30 runs.
+
+### Model and framework-reference capabilities
   * 📊 **Integrated Benchmarking**: Optional support for `lm-evaluation-harness`. Track model accuracy on standard benchmarks (HellaSwag, ARC, etc.) during or after training with `--eval-tasks`, or use `--benchmark-preset rog-ally` for a bounded local CPU smoke test.
   * 🎮 **AMD GPU Support (DirectML/ZLUDA)**: Train on AMD Radeon GPUs using DirectML backend on Windows. Opt-in via `--device dml` with automatic compatibility handling and optimized fallbacks.
   * 🎓 **Proper Temporal Learning**: Configurable truncated BPTT (`--detach-every-n-steps`) enables learning across multiple timesteps while managing memory. Default 32-step gradients flow allows the model to **learn temporal dependencies** effectively.
@@ -535,7 +710,39 @@ Choose the runtime you intend to use:
   * **Optional framework CUDA training:** NVIDIA GPU with CUDA support (Compute
     Capability 7.0+ recommended) and a PyTorch build with CUDA enabled.
 
-### Installation
+### Native installation (recommended)
+
+1. **Clone the repository:**
+
+   ```powershell
+   git clone https://github.com/your-username/Hierarchos.git
+   cd Hierarchos
+   ```
+
+2. **Build the isolated Rust/Vulkan release:**
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\tools\build_native_release.ps1
+   ```
+
+3. **Verify Vulkan device discovery:**
+
+   ```powershell
+   .\dist\Hierarchos-Native\HierarchosCLI.exe devices
+   ```
+
+4. **Launch the native GUI or use the native CLI:**
+
+   ```powershell
+   .\dist\Hierarchos-Native\HierarchosNative.exe
+   .\dist\Hierarchos-Native\HierarchosCLI.exe --help
+   ```
+
+No Python environment is required for this path. For a CI/headless build host,
+the release builder supports `-SkipDeviceProbe`; use `-SkipTests` only when the
+same source revision has already passed the native gates.
+
+### Framework/Python installation (reference and compatibility workflows)
 
 1.  **Clone the repository:**
 
@@ -596,16 +803,17 @@ This guide covers common scenarios from data preparation to inference.
 
 ### Choosing Your Entry Point
 
-> ⚠️ **Important:** For the Python/framework stack, the modular CLI
-> (`hierarchos_cli.py`) is the **only supported Python entry point**. The original
-> `hierarchos.py` is legacy and no longer maintained. The independent supported
-> Rust/Vulkan entry point is `hierarchos-native-cli`; see
-> [NATIVE_BACKEND.md](NATIVE_BACKEND.md).
+> [!TIP]
+> Start with `HierarchosCLI.exe` / `hierarchos-native-cli` for Alpha v0.30. The
+> Python CLI is retained for framework-specific research and compatibility work.
+> If you do use the Python stack, `hierarchos_cli.py` is its supported modular
+> entry point; the original `hierarchos.py` is legacy and unmaintained.
 
 | Entry Point | Status | Description |
 |-------------|--------|-------------|
-| `hierarchos_cli.py` | ✅ **Recommended** | Modular CLI - faster, stable, actively maintained |
-| `hierarchos-native-cli` | ✅ **Native** | Pure-Rust CLI for coherent-v9 inference and Vulkan training; no Python/PyTorch runtime dispatcher. |
+| `HierarchosCLI.exe` / `hierarchos-native-cli` | ✅ **Primary / Recommended** | Pure-Rust CLI for coherent-v9 package management, inference/chat, and full-model Vulkan training; no Python/PyTorch runtime dispatcher. |
+| `HierarchosNative.exe` | ✅ **Primary GUI** | Dedicated Rust GUI using `hierarchos-inference` and the Vulkan trainer directly. |
+| `hierarchos_cli.py` | ✅ **Framework Reference** | Supported modular Python/PyTorch CLI for framework-only research and compatibility workflows. |
 | `hierarchos.py` | ⚠️ **Legacy** | Unmaintained monolith (5,600 lines). Kept only as reference for agentic AI workflows. | <-- DO NOT USE THIS! ITS 16 VERSIONS OUT OF DATE!!
 
 > **Product version boundary:** Hierarchos Alpha v0.30 is the current release.
@@ -615,7 +823,21 @@ This guide covers common scenarios from data preparation to inference.
 > that explicitly say `232M`, `232.5M`, or `95` state tensors describe the
 > historical RWKV-v8 core (`legacy-v8`) unless they say otherwise.
 
-**Example:**
+**Native example:**
+
+```powershell
+.\dist\Hierarchos-Native\HierarchosCLI.exe train `
+    --tokenizer-path .\tokenizer_assets `
+    --train .\instruct_dataset.jsonl `
+    --out-dir .\hierarchos_vulkan_model `
+    --epochs 3 `
+    --batch_size 4 `
+    --training-chunk-size 256 `
+    --precision fp32 `
+    --device-index 0
+```
+
+**Framework-reference example:**
 ```bash
 python hierarchos_cli.py train \
     --hf_dataset "tatsu-lab/alpaca" \
@@ -1400,7 +1622,7 @@ python hierarchos_cli.py chat --model-path "./my_model" --temperature 0.4 --top-
 
 -----
 
-## Native Rust/Vulkan backend
+## Native Rust/Vulkan backend — detailed developer reference
 
 The coherent-v9 full-model native training backend now lives in
 `hierarchos-vulkan/`. It uses raw Vulkan compute through Rust/`ash` and standard
@@ -1900,15 +2122,15 @@ scalar-RWKV checkpoints remain intentionally fail-closed.
 
 ## Roadmap
 
+  * [x] Promote the Rust/Vulkan stack to the primary Hierarchos Alpha v0.30 execution path and ship it as an isolated native release.
   * [x] Ship a dedicated pure-Rust GUI wrapper for native inference and direct Vulkan training (`hierarchos-native`).
-  * [ ] Extend the architecture to support multi-modal inputs (images, audio).
-  * [ ] Implement multi-GPU training with DistributedDataParallel / FSDP.
   * [x] Implement the coherent-v9 full-model training loop in Vulkan with portable FP32-master SafeTensors, AdamW/resume state, TBPTT, mixed-precision policies, and native multi-adapter execution.
   * [x] Add native parameter-efficient coherent-v9 finetuning over built-in low-rank/shared factors plus Rust SafeTensors LoRA adapter merge parity.
+  * [ ] Expand and benchmark native multi-device Vulkan scaling beyond the current adapter-selection/execution path, including controlled cross-vendor NVIDIA/AMD validation.
   * [ ] Add optional on-the-fly arbitrary PEFT-LoRA geometry injection/training without changing the canonical native runtime contract.
-  * [ ] Expand DirectML support to Linux via ROCm.
+  * [ ] Extend the architecture to support multi-modal inputs (images, audio).
   * [ ] Optimize LTM retrieval with approximate nearest neighbor search for larger memory capacities.
-  * [ ] Explore RWKV v8 custom CUDA kernels for fused WKV computation.
+  * [ ] Continue Vulkan shader fusion, autotuning, and low-precision kernel work for higher training throughput while preserving the canonical SafeTensors contract.
 
 ## License
 
@@ -1934,6 +2156,8 @@ Please consider supporting my work on Patreon. I have motor cortex damage, which
 
 ### v0.30 (alpha)
 
+  * **Native/Vulkan Major Update**: Hierarchos Native is promoted to the primary Alpha v0.30 execution path. The standalone stack now covers Rust-side model/package handling, tokenization, fresh coherent-v9 initialization, CLI/GUI orchestration and inference, plus full-model Vulkan training/optimization, native fine-tuning, exact resume, supported Hugging Face transport, local benchmarking, and canonical SafeTensors interchange without a Python/PyTorch runtime dependency.
+  * **Native Release Gate**: `tools/build_native_release.ps1` audits the Rust dependency graph for Python/libtorch bindings, runs the native crate/GUI test gates, builds `HierarchosNative.exe`, `HierarchosCLI.exe`, and the Vulkan trainer/device binaries, probes Vulkan when available, and rejects Python runtime artifacts from the staged distribution.
   * **Product and Core Naming**: The public release is **Hierarchos Alpha v0.30**. RWKV-v8 and RWKV-v9 identify core architecture generations only; `legacy-v8` and `coherent-v9` remain compatibility-stable internal checkpoint/config identifiers.
   * **RWKV-v9 Core**: Introduces the corrected matrix-state recurrence, per-row hard ACT, bounded deterministic ROSA, isolated metadata-safe LTM, and shared factorized token adapters.
   * **Affordable Reference Architecture**: The `448/448/448` reference has `30,227,653` parameters and `102` state-dict entries, versus `232,516,229` parameters and `95` entries for the historical RWKV-v8 reference—an `86.9998%` parameter reduction.
